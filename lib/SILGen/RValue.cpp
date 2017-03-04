@@ -1,12 +1,12 @@
-//===--- RValue.cpp - Exploded RValue Representation ------------*- C++ -*-===//
+//===--- RValue.cpp - Exploded RValue Representation ----------------------===//
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2016 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 //
@@ -17,11 +17,12 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "Initialization.h"
 #include "RValue.h"
-#include "swift/SIL/SILArgument.h"
+#include "Initialization.h"
+#include "SILGenFunction.h"
 #include "swift/AST/CanTypeVisitor.h"
-#include "swift/Basic/Fallthrough.h"
+#include "swift/SIL/AbstractionPattern.h"
+#include "swift/SIL/SILArgument.h"
 
 using namespace swift;
 using namespace Lowering;
@@ -30,6 +31,20 @@ using namespace Lowering;
 static unsigned getTupleSize(CanType t) {
   if (TupleType *tt = dyn_cast<TupleType>(t))
     return tt->getNumElements();
+  return 1;
+}
+
+static unsigned getRValueSize(AbstractionPattern pattern, CanType formalType) {
+  if (pattern.isTuple()) {
+    unsigned count = 0;
+    auto formalTupleType = cast<TupleType>(formalType);
+    for (auto i : indices(formalTupleType.getElementTypes())) {
+      count += getRValueSize(pattern.getTupleElementType(i),
+                             formalTupleType.getElementType(i));
+    }
+    return count;
+  }
+
   return 1;
 }
 
@@ -74,14 +89,14 @@ public:
       CanType eltFormalType = tupleFormalType.getElementType(i);
       assert(eltFormalType->isMaterializable());
 
-      auto eltTy = tuple.getType().getTupleElementType(i);
-      assert(eltTy.isAddress() == tuple.getType().isAddress());
+      auto eltTy = tuple->getType().getTupleElementType(i);
+      assert(eltTy.isAddress() == tuple->getType().isAddress());
       auto &eltTI = gen.getTypeLowering(eltTy);
 
       // Project the element.
       SILValue elt;
-      if (tuple.getType().isObject()) {
-        assert(eltTI.isLoadable());
+      if (tuple->getType().isObject()) {
+        assert(eltTI.isLoadable() || !gen.silConv.useLoweredAddresses());
         elt = gen.B.createTupleExtract(loc, tuple, i, eltTy);
       } else {
         elt = gen.B.createTupleElementAddr(loc, tuple, i, eltTy);
@@ -90,7 +105,7 @@ public:
         // loaded.  Except it's not really an invariant, because
         // argument emission likes to lie sometimes.
         if (eltTI.isLoadable()) {
-          elt = gen.B.createLoad(loc, elt);
+          elt = eltTI.emitLoad(gen.B, loc, elt, LoadOwnershipQualifier::Take);
         }
       }
 
@@ -125,6 +140,8 @@ public:
     case ImplodeKind::Copy:
       return v.copyUnmanaged(gen, l).forward(gen);
     }
+
+    llvm_unreachable("Unhandled ImplodeKind in switch.");
   }
 
   ImplodeLoadableTupleValue(ArrayRef<ManagedValue> values,
@@ -239,8 +256,18 @@ public:
     : gen(gen), parent(parent), loc(l), functionArgs(functionArgs) {}
 
   RValue visitType(CanType t) {
-    SILValue arg = new (gen.SGM.M)
-      SILArgument(parent, gen.getLoweredType(t), loc.getAsASTNode<ValueDecl>());
+    SILValue arg;
+    if (functionArgs) {
+      arg = parent->createFunctionArgument(gen.getLoweredType(t),
+                                           loc.getAsASTNode<ValueDecl>());
+    } else {
+      SILType lty = gen.getLoweredType(t);
+      ValueOwnershipKind ownershipkind = lty.isAddress()
+                                             ? ValueOwnershipKind::Trivial
+                                             : ValueOwnershipKind::Owned;
+      arg = parent->createPHIArgument(lty, ownershipkind,
+                                      loc.getAsASTNode<ValueDecl>());
+    }
     ManagedValue mv = isa<InOutType>(t)
       ? ManagedValue::forLValue(arg)
       : gen.emitManagedRValueWithCleanup(arg);
@@ -302,7 +329,7 @@ static void copyOrInitValuesInto(Initialization *init,
     // We take the first value.
     ManagedValue result = values[0];
     values = values.slice(1);
-    init->copyOrInitValueInto(result, isInit, loc, gen);
+    init->copyOrInitValueInto(gen, loc, result, isInit);
     init->finishInitialization(gen);
     return;
   }
@@ -320,10 +347,9 @@ static void copyOrInitValuesInto(Initialization *init,
   
   // If we can satisfy the tuple type by breaking up the aggregate
   // initialization, do so.
-  if (!implodeTuple && init->canSplitIntoSubelementAddresses()) {
+  if (!implodeTuple && init->canSplitIntoTupleElements()) {
     SmallVector<InitializationPtr, 4> subInitBuf;
-    auto subInits = init->getSubInitializationsForTuple(gen, type,
-                                                        subInitBuf, loc);
+    auto subInits = init->splitIntoTupleElements(gen, loc, type, subInitBuf);
     
     assert(subInits.size() == tupleType->getNumElements() &&
            "initialization does not match tuple?!");
@@ -331,6 +357,8 @@ static void copyOrInitValuesInto(Initialization *init,
     for (unsigned i = 0, e = subInits.size(); i < e; ++i)
       copyOrInitValuesInto<KIND>(subInits[i].get(), values,
                                  tupleType.getElementType(i), loc, gen);
+
+    init->finishInitialization(gen);
     return;
   }
   
@@ -342,14 +370,29 @@ static void copyOrInitValuesInto(Initialization *init,
   // This will have just used up the first values in the list, pop them off.
   values = values.slice(getRValueSize(type));
   
-  init->copyOrInitValueInto(ManagedValue::forUnmanaged(scalar), isInit, loc,
-                            gen);
+  init->copyOrInitValueInto(gen, loc, ManagedValue::forUnmanaged(scalar),
+                            isInit);
   init->finishInitialization(gen);
 }
 
+static unsigned
+expectedExplosionSize(CanType type) {
+  auto tuple = dyn_cast<TupleType>(type);
+  if (!tuple)
+    return 1;
+  unsigned total = 0;
+  for (unsigned i = 0; i < tuple->getNumElements(); ++i) {
+    total += expectedExplosionSize(tuple.getElementType(i));
+  }
+  return total;
+}
 
 RValue::RValue(ArrayRef<ManagedValue> values, CanType type)
   : values(values.begin(), values.end()), type(type), elementsToBeAdded(0) {
+  
+  assert(values.size() == expectedExplosionSize(type)
+         && "creating rvalue with wrong number of pre-exploded elements");
+  
   if (values.size() == 1 && values[0].isInContext()) {
     values = ArrayRef<ManagedValue>();
     type = CanType();
@@ -357,6 +400,11 @@ RValue::RValue(ArrayRef<ManagedValue> values, CanType type)
     return;
   }
 
+}
+
+RValue RValue::withPreExplodedElements(ArrayRef<ManagedValue> values,
+                                       CanType type) {
+  return RValue(values, type);
 }
 
 RValue::RValue(SILGenFunction &gen, SILLocation l, CanType formalType,
@@ -391,6 +439,10 @@ RValue::RValue(SILGenFunction &gen, Expr *expr, ManagedValue v)
 
 RValue::RValue(CanType type)
   : type(type), elementsToBeAdded(getTupleSize(type)) {
+}
+
+RValue::RValue(AbstractionPattern pattern, CanType type)
+  : type(type), elementsToBeAdded(getRValueSize(pattern, type)) {
 }
 
 void RValue::addElement(RValue &&element) & {
@@ -434,19 +486,48 @@ SILValue RValue::forwardAsSingleStorageValue(SILGenFunction &gen,
   return gen.emitConversionFromSemanticValue(l, result, storageType);
 }
 
-void RValue::forwardInto(SILGenFunction &gen, Initialization *I,
-                         SILLocation loc) && {
+void RValue::forwardInto(SILGenFunction &gen, SILLocation loc, 
+                         Initialization *I) && {
   assert(isComplete() && "rvalue is not complete");
-  
   ArrayRef<ManagedValue> elts = values;
   copyOrInitValuesInto<ImplodeKind::Forward>(I, elts, type, loc, gen);
 }
 
-void RValue::copyInto(SILGenFunction &gen, Initialization *I,
-                      SILLocation loc) const & {
+void RValue::copyInto(SILGenFunction &gen, SILLocation loc,
+                      Initialization *I) const & {
   assert(isComplete() && "rvalue is not complete");
   ArrayRef<ManagedValue> elts = values;
   copyOrInitValuesInto<ImplodeKind::Copy>(I, elts, type, loc, gen);
+}
+
+static void assignRecursive(SILGenFunction &gen, SILLocation loc,
+                            CanType type, ArrayRef<ManagedValue> &srcValues,
+                            SILValue destAddr) {
+  // Recurse into tuples.
+  if (auto srcTupleType = dyn_cast<TupleType>(type)) {
+    assert(destAddr->getType().castTo<TupleType>()->getNumElements()
+             == srcTupleType->getNumElements());
+    for (auto eltIndex : indices(srcTupleType.getElementTypes())) {
+      auto eltDestAddr = gen.B.createTupleElementAddr(loc, destAddr, eltIndex);
+      assignRecursive(gen, loc, srcTupleType.getElementType(eltIndex),
+                      srcValues, eltDestAddr);
+    }
+    return;
+  }
+
+  // Otherwise, pull the front value off the list.
+  auto srcValue = srcValues.front();
+  srcValues = srcValues.slice(1);
+
+  srcValue.assignInto(gen, loc, destAddr);
+}
+
+void RValue::assignInto(SILGenFunction &gen, SILLocation loc,
+                        SILValue destAddr) && {
+  assert(isComplete() && "rvalue is not complete");
+  ArrayRef<ManagedValue> srcValues = values;
+  assignRecursive(gen, loc, type, srcValues, destAddr);
+  assert(srcValues.empty() && "didn't claim all elements!");
 }
 
 ManagedValue RValue::getAsSingleValue(SILGenFunction &gen, SILLocation l) && {
@@ -510,7 +591,16 @@ getElementRange(CanTupleType tupleType, unsigned eltIndex) {
 RValue RValue::extractElement(unsigned n) && {
   assert(isComplete() && "rvalue is not complete");
 
-  auto tupleTy = cast<TupleType>(type);
+  CanTupleType tupleTy = dyn_cast<TupleType>(type);
+  if (!tupleTy) {
+    assert(n == 0);
+    unsigned to = getRValueSize(type);
+    assert(to == values.size());
+    RValue element({llvm::makeArrayRef(values).slice(0, to), type});
+    makeUsed();
+    return element;
+  }
+
   auto range = getElementRange(tupleTy, n);
   unsigned from = range.first, to = range.second;
 
@@ -523,8 +613,17 @@ RValue RValue::extractElement(unsigned n) && {
 void RValue::extractElements(SmallVectorImpl<RValue> &elements) && {
   assert(isComplete() && "rvalue is not complete");
 
+  CanTupleType tupleTy = dyn_cast<TupleType>(type);
+  if (!tupleTy) {
+    unsigned to = getRValueSize(type);
+    assert(to == values.size());
+    elements.push_back({llvm::makeArrayRef(values).slice(0, to), type});
+    makeUsed();
+    return;
+  }
+
   unsigned from = 0;
-  for (auto eltType : cast<TupleType>(type).getElementTypes()) {
+  for (auto eltType : tupleTy.getElementTypes()) {
     unsigned to = from + getRValueSize(eltType);
     elements.push_back({llvm::makeArrayRef(values).slice(from, to - from),
                         eltType});
@@ -560,6 +659,6 @@ ManagedValue RValue::materialize(SILGenFunction &gen, SILLocation loc) && {
 
   // Otherwise, emit to a temporary.
   auto temp = gen.emitTemporary(loc, paramTL);
-  std::move(*this).forwardInto(gen, temp.get(), loc);
+  std::move(*this).forwardInto(gen, loc, temp.get());
   return temp->getManagedAddress();
 }

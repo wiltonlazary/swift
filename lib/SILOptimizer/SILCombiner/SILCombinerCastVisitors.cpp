@@ -2,11 +2,11 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2016 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 
@@ -14,7 +14,6 @@
 #include "SILCombiner.h"
 #include "swift/SIL/DynamicCasts.h"
 #include "swift/SIL/PatternMatch.h"
-#include "swift/SIL/Projection.h"
 #include "swift/SIL/SILBuilder.h"
 #include "swift/SIL/SILVisitor.h"
 #include "swift/SIL/DebugUtils.h"
@@ -36,7 +35,7 @@ SILCombiner::visitRefToRawPointerInst(RefToRawPointerInst *RRPI) {
   if (auto *URCI = dyn_cast<UncheckedRefCastInst>(RRPI->getOperand())) {
     // (ref_to_raw_pointer (unchecked_ref_cast x))
     //    -> (ref_to_raw_pointer x)
-    if (URCI->getOperand().getType().getSwiftType()
+    if (URCI->getOperand()->getType().getSwiftRValueType()
         ->isAnyClassReferenceType()) {
       RRPI->setOperand(URCI->getOperand());
       return URCI->use_empty() ? eraseInstFromFunction(*URCI) : nullptr;
@@ -80,16 +79,18 @@ visitPointerToAddressInst(PointerToAddressInst *PTAI) {
   // always legal to do since address-to-pointer pointer-to-address implies
   // layout compatibility.
   //
-  // (pointer-to-address (address-to-pointer %x)) -> (unchecked_addr_cast %x)
-  if (auto *ATPI = dyn_cast<AddressToPointerInst>(PTAI->getOperand())) {
-    return Builder.createUncheckedAddrCast(PTAI->getLoc(), ATPI->getOperand(),
-                                           PTAI->getType());
+  // (pointer-to-address strict (address-to-pointer %x))
+  // -> (unchecked_addr_cast %x)
+  if (PTAI->isStrict()) {
+    if (auto *ATPI = dyn_cast<AddressToPointerInst>(PTAI->getOperand())) {
+      return Builder.createUncheckedAddrCast(PTAI->getLoc(), ATPI->getOperand(),
+                                             PTAI->getType());
+    }
   }
-
   // Turn this also into an index_addr. We generate this pattern after switching
   // the Word type to an explicit Int32 or Int64 in the stdlib.
   //
-  // %101 = builtin "strideof_nonzero"<Int>(%84 : $@thick Int.Type) :
+  // %101 = builtin "strideof"<Int>(%84 : $@thick Int.Type) :
   //         $Builtin.Word
   // %102 = builtin "zextOrBitCast_Word_Int64"(%101 : $Builtin.Word) :
   //         $Builtin.Int64
@@ -100,7 +101,7 @@ visitPointerToAddressInst(PointerToAddressInst *PTAI) {
   // %113 = builtin "truncOrBitCast_Int64_Word"(%112 : $Builtin.Int64) :
   //         $Builtin.Word
   // %114 = index_raw_pointer %100 : $Builtin.RawPointer, %113 : $Builtin.Word
-  // %115 = pointer_to_address %114 : $Builtin.RawPointer to $*Int
+  // %115 = pointer_to_address %114 : $Builtin.RawPointer to [strict] $*Int
   SILValue Distance;
   SILValue TruncOrBitCast;
   MetatypeInst *Metatype;
@@ -118,13 +119,13 @@ visitPointerToAddressInst(PointerToAddressInst *PTAI) {
                 m_ApplyInst(
                     BuiltinValueKind::SMulOver, m_SILValue(Distance),
                     m_ApplyInst(BuiltinValueKind::ZExtOrBitCast,
-                                m_ApplyInst(BuiltinValueKind::StrideofNonZero,
+                                m_ApplyInst(BuiltinValueKind::Strideof,
                                             m_MetatypeInst(Metatype))))) ||
           match(StrideMul,
                 m_ApplyInst(
                     BuiltinValueKind::SMulOver,
                     m_ApplyInst(BuiltinValueKind::ZExtOrBitCast,
-                                m_ApplyInst(BuiltinValueKind::StrideofNonZero,
+                                m_ApplyInst(BuiltinValueKind::Strideof,
                                             m_MetatypeInst(Metatype))),
                     m_SILValue(Distance)))) {
         SILType InstanceType =
@@ -138,7 +139,8 @@ visitPointerToAddressInst(PointerToAddressInst *PTAI) {
         }
 
         auto *NewPTAI = Builder.createPointerToAddress(PTAI->getLoc(), Ptr,
-                                                        PTAI->getType());
+                                                       PTAI->getType(),
+                                                       PTAI->isStrict());
         auto DistanceAsWord = Builder.createBuiltin(
             PTAI->getLoc(), Trunc->getName(), Trunc->getType(), {}, Distance);
 
@@ -150,11 +152,11 @@ visitPointerToAddressInst(PointerToAddressInst *PTAI) {
   //
   //   %stride = Builtin.strideof(T) * %distance
   //   %ptr' = index_raw_pointer %ptr, %stride
-  //   %result = pointer_to_address %ptr, $T'
+  //   %result = pointer_to_address %ptr, [strict] $T'
   //
   // To:
   //
-  //   %addr = pointer_to_address %ptr, $T
+  //   %addr = pointer_to_address %ptr, [strict] $T
   //   %result = index_addr %addr, %distance
   //
   BuiltinInst *Bytes;
@@ -165,10 +167,6 @@ visitPointerToAddressInst(PointerToAddressInst *PTAI) {
     if (match(Bytes, m_ApplyInst(BuiltinValueKind::SMulOver, m_ValueBase(),
                                  m_ApplyInst(BuiltinValueKind::Strideof,
                                              m_MetatypeInst(Metatype)),
-                                 m_ValueBase())) ||
-        match(Bytes, m_ApplyInst(BuiltinValueKind::SMulOver, m_ValueBase(),
-                                 m_ApplyInst(BuiltinValueKind::StrideofNonZero,
-                                             m_MetatypeInst(Metatype)),
                                  m_ValueBase()))) {
       SILType InstanceType =
         Metatype->getType().getMetatypeInstanceType(PTAI->getModule());
@@ -178,11 +176,12 @@ visitPointerToAddressInst(PointerToAddressInst *PTAI) {
       if (InstanceType.getAddressType() != PTAI->getType())
         return nullptr;
 
-      auto IRPI = cast<IndexRawPointerInst>(PTAI->getOperand().getDef());
+      auto IRPI = cast<IndexRawPointerInst>(PTAI->getOperand());
       SILValue Ptr = IRPI->getOperand(0);
       SILValue Distance = Bytes->getArguments()[0];
       auto *NewPTAI =
-          Builder.createPointerToAddress(PTAI->getLoc(), Ptr, PTAI->getType());
+        Builder.createPointerToAddress(PTAI->getLoc(), Ptr, PTAI->getType(),
+                                       PTAI->isStrict());
       return Builder.createIndexAddr(PTAI->getLoc(), NewPTAI, Distance);
     }
   }
@@ -204,8 +203,8 @@ SILCombiner::visitUncheckedAddrCastInst(UncheckedAddrCastInst *UADCI) {
                                            UADCI->getType());
 
   // (unchecked-addr-cast cls->superclass) -> (upcast cls->superclass)
-  if (UADCI->getType() != UADCI->getOperand().getType() &&
-      UADCI->getType().isSuperclassOf(UADCI->getOperand().getType()))
+  if (UADCI->getType() != UADCI->getOperand()->getType() &&
+      UADCI->getType().isExactSuperclassOf(UADCI->getOperand()->getType()))
     return Builder.createUpcast(UADCI->getLoc(), UADCI->getOperand(),
                                 UADCI->getType());
 
@@ -216,7 +215,7 @@ SILCombiner::visitUncheckedAddrCastInst(UncheckedAddrCastInst *UADCI) {
   if (UADCI->use_empty())
     return nullptr;
 
-  SILType InputTy = UADCI->getOperand().getType();
+  SILType InputTy = UADCI->getOperand()->getType();
   SILType OutputTy = UADCI->getType();
 
   // If either type is address only, do not do anything here.
@@ -241,7 +240,7 @@ SILCombiner::visitUncheckedAddrCastInst(UncheckedAddrCastInst *UADCI) {
     return nullptr;
 
   // For each user U of the unchecked_addr_cast...
-  for (auto U : getNonDebugUses(*UADCI))
+  for (auto U : getNonDebugUses(UADCI))
     // Check if it is load. If it is not a load, bail...
     if (!isa<LoadInst>(U->getUser()))
       return nullptr;
@@ -251,19 +250,20 @@ SILCombiner::visitUncheckedAddrCastInst(UncheckedAddrCastInst *UADCI) {
 
   // Ok, we have all loads. Lets simplify this. Go back through the loads a
   // second time, rewriting them into a load + bitcast from our source.
-  auto UsesRange = getNonDebugUses(*UADCI);
+  auto UsesRange = getNonDebugUses(UADCI);
   for (auto UI = UsesRange.begin(), E = UsesRange.end(); UI != E;) {
     // Grab the original load.
     LoadInst *L = cast<LoadInst>(UI->getUser());
     UI++;
 
     // Insert a new load from our source and bitcast that as appropriate.
-    LoadInst *NewLoad = Builder.createLoad(Loc, Op);
+    LoadInst *NewLoad =
+        Builder.createLoad(Loc, Op, LoadOwnershipQualifier::Unqualified);
     auto *BitCast = Builder.createUncheckedBitCast(Loc, NewLoad,
                                                     OutputTy.getObjectType());
     // Replace all uses of the old load with the new bitcasted result and erase
     // the old load.
-    replaceInstUsesWith(*L, BitCast, 0);
+    replaceInstUsesWith(*L, BitCast);
     eraseInstFromFunction(*L);
   }
 
@@ -287,8 +287,8 @@ SILCombiner::visitUncheckedRefCastInst(UncheckedRefCastInst *URCI) {
                                               UI->getOperand(),
                                               URCI->getType());
 
-  if (URCI->getType() != URCI->getOperand().getType() &&
-      URCI->getType().isSuperclassOf(URCI->getOperand().getType()))
+  if (URCI->getType() != URCI->getOperand()->getType() &&
+      URCI->getType().isExactSuperclassOf(URCI->getOperand()->getType()))
     return Builder.createUpcast(URCI->getLoc(), URCI->getOperand(),
                                 URCI->getType());
 
@@ -304,11 +304,11 @@ SILCombiner::visitUncheckedRefCastInst(UncheckedRefCastInst *URCI) {
 
 SILInstruction *
 SILCombiner::visitUncheckedRefCastAddrInst(UncheckedRefCastAddrInst *URCI) {
-  SILType SrcTy = URCI->getSrc().getType();
+  SILType SrcTy = URCI->getSrc()->getType();
   if (!SrcTy.isLoadable(URCI->getModule()))
     return nullptr;
 
-  SILType DestTy = URCI->getDest().getType();
+  SILType DestTy = URCI->getDest()->getType();
   if (!DestTy.isLoadable(URCI->getModule()))
     return nullptr;
 
@@ -322,11 +322,13 @@ SILCombiner::visitUncheckedRefCastAddrInst(UncheckedRefCastAddrInst *URCI) {
  
   SILLocation Loc = URCI->getLoc();
   Builder.setCurrentDebugScope(URCI->getDebugScope());
-  LoadInst *load = Builder.createLoad(Loc, URCI->getSrc());
+  LoadInst *load = Builder.createLoad(Loc, URCI->getSrc(),
+                                      LoadOwnershipQualifier::Unqualified);
   auto *cast = Builder.tryCreateUncheckedRefCast(Loc, load,
                                                  DestTy.getObjectType());
   assert(cast && "SILBuilder cannot handle reference-castable types");
-  Builder.createStore(Loc, cast, URCI->getDest());
+  Builder.createStore(Loc, cast, URCI->getDest(),
+                      StoreOwnershipQualifier::Unqualified);
 
   return eraseInstFromFunction(*URCI);
 }
@@ -353,8 +355,8 @@ visitUnconditionalCheckedCastInst(UnconditionalCheckedCastInst *UCCI) {
       // unconditional_checked_cast -> unchecked_addr_cast
       return Builder.createUncheckedAddrCast(Loc, Op, LoweredTargetType);
     } else if (LoweredTargetType.isHeapObjectReferenceType()) {
-      if (!(Op.getType().isHeapObjectReferenceType() ||
-            Op.getType().isClassExistentialType())) {
+      if (!(Op->getType().isHeapObjectReferenceType() ||
+            Op->getType().isClassExistentialType())) {
         return nullptr;
       }
       // unconditional_checked_cast -> unchecked_ref_cast
@@ -441,7 +443,7 @@ visitMetatypeConversionInst(SILBuilder &Builder, ConversionInst *MCI,
   SILValue Op = MCI->getOperand(0);
   // Instruction has a proper target type already.
   SILType Ty = MCI->getType();
-  auto MetatypeTy = Op.getType().getAs<AnyMetatypeType>();
+  auto MetatypeTy = Op->getType().getAs<AnyMetatypeType>();
 
   if (MetatypeTy->getRepresentation() != Representation)
     return nullptr;

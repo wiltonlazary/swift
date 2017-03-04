@@ -2,11 +2,11 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2016 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 #ifndef SWIFT_SILOPTIMIZER_PASSMANAGER_TRANSFORMS_H
@@ -96,14 +96,31 @@ namespace swift {
 
     void injectFunction(SILFunction *Func) { F = Func; }
 
-    /// \brief Notify the pass manager of a function that needs to be
-    /// processed by the function passes.
-    void notifyPassManagerOfFunction(SILFunction *F) {
-      PM->addFunctionToWorklist(F);
+    /// \brief Notify the pass manager of a function \p F that needs to be
+    /// processed by the function passes and the analyses.
+    ///
+    /// If not null, the function \p DerivedFrom is the function from which \p F
+    /// is derived. This is used to limit the number of new functions which are
+    /// derived from a common base function, e.g. due to specialization.
+    /// The number should be small anyway, but bugs in optimizations could cause
+    /// an infinite loop in the passmanager.
+    void notifyPassManagerOfFunction(SILFunction *F, SILFunction *DerivedFrom) {
+      PM->addFunctionToWorklist(F, DerivedFrom);
+      PM->notifyAnalysisOfFunction(F);
     }
+
+    /// \brief Reoptimize the current function by restarting the pass
+    /// pipeline on it.
+    void restartPassPipeline() { PM->restartWithCurrentFunction(this); }
 
   protected:
     SILFunction *getFunction() { return F; }
+
+    irgen::IRGenModule *getIRGenModule() {
+      auto *Mod = PM->getIRGenModule();
+      assert(Mod && "Expecting a valid module");
+      return Mod;
+    }
 
     void invalidateAnalysis(SILAnalysis::InvalidationKind K) {
       PM->invalidateAnalysis(F, K);
@@ -140,8 +157,13 @@ namespace swift {
       PM->invalidateAnalysis(F, K);
     }
 
+    /// Invalidate only the function \p F, using invalidation information \p K.
+    /// But we also know this function is going to be dead.
+    void invalidateAnalysisForDeadFunction(SILFunction *F,
+                                           SILAnalysis::InvalidationKind K) {
+      PM->invalidateAnalysisForDeadFunction(F, K);
+    }
   };
-
 } // end namespace swift
 
 #endif

@@ -42,20 +42,20 @@ public struct Color {
 
 // Resilient enum
 public enum Medium {
-  // Empty cases
-  case Paper
-  case Canvas
-
   // Indirect case
-  indirect case Pamphlet(Medium)
+  indirect case Pamphlet(Medium)  // -1
 
   // Case with resilient payload
-  case Postcard(Size)
+  case Postcard(Size)             // -2
+
+  // Empty cases
+  case Paper                      // 0
+  case Canvas                     // 1
 }
 
 // Indirect resilient enum
 public indirect enum IndirectApproach {
-  case Angle(Double)
+  case Angle(Double)              // -1
 }
 
 // Resilient enum with resilient empty payload case
@@ -64,9 +64,9 @@ public struct EmptyStruct {
 }
 
 public enum ResilientEnumWithEmptyCase {
-  case A // should always be case 1
-  case B // should always be case 2
-  case Empty(EmptyStruct) // should always be case 0
+  case A                          // 0
+  case B                          // 1
+  case Empty(EmptyStruct)         // -1
 }
 
 public func getResilientEnumWithEmptyCase() -> [ResilientEnumWithEmptyCase] {
@@ -93,17 +93,17 @@ public enum ResilientNoPayloadEnum {
 }
 
 public enum ResilientSinglePayloadEnum {
-  case A
-  case B
-  case C
-  case X(AnyObject)
+  case X(AnyObject)               // -1
+  case A                          // 0
+  case B                          // 1
+  case C                          // 2
 }
 
 public enum ResilientSinglePayloadGenericEnum<T> {
-  case A
-  case B
-  case C
-  case X(T)
+  case X(T)                       // -1
+  case A                          // 0
+  case B                          // 1
+  case C                          // 2
 }
 
 public class ArtClass {
@@ -118,7 +118,7 @@ public enum ResilientMultiPayloadEnum {
   case Y(Int)
 }
 
-public func makeResilientMultiPayloadEnum(n: Int, i: Int)
+public func makeResilientMultiPayloadEnum(_ n: Int, i: Int)
     -> ResilientMultiPayloadEnum {
   switch i {
   case 0:
@@ -137,14 +137,14 @@ public func makeResilientMultiPayloadEnum(n: Int, i: Int)
 }
 
 public enum ResilientMultiPayloadEnumSpareBits {
-  case A
-  case B
-  case C
-  case X(ArtClass)
-  case Y(ArtClass)
+  case A                          // 0
+  case B                          // 1
+  case C                          // 2
+  case X(ArtClass)                // -1
+  case Y(ArtClass)                // -2
 }
 
-public func makeResilientMultiPayloadEnumSpareBits(o: ArtClass, i: Int)
+public func makeResilientMultiPayloadEnumSpareBits(_ o: ArtClass, i: Int)
     -> ResilientMultiPayloadEnumSpareBits {
   switch i {
   case 0:
@@ -178,15 +178,28 @@ public enum ResilientMultiPayloadEnumSpareBitsAndExtraBits {
 }
 
 public enum ResilientMultiPayloadGenericEnum<T> {
-  case A
-  case B
-  case C
-  case X(T)
-  case Y(T)
+  case A                          // 0
+  case B                          // 1
+  case C                          // 2
+  case X(T)                       // -1
+  case Y(T)                       // -2
+}
+
+public enum ResilientMultiPayloadGenericEnumFixedSize<T> {
+  case A                          // 0
+  case B                          // 1
+  case C                          // 2
+  case X(Int)                     // -1
+  case Y(Int)                     // -2
 }
 
 public enum ResilientIndirectEnum {
+  // 0
   case Base
+
+  // -1
   indirect case A(ResilientIndirectEnum)
+
+  // -2
   indirect case B(ResilientIndirectEnum, ResilientIndirectEnum)
 }

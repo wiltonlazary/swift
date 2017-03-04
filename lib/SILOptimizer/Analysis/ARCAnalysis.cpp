@@ -2,27 +2,47 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2016 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 
 #define DEBUG_TYPE "sil-arc-analysis"
+
 #include "swift/SILOptimizer/Analysis/ARCAnalysis.h"
-#include "swift/Basic/Fallthrough.h"
+#include "swift/SIL/DebugUtils.h"
+#include "swift/SIL/InstructionUtils.h"
 #include "swift/SIL/SILFunction.h"
 #include "swift/SIL/SILInstruction.h"
+#include "swift/SIL/Projection.h"
 #include "swift/SILOptimizer/Analysis/AliasAnalysis.h"
 #include "swift/SILOptimizer/Analysis/RCIdentityAnalysis.h"
 #include "swift/SILOptimizer/Analysis/ValueTracking.h"
 #include "swift/SILOptimizer/Utils/Local.h"
 #include "llvm/ADT/StringSwitch.h"
+#include "llvm/ADT/BitVector.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/Support/Debug.h"
 
 using namespace swift;
+
+using BasicBlockRetainValue = std::pair<SILBasicBlock *, SILValue>;
+
+//===----------------------------------------------------------------------===//
+//                             Utility Analysis
+//===----------------------------------------------------------------------===//
+
+bool swift::isRetainInstruction(SILInstruction *I) {
+  return isa<StrongRetainInst>(I) || isa<RetainValueInst>(I);
+}
+
+
+bool swift::isReleaseInstruction(SILInstruction *I) {
+  return isa<StrongReleaseInst>(I) || isa<ReleaseValueInst>(I);
+}
 
 //===----------------------------------------------------------------------===//
 //                             Decrement Analysis
@@ -71,7 +91,7 @@ static bool canApplyOfBuiltinUseNonTrivialValues(BuiltinInst *BInst) {
   if (II.ID != llvm::Intrinsic::not_intrinsic) {
     if (II.hasAttribute(llvm::Attribute::ReadNone)) {
       for (auto &Op : BInst->getAllOperands()) {
-        if (!Op.get().getType().isTrivial(Mod)) {
+        if (!Op.get()->getType().isTrivial(Mod)) {
           return false;
         }
       }
@@ -83,7 +103,7 @@ static bool canApplyOfBuiltinUseNonTrivialValues(BuiltinInst *BInst) {
   auto &BI = BInst->getBuiltinInfo();
   if (BI.isReadNone()) {
     for (auto &Op : BInst->getAllOperands()) {
-      if (!Op.get().getType().isTrivial(Mod)) {
+      if (!Op.get()->getType().isTrivial(Mod)) {
         return false;
       }
     }
@@ -147,7 +167,7 @@ bool swift::canNeverUseValues(SILInstruction *Inst) {
   // safe.
   case ValueKind::UncheckedTrivialBitCastInst: {
     SILValue Op = cast<UncheckedTrivialBitCastInst>(Inst)->getOperand();
-    return Op.getType().isTrivial(Inst->getModule());
+    return Op->getType().isTrivial(Inst->getModule());
   }
 
   // Typed GEPs do not use pointers. The user of the typed GEP may but we will
@@ -158,6 +178,7 @@ bool swift::canNeverUseValues(SILInstruction *Inst) {
   case ValueKind::TupleElementAddrInst:
   case ValueKind::UncheckedTakeEnumDataAddrInst:
   case ValueKind::RefElementAddrInst:
+  case ValueKind::RefTailAddrInst:
   case ValueKind::UncheckedEnumDataInst:
   case ValueKind::IndexAddrInst:
   case ValueKind::IndexRawPointerInst:
@@ -229,8 +250,12 @@ static bool canTerminatorUseValue(TermInst *TI, SILValue Ptr,
   return doOperandsAlias(CCBI->getAllOperands(), Ptr, AA);
 }
 
-bool swift::mayUseValue(SILInstruction *User, SILValue Ptr,
-                        AliasAnalysis *AA) {
+
+bool swift::mayHaveSymmetricInterference(SILInstruction *User, SILValue Ptr, AliasAnalysis *AA) {
+  // Check whether releasing this value can call deinit and interfere with User.
+  if (AA->mayValueReleaseInterfereWithInstruction(User, Ptr))
+    return true;
+  
   // If Inst is an instruction that we know can never use values with reference
   // semantics, return true.
   if (canNeverUseValues(User))
@@ -240,18 +265,14 @@ bool swift::mayUseValue(SILInstruction *User, SILValue Ptr,
   // the object then return true.
   // Notice that we need to check all of the values of the object.
   if (isa<StoreInst>(User)) {
-    for (int i = 0, e = Ptr->getNumTypes(); i < e; i++) {
-      if (AA->mayWriteToMemory(User, SILValue(Ptr.getDef(), i)))
-        return true;
-    }
+    if (AA->mayWriteToMemory(User, Ptr))
+      return true;
     return false;
   }
 
   if (isa<LoadInst>(User) ) {
-    for (int i = 0, e = Ptr->getNumTypes(); i < e; i++) {
-      if (AA->mayReadFromMemory(User, SILValue(Ptr.getDef(), i)))
-        return true;
-    }
+    if (AA->mayReadFromMemory(User, Ptr))
+      return true;
     return false;
   }
 
@@ -336,7 +357,7 @@ valueHasARCUsesInInstructionRange(SILValue Op,
   // Otherwise, until Start != End.
   while (Start != End) {
     // Check if Start can use Op in an ARC relevant way. If so, return true.
-    if (mayUseValue(&*Start, Op, AA))
+    if (mayHaveSymmetricInterference(&*Start, Op, AA))
       return Start;
 
     // Otherwise, increment our iterator.
@@ -367,7 +388,7 @@ swift::valueHasARCUsesInReverseInstructionRange(SILValue Op,
   // Otherwise, until End == Start.
   while (Start != End) {
     // Check if Start can use Op in an ARC relevant way. If so, return true.
-    if (mayUseValue(&*End, Op, AA))
+    if (mayHaveSymmetricInterference(&*End, Op, AA))
       return End;
 
     // Otherwise, decrement our iterator.
@@ -435,9 +456,8 @@ mayGuaranteedUseValue(SILInstruction *User, SILValue Ptr, AliasAnalysis *AA) {
     if (!Params[i].isGuaranteed())
       continue;
     SILValue Op = FAS.getArgument(i);
-    for (int i = 0, e = Ptr->getNumTypes(); i < e; i++)
-      if (!AA->isNoAlias(Op, SILValue(Ptr.getDef(), i)))
-        return true;
+    if (!AA->isNoAlias(Op, Ptr))
+      return true;
   }
 
   // Ok, we were able to prove that all arguments to the apply that were
@@ -446,17 +466,208 @@ mayGuaranteedUseValue(SILInstruction *User, SILValue Ptr, AliasAnalysis *AA) {
 }
 
 //===----------------------------------------------------------------------===//
-//           Utilities for recognizing trap BBs that are ARC inert
+//                          Owned Result Utilities
 //===----------------------------------------------------------------------===//
 
+ConsumedResultToEpilogueRetainMatcher::
+ConsumedResultToEpilogueRetainMatcher(RCIdentityFunctionInfo *RCFI,
+                                      AliasAnalysis *AA,
+                                      SILFunction *F)
+    : F(F), RCFI(RCFI), AA(AA) {
+  recompute();
+}
+
+void ConsumedResultToEpilogueRetainMatcher::recompute() {
+  EpilogueRetainInsts.clear();
+
+  // Find the return BB of F. If we fail, then bail.
+  SILFunction::iterator BB = F->findReturnBB();
+  if (BB == F->end())
+    return;
+  findMatchingRetains(&*BB);
+}
+
+bool
+ConsumedResultToEpilogueRetainMatcher::
+isTransitiveSuccessorsRetainFree(llvm::DenseSet<SILBasicBlock *> BBs) {
+  // For every block with retain, we need to check the transitive
+  // closure of its successors are retain-free.
+  for (auto &I : EpilogueRetainInsts) {
+    auto *CBB = I->getParent();
+    for (auto &Succ : CBB->getSuccessors()) {
+      if (BBs.find(Succ) != BBs.end())
+        continue;
+      return false;
+    }
+  }
+  for (auto CBB : BBs) {
+    for (auto &Succ : CBB->getSuccessors()) {
+      if (BBs.find(Succ) != BBs.end())
+        continue;
+      return false;
+    }
+  }
+  return true;
+}
+
+ConsumedResultToEpilogueRetainMatcher::RetainKindValue
+ConsumedResultToEpilogueRetainMatcher::
+findMatchingRetainsInBasicBlock(SILBasicBlock *BB, SILValue V) {
+  for (auto II = BB->rbegin(), IE = BB->rend(); II != IE; ++II) {
+    // Handle self-recursion.
+    if (ApplyInst *AI = dyn_cast<ApplyInst>(&*II))
+      if (AI->getCalleeFunction() == BB->getParent()) 
+        return std::make_pair(FindRetainKind::Recursion, AI);
+    
+    // If we do not have a retain_value or strong_retain...
+    if (!isa<RetainValueInst>(*II) && !isa<StrongRetainInst>(*II)) {
+      // we can ignore it if it can not decrement the reference count of the
+      // return value.
+      if (!mayDecrementRefCount(&*II, V, AA))
+        continue;
+
+      // Otherwise, we need to stop computing since we do not want to create
+      // lifetime gap.
+      return std::make_pair(FindRetainKind::Blocked, nullptr);
+    }
+
+    // Ok, we have a retain_value or strong_retain. Grab Target and find the
+    // RC identity root of its operand.
+    SILInstruction *Target = &*II;
+    SILValue RetainValue = RCFI->getRCIdentityRoot(Target->getOperand(0));
+    SILValue ReturnValue = RCFI->getRCIdentityRoot(V);
+
+    // Is this the epilogue retain we are looking for ?.
+    // We break here as we do not know whether this is a part of the epilogue
+    // retain for the @own return value.
+    if (RetainValue != ReturnValue)
+      break;
+
+    return std::make_pair(FindRetainKind::Found, &*II);
+  }
+
+  // Did not find retain in this block.
+  return std::make_pair(FindRetainKind::None, nullptr);
+} 
+
+void
+ConsumedResultToEpilogueRetainMatcher::
+findMatchingRetains(SILBasicBlock *BB) {
+  // Iterate over the instructions post-order and find retains associated with
+  // return value.
+  SILValue RV = SILValue();
+  for (auto II = BB->rbegin(), IE = BB->rend(); II != IE; ++II) {
+    if (ReturnInst *RI = dyn_cast<ReturnInst>(&*II)) {
+      RV = RI->getOperand();
+      break;
+    }
+  }
+
+  // Somehow, we managed not to find a return value.
+  if (!RV)
+    return;
+
+  // OK. we've found the return value, now iterate on the CFG to find all the
+  // post-dominating retains.
+  //
+  // The ConsumedArgToEpilogueReleaseMatcher finds the final releases
+  // in the following way. 
+  //
+  // 1. If an instruction, which is not releaseinst nor releasevalue, that
+  // could decrement reference count is found. bail out.
+  //
+  // 2. If a release is found and the release that can not be mapped to any
+  // @owned argument. bail as this release may well be the final release of
+  // an @owned argument, but somehow rc-identity fails to prove that.
+  //
+  // 3. A release that is mapped to an argument which already has a release
+  // that overlaps with this release. This release for sure is not the final
+  // release.
+  constexpr unsigned WorkListMaxSize = 4;
+
+  llvm::DenseSet<SILBasicBlock *> RetainFrees;
+  llvm::SmallVector<BasicBlockRetainValue, 4> WorkList;
+  llvm::DenseSet<SILBasicBlock *> HandledBBs;
+  WorkList.push_back(std::make_pair(BB, RV));
+  HandledBBs.insert(BB);
+  while (!WorkList.empty()) {
+    // Too many blocks ?.
+    if (WorkList.size() > WorkListMaxSize) {
+      EpilogueRetainInsts.clear();
+      return;
+    }
+
+    // Try to find a retain %value in this basic block.
+    auto R = WorkList.pop_back_val();
+    RetainKindValue Kind = findMatchingRetainsInBasicBlock(R.first, R.second);
+
+    // We've found a retain on this path.
+    if (Kind.first == FindRetainKind::Found) { 
+      EpilogueRetainInsts.push_back(Kind.second);
+      continue;
+    }
+
+    // There is a MayDecrement instruction.
+    if (Kind.first == FindRetainKind::Blocked) {
+      EpilogueRetainInsts.clear();
+      return;
+    }
+
+    // There is a self-recursion. Use the apply instruction as the retain.
+    if (Kind.first == FindRetainKind::Recursion) {
+      EpilogueRetainInsts.push_back(Kind.second);
+      continue;
+    }
+  
+    // Did not find a retain in this block, try to go to its predecessors.
+    if (Kind.first == FindRetainKind::None) {
+      // We can not find a retain in a block with no predecessors.
+      if (R.first->getPredecessorBlocks().begin() ==
+          R.first->getPredecessorBlocks().end()) {
+        EpilogueRetainInsts.clear();
+        return;
+      }
+
+      // This block does not have a retain.
+      RetainFrees.insert(R.first);
+
+      // If this is a SILArgument of current basic block, we can split it up to
+      // values in the predecessors.
+      auto *SA = dyn_cast<SILPHIArgument>(R.second);
+      if (SA && SA->getParent() != R.first)
+        SA = nullptr;
+
+      for (auto X : R.first->getPredecessorBlocks()) {
+        if (HandledBBs.find(X) != HandledBBs.end())
+          continue;
+        // Try to use the predecessor edge-value.
+        if (SA && SA->getIncomingValue(X)) {
+          WorkList.push_back(std::make_pair(X, SA->getIncomingValue(X)));
+        }
+        else 
+          WorkList.push_back(std::make_pair(X, R.second));
+   
+        HandledBBs.insert(X);
+      }
+    }
+  }
+
+  // Lastly, check whether all the successor blocks are retain-free.
+  if (!isTransitiveSuccessorsRetainFree(RetainFrees))
+    EpilogueRetainInsts.clear();
+
+  // At this point, we've either failed to find any epilogue retains or
+  // all the post-dominating epilogue retains.
+}
 
 //===----------------------------------------------------------------------===//
 //                          Owned Argument Utilities
 //===----------------------------------------------------------------------===//
 
-ConsumedArgToEpilogueReleaseMatcher::ConsumedArgToEpilogueReleaseMatcher(
-    RCIdentityFunctionInfo *RCFI, SILFunction *F, ExitKind Kind)
-    : F(F), RCFI(RCFI), Kind(Kind) {
+ConsumedArgToEpilogueReleaseMatcher::
+ConsumedArgToEpilogueReleaseMatcher(RCIdentityFunctionInfo *RCFI,
+                                    SILFunction *F, ExitKind Kind)
+   : F(F), RCFI(RCFI), Kind(Kind), ProcessedBlock(nullptr) {
   recompute();
 }
 
@@ -475,51 +686,180 @@ void ConsumedArgToEpilogueReleaseMatcher::recompute() {
   }
 
   if (BB == F->end()) {
-    HasBlock = false;
+    ProcessedBlock = nullptr;
     return;
   }
-  HasBlock = true;
+  ProcessedBlock = &*BB;
   findMatchingReleases(&*BB);
 }
 
-void ConsumedArgToEpilogueReleaseMatcher::findMatchingReleases(
-    SILBasicBlock *BB) {
-  for (auto II = std::next(BB->rbegin()), IE = BB->rend();
-       II != IE; ++II) {
-    // If we do not have a release_value or strong_release...
-    if (!isa<ReleaseValueInst>(*II) && !isa<StrongReleaseInst>(*II)) {
-      // And the object cannot use values in a manner that will keep the object
-      // alive, continue. We may be able to find additional releases.
-      if (canNeverUseValues(&*II))
-        continue;
+bool
+ConsumedArgToEpilogueReleaseMatcher::
+isRedundantRelease(ReleaseList Insts, SILValue Base, SILValue Derived) {
+  // We use projection path to analyze the relation.
+  auto POp = ProjectionPath::getProjectionPath(Base, Derived);
+  // We can not build a projection path from the base to the derived, bail out.
+  // and return true so that we can stop the epilogue walking sequence.
+  if (!POp.hasValue())
+    return true;
 
-      // Otherwise, we need to stop computing since we do not want to reduce the
-      // lifetime of objects.
-      return;
+  for (auto &R : Insts) {
+    SILValue ROp = R->getOperand(0);
+    auto PROp = ProjectionPath::getProjectionPath(Base, ROp); 
+    if (!PROp.hasValue())
+      return true;
+    // If Op is a part of ROp or Rop is a part of Op. then we have seen
+    // a redundant release.
+    if (!PROp.getValue().hasNonEmptySymmetricDifference(POp.getValue()))
+      return true;
+  }
+  return false;
+}
+
+bool
+ConsumedArgToEpilogueReleaseMatcher::
+releaseArgument(ReleaseList Insts, SILValue Arg) {
+  // Reason about whether all parts are released.
+  SILModule *Mod = &(*Insts.begin())->getModule();
+
+  // These are the list of SILValues that are actually released.
+  ProjectionPathSet Paths;
+  for (auto &I : Insts) {
+    auto PP = ProjectionPath::getProjectionPath(Arg, I->getOperand(0));
+    if (!PP)
+      return false;
+    Paths.insert(PP.getValue());
+  } 
+
+  // Is there an uncovered non-trivial type.
+  return !ProjectionPath::hasUncoveredNonTrivials(Arg->getType(), Mod, Paths);
+}
+
+void
+ConsumedArgToEpilogueReleaseMatcher::
+processMatchingReleases() {
+  llvm::DenseSet<SILArgument *> ArgToRemove;
+  // If we can not find a release for all parts with reference semantics
+  // that means we did not find all releases for the base.
+  for (auto Arg : ArgInstMap) {
+    // If an argument has a single release and it is rc-identical to the
+    // SILArgument. Then we do not need to use projection to check for whether
+    // all non-trivial fields are covered.
+    if (Arg.second.size() == 1) {
+      SILInstruction *I = *Arg.second.begin();
+      SILValue RV = I->getOperand(0);
+      if (Arg.first == RCFI->getRCIdentityRoot(RV))
+        continue;
+    }
+
+    // OK. we have multiple epilogue releases for this argument, check whether
+    // it has covered all fields with reference semantic in the argument.
+    if (releaseArgument(Arg.second, Arg.first))
+      continue;
+
+    // OK. we did find some epilogue releases, just not all.
+    if (!Arg.second.empty())
+      FoundSomeReleases.insert(Arg.first);
+
+    ArgToRemove.insert(Arg.first);
+  }
+
+  // Clear any releases found for this argument.
+  for (auto &X : ArgToRemove) { 
+    ArgInstMap.erase(ArgInstMap.find(X));
+  }
+}
+
+void
+ConsumedArgToEpilogueReleaseMatcher::
+collectMatchingReleases(SILBasicBlock *BB) {
+  // Iterate over the instructions post-order and find final releases
+  // associated with each arguments.
+  //
+  // The ConsumedArgToEpilogueReleaseMatcher finds the final releases
+  // in the following way. 
+  //
+  // 1. If an instruction, which is not releaseinst nor releasevalue, that
+  // could decrement reference count is found. bail out.
+  //
+  // 2. If a release is found and the release that can not be mapped to any
+  // @owned argument. bail as this release may well be the final release of
+  // an @owned argument, but somehow rc-identity fails to prove that.
+  //
+  // 3. A release that is mapped to an argument which already has a release
+  // that overlaps with this release. This release for sure is not the final
+  // release.
+  for (auto II = std::next(BB->rbegin()), IE = BB->rend(); II != IE; ++II) {
+    // If we do not have a release_value or strong_release. We can continue
+    if (!isa<ReleaseValueInst>(*II) && !isa<StrongReleaseInst>(*II)) {
+
+      // We cannot match a final release if it is followed by a dealloc_ref.
+      if (isa<DeallocRefInst>(*II))
+        break;
+
+      // We do not know what this instruction is, do a simple check to make sure
+      // that it does not decrement the reference count of any of its operand. 
+      //
+      // TODO: we could make the logic here more complicated to handle each type
+      // of instructions in a more precise manner.
+      if (!II->mayRelease())
+        continue;
+      // This instruction may release something, bail out conservatively.
+      break;
     }
 
     // Ok, we have a release_value or strong_release. Grab Target and find the
     // RC identity root of its operand.
     SILInstruction *Target = &*II;
-    SILValue Op = RCFI->getRCIdentityRoot(Target->getOperand(0));
+    SILValue OrigOp = Target->getOperand(0);
+    SILValue Op = RCFI->getRCIdentityRoot(OrigOp);
+
+    // Check whether this is a SILArgument or a part of a SILArgument. This is
+    // possible after we expand release instructions in SILLowerAgg pass.
+    auto *Arg = dyn_cast<SILFunctionArgument>(stripValueProjections(Op));
+    if (!Arg)
+      break;
 
     // If Op is not a consumed argument, we must break since this is not an Op
     // that is a part of a return sequence. We are being conservative here since
     // we could make this more general by allowing for intervening non-arg
     // releases in the sense that we do not allow for race conditions in between
     // destructors.
-    auto *Arg = dyn_cast<SILArgument>(Op);
-    if (!Arg || !Arg->isFunctionArg() ||
-        !Arg->hasConvention(ParameterConvention::Direct_Owned))
-      return;
+    if (!Arg->hasConvention(SILArgumentConvention::Direct_Owned))
+      break;
 
     // Ok, we have a release on a SILArgument that is direct owned. Attempt to
     // put it into our arc opts map. If we already have it, we have exited the
     // return value sequence so break. Otherwise, continue looking for more arc
     // operations.
-    if (!ArgInstMap.insert({Arg, Target}).second)
-      return;
+    auto Iter = ArgInstMap.find(Arg);
+    if (Iter == ArgInstMap.end()) {
+      ArgInstMap[Arg].push_back(Target);
+      continue;
+    }
+
+    // We've already seen at least part of this base. Check to see whether we
+    // are seeing a redundant release.
+    //
+    // If we are seeing a redundant release we have exited the return value
+    // sequence, so break.
+    if (isRedundantRelease(Iter->second, Arg, OrigOp)) 
+      break;
+    
+    // We've seen part of this base, but this is a part we've have not seen.
+    // Record it. 
+    Iter->second.push_back(Target);
   }
+}
+
+void
+ConsumedArgToEpilogueReleaseMatcher::
+findMatchingReleases(SILBasicBlock *BB) {
+  // Walk the given basic block to find all the epilogue releases.
+  collectMatchingReleases(BB);
+  // We've exited the epilogue sequence, try to find out which parameter we
+  // have all the epilogue releases for and which one we did not.
+  processMatchingReleases();
 }
 
 //===----------------------------------------------------------------------===//
@@ -533,7 +873,7 @@ static void propagateLiveness(llvm::SmallPtrSetImpl<SILBasicBlock *> &LiveIn,
   // First populate a worklist of predecessors.
   llvm::SmallVector<SILBasicBlock *, 64> Worklist;
   for (auto *BB : LiveIn)
-    for (auto Pred : BB->getPreds())
+    for (auto Pred : BB->getPredecessorBlocks())
       Worklist.push_back(Pred);
 
   // Now propagate liveness backwards until we hit the alloc_box.
@@ -545,7 +885,7 @@ static void propagateLiveness(llvm::SmallPtrSetImpl<SILBasicBlock *> &LiveIn,
     if (BB == DefBB || !LiveIn.insert(BB).second)
       continue;
 
-    for (auto Pred : BB->getPreds())
+    for (auto Pred : BB->getPredecessorBlocks())
       Worklist.push_back(Pred);
   }
 }
@@ -566,7 +906,7 @@ static bool addLastUse(SILValue V, SILBasicBlock *BB,
                        ReleaseTracker &Tracker) {
   for (auto I = BB->rbegin(); I != BB->rend(); ++I) {
     for (auto &Op : I->getAllOperands())
-      if (Op.get().getDef() == V.getDef()) {
+      if (Op.get() == V) {
         Tracker.trackLastRelease(&*I);
         return true;
       }
@@ -583,7 +923,7 @@ bool swift::getFinalReleasesForValue(SILValue V, ReleaseTracker &Tracker) {
   llvm::SmallPtrSet<SILBasicBlock *, 16> UseBlocks;
 
   // First attempt to get the BB where this value resides.
-  auto *DefBB = V->getParentBB();
+  auto *DefBB = V->getParentBlock();
   if (!DefBB)
     return false;
 
@@ -593,7 +933,7 @@ bool swift::getFinalReleasesForValue(SILValue V, ReleaseTracker &Tracker) {
   // We'll treat this like a liveness problem where the value is the def. Each
   // block that has a use of the value has the value live-in unless it is the
   // block with the value.
-  for (auto *UI : V.getUses()) {
+  for (auto *UI : V->getUses()) {
     auto *User = UI->getUser();
     auto *BB = User->getParent();
 
@@ -642,7 +982,7 @@ bool swift::getFinalReleasesForValue(SILValue V, ReleaseTracker &Tracker) {
 //===----------------------------------------------------------------------===//
 
 static bool ignorableApplyInstInUnreachableBlock(const ApplyInst *AI) {
-  const auto *Fn = AI->getCalleeFunction();
+  const auto *Fn = AI->getReferencedFunction();
   if (!Fn)
     return false;
 
@@ -708,3 +1048,128 @@ bool swift::isARCInertTrapBB(const SILBasicBlock *BB) {
   // ARC perspective in an unreachable BB.
   return true;
 }
+
+//===----------------------------------------------------------------------===//
+//             Analysis of builtin "unsafeGuaranteed" instructions
+//===----------------------------------------------------------------------===//
+std::pair<SILInstruction *, SILInstruction *>
+swift::getSingleUnsafeGuaranteedValueResult(BuiltinInst *BI) {
+  assert(BI->getBuiltinKind() &&
+         *BI->getBuiltinKind() == BuiltinValueKind::UnsafeGuaranteed &&
+         "Expecting a unsafeGuaranteed builtin");
+
+  SILInstruction *GuaranteedValue = nullptr;
+  SILInstruction *Token = nullptr;
+
+  auto Failed = std::make_pair(nullptr, nullptr);
+
+  for (auto *Operand : getNonDebugUses(BI)) {
+    auto *Usr = Operand->getUser();
+    if (isa<ReleaseValueInst>(Usr) || isa<RetainValueInst>(Usr))
+      continue;
+
+    auto *TE = dyn_cast<TupleExtractInst>(Usr);
+    if (!TE || TE->getOperand() != BI)
+      return Failed;
+
+    if (TE->getFieldNo() == 0 && !GuaranteedValue) {
+      GuaranteedValue = TE;
+      continue;
+    }
+    if (TE->getFieldNo() == 1 && !Token) {
+      Token = TE;
+      continue;
+    }
+    return Failed;
+  }
+
+  if (!GuaranteedValue || !Token)
+    return Failed;
+
+  return std::make_pair(GuaranteedValue, Token);
+}
+
+BuiltinInst *swift::getUnsafeGuaranteedEndUser(SILInstruction *UnsafeGuaranteedToken) {
+  BuiltinInst *UnsafeGuaranteedEndI = nullptr;
+
+  for (auto *Operand : getNonDebugUses(UnsafeGuaranteedToken)) {
+    if (UnsafeGuaranteedEndI) {
+      DEBUG(llvm::dbgs() << "  multiple unsafeGuaranteedEnd users\n");
+      UnsafeGuaranteedEndI = nullptr;
+      break;
+    }
+    auto *BI = dyn_cast<BuiltinInst>(Operand->getUser());
+    if (!BI || !BI->getBuiltinKind() ||
+        *BI->getBuiltinKind() != BuiltinValueKind::UnsafeGuaranteedEnd) {
+      DEBUG(llvm::dbgs() << "  wrong unsafeGuaranteed token user "
+            << *Operand->getUser());
+      break;
+    }
+
+    UnsafeGuaranteedEndI = BI;
+  }
+  return UnsafeGuaranteedEndI;
+}
+
+static bool hasUnsafeGuaranteedOperand(SILValue UnsafeGuaranteedValue,
+                                       SILValue UnsafeGuaranteedValueOperand,
+                                       RCIdentityFunctionInfo &RCII,
+                                       SILInstruction &Release) {
+  assert(isa<StrongReleaseInst>(Release) ||
+         isa<ReleaseValueInst>(Release) && "Expecting a release");
+
+  auto RCRoot = RCII.getRCIdentityRoot(Release.getOperand(0));
+
+  return RCRoot == UnsafeGuaranteedValue ||
+         RCRoot == UnsafeGuaranteedValueOperand;
+}
+
+SILInstruction *swift::findReleaseToMatchUnsafeGuaranteedValue(
+    SILInstruction *UnsafeGuaranteedEndI, SILInstruction *UnsafeGuaranteedI,
+    SILValue UnsafeGuaranteedValue, SILBasicBlock &BB,
+    RCIdentityFunctionInfo &RCFI) {
+
+  auto UnsafeGuaranteedRoot = RCFI.getRCIdentityRoot(UnsafeGuaranteedValue);
+  auto UnsafeGuaranteedOpdRoot =
+      RCFI.getRCIdentityRoot(UnsafeGuaranteedI->getOperand(0));
+
+  // Look before the "unsafeGuaranteedEnd".
+  for (auto ReverseIt = ++UnsafeGuaranteedEndI->getIterator().getReverse(),
+            End = BB.rend();
+       ReverseIt != End; ++ReverseIt) {
+    SILInstruction &CurInst = *ReverseIt;
+
+    // Is this a release?
+    if (isa<ReleaseValueInst>(CurInst) || isa<StrongReleaseInst>(CurInst)) {
+      if (hasUnsafeGuaranteedOperand(UnsafeGuaranteedRoot,
+                                     UnsafeGuaranteedOpdRoot, RCFI, CurInst))
+        return &CurInst;
+      continue;
+    }
+
+    if (CurInst.mayHaveSideEffects() && !isa<DebugValueInst>(CurInst) &&
+        !isa<DebugValueAddrInst>(CurInst))
+      break;
+  }
+
+  // Otherwise, try finding it after the "unsafeGuaranteedEnd".
+  for (auto ForwardIt = std::next(UnsafeGuaranteedEndI->getIterator()),
+            End = BB.end();
+       ForwardIt != End; ++ForwardIt) {
+    SILInstruction &CurInst = *ForwardIt;
+
+    // Is this a release?
+    if (isa<ReleaseValueInst>(CurInst) || isa<StrongReleaseInst>(CurInst)) {
+      if (hasUnsafeGuaranteedOperand(UnsafeGuaranteedRoot,
+                                     UnsafeGuaranteedOpdRoot, RCFI, CurInst))
+        return &CurInst;
+      continue;
+    }
+
+    if (CurInst.mayHaveSideEffects() && !isa<DebugValueInst>(CurInst) &&
+        !isa<DebugValueAddrInst>(CurInst))
+      break;
+  }
+  return nullptr;
+}
+

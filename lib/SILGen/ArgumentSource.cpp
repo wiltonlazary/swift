@@ -1,12 +1,12 @@
-//===--- ArgumentSource.cpp - Latent value representation -------*- C++ -*-===//
+//===--- ArgumentSource.cpp - Latent value representation -----------------===//
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2016 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 //
@@ -47,6 +47,46 @@ void ArgumentSource::rewriteType(CanType newType) & {
     if (expr->getType()->isEqual(newType)) return;
     llvm_unreachable("unimplemented! hope it doesn't happen");
   }
+}
+
+bool ArgumentSource::requiresCalleeToEvaluate() {
+  switch (StoredKind) {
+  case Kind::RValue:
+  case Kind::LValue:
+    return false;
+  case Kind::Expr:
+    // FIXME: TupleShuffleExprs come in two flavors:
+    //
+    // 1) as apply arguments, where they're used to insert default
+    // argument value and collect varargs
+    //
+    // 2) as tuple conversions, where they can introduce, eliminate
+    // and re-order fields
+    //
+    // Case 1) must be emitted by ArgEmitter, and Case 2) must be
+    // emitted by RValueEmitter.
+    //
+    // It would be good to split up TupleShuffleExpr into these two
+    // cases, and simplify ArgEmitter since it no longer has to deal
+    // with re-ordering. However for now, SubscriptExpr emits the
+    // index argument via the RValueEmitter, so the RValueEmitter has
+    // to know about varargs, duplicating some of the logic in
+    // ArgEmitter.
+    //
+    // Once this is fixed, we can also consider allowing subscripts
+    // to have default arguments.
+    if (auto *shuffleExpr = dyn_cast<TupleShuffleExpr>(asKnownExpr())) {
+      for (auto index : shuffleExpr->getElementMapping()) {
+        if (index == TupleShuffleExpr::DefaultInitialize ||
+            index == TupleShuffleExpr::CallerDefaultInitialize ||
+            index == TupleShuffleExpr::Variadic)
+          return true;
+      }
+    }
+    return false;
+  }
+
+  llvm_unreachable("Unhandled Kind in switch.");
 }
 
 RValue ArgumentSource::getAsRValue(SILGenFunction &gen, SGFContext C) && {
@@ -94,7 +134,7 @@ void ArgumentSource::forwardInto(SILGenFunction &gen, Initialization *dest) && {
   assert(!isLValue());
   if (isRValue()) {
     auto loc = getKnownRValueLocation();
-    return std::move(*this).asKnownRValue().forwardInto(gen, dest, loc);
+    return std::move(*this).asKnownRValue().forwardInto(gen, loc, dest);
   }
 
   auto e = std::move(*this).asKnownExpr();
@@ -175,5 +215,5 @@ void ArgumentSource::forwardInto(SILGenFunction &SGF,
   // we're emitting into an abstracted value, which RValue doesn't
   // really handle.
   auto substLoweredType = destTL.getLoweredType().getSwiftRValueType();
-  RValue(SGF, loc, substLoweredType, outputValue).forwardInto(SGF, dest, loc);
+  RValue(SGF, loc, substLoweredType, outputValue).forwardInto(SGF, loc, dest);
 }

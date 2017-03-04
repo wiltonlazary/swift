@@ -2,20 +2,24 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2016 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 
 #define DEBUG_TYPE "sil-module"
+#include "swift/Serialization/SerializedSILLoader.h"
+#include "swift/AST/GenericEnvironment.h"
+#include "swift/AST/ProtocolConformance.h"
+#include "swift/AST/Substitution.h"
+#include "swift/SIL/FormalLinkage.h"
+#include "swift/SIL/SILDebugScope.h"
 #include "swift/SIL/SILModule.h"
 #include "Linker.h"
-#include "swift/SIL/SILDebugScope.h"
 #include "swift/SIL/SILVisitor.h"
-#include "swift/Serialization/SerializedSILLoader.h"
 #include "swift/SIL/SILValue.h"
 #include "llvm/ADT/FoldingSet.h"
 #include "llvm/ADT/SmallString.h"
@@ -26,33 +30,12 @@
 using namespace swift;
 using namespace Lowering;
 
-namespace swift {
-  /// SILTypeList - The uniqued backing store for the SILValue type list.  This
-  /// is only exposed out of SILValue as an ArrayRef of types, so it should
-  /// never be used outside of libSIL.
-  class SILTypeList : public llvm::FoldingSetNode {
-  public:
-    unsigned NumTypes;
-    SILType Types[1];  // Actually variable sized.
-
-    void Profile(llvm::FoldingSetNodeID &ID) const {
-      for (unsigned i = 0, e = NumTypes; i != e; ++i) {
-        ID.AddPointer(Types[i].getOpaqueValue());
-      }
-    }
-  };
-} // end namespace swift.
-
-/// SILTypeListUniquingType - This is the type of the folding set maintained by
-/// SILModule that these things are uniqued into.
-typedef llvm::FoldingSet<SILTypeList> SILTypeListUniquingType;
-
 class SILModule::SerializationCallback : public SerializedSILLoader::Callback {
-  void didDeserialize(Module *M, SILFunction *fn) override {
+  void didDeserialize(ModuleDecl *M, SILFunction *fn) override {
     updateLinkage(fn);
   }
 
-  void didDeserialize(Module *M, SILGlobalVariable *var) override {
+  void didDeserialize(ModuleDecl *M, SILGlobalVariable *var) override {
     updateLinkage(var);
     
     // For globals we currently do not support available_externally.
@@ -61,12 +44,12 @@ class SILModule::SerializationCallback : public SerializedSILLoader::Callback {
     var->setDeclaration(true);
   }
 
-  void didDeserialize(Module *M, SILVTable *vtable) override {
+  void didDeserialize(ModuleDecl *M, SILVTable *vtable) override {
     // TODO: should vtables get linkage?
     //updateLinkage(vtable);
   }
 
-  void didDeserialize(Module *M, SILWitnessTable *wt) override {
+  void didDeserialize(ModuleDecl *M, SILWitnessTable *wt) override {
     updateLinkage(wt);
   }
 
@@ -93,13 +76,12 @@ class SILModule::SerializationCallback : public SerializedSILLoader::Callback {
   }
 };
 
-SILModule::SILModule(Module *SwiftModule, SILOptions &Options,
+SILModule::SILModule(ModuleDecl *SwiftModule, SILOptions &Options,
                      const DeclContext *associatedDC,
                      bool wholeModule)
   : TheSwiftModule(SwiftModule), AssociatedDeclContext(associatedDC),
     Stage(SILStage::Raw), Callback(new SILModule::SerializationCallback()),
     wholeModule(wholeModule), Options(Options), Types(*this) {
-  TypeListUniquing = new SILTypeListUniquingType();
 }
 
 SILModule::~SILModule() {
@@ -116,8 +98,6 @@ SILModule::~SILModule() {
   // at all.
   for (SILFunction &F : *this)
     F.dropAllReferences();
-
-  delete (SILTypeListUniquingType*)TypeListUniquing;
 }
 
 void *SILModule::allocate(unsigned Size, unsigned Align) const {
@@ -146,63 +126,29 @@ SILModule::createWitnessTableDeclaration(ProtocolConformance *C,
   // Extract the base NormalProtocolConformance.
   NormalProtocolConformance *NormalC = C->getRootNormalConformance();
 
-  SILWitnessTable *WT = SILWitnessTable::create(*this,
-                                                linkage,
-                                                NormalC);
-  return WT;
+  return SILWitnessTable::create(*this, linkage, NormalC);
 }
 
-std::pair<SILWitnessTable *, ArrayRef<Substitution>>
-SILModule::
-lookUpWitnessTable(ProtocolConformanceRef C, bool deserializeLazily) {
+SILWitnessTable *
+SILModule::lookUpWitnessTable(ProtocolConformanceRef C,
+                              bool deserializeLazily) {
   // If we have an abstract conformance passed in (a legal value), just return
   // nullptr.
   if (!C.isConcrete())
-    return {nullptr, {}};
+    return nullptr;
 
   return lookUpWitnessTable(C.getConcrete());
 }
 
-std::pair<SILWitnessTable *, ArrayRef<Substitution>>
-SILModule::
-lookUpWitnessTable(const ProtocolConformance *C, bool deserializeLazily) {
+SILWitnessTable *
+SILModule::lookUpWitnessTable(const ProtocolConformance *C,
+                              bool deserializeLazily) {
   assert(C && "null conformance passed to lookUpWitnessTable");
 
-  // Walk down to the base NormalProtocolConformance.
-  ArrayRef<Substitution> Subs;
-  const ProtocolConformance *ParentC = C;
-  while (!isa<NormalProtocolConformance>(ParentC)) {
-    switch (ParentC->getKind()) {
-    case ProtocolConformanceKind::Normal:
-      llvm_unreachable("should have exited the loop?!");
-    case ProtocolConformanceKind::Inherited:
-      ParentC = cast<InheritedProtocolConformance>(ParentC)
-        ->getInheritedConformance();
-      break;
-    case ProtocolConformanceKind::Specialized: {
-      auto SC = cast<SpecializedProtocolConformance>(ParentC);
-      ParentC = SC->getGenericConformance();
-      assert(Subs.empty() && "multiple conformance specializations?!");
-      Subs = SC->getGenericSubstitutions();
-      break;
-    }
-    }
-  }
-  const NormalProtocolConformance *NormalC
-    = cast<NormalProtocolConformance>(ParentC);
-
-  // If the normal conformance is for a generic type, and we didn't hit a
-  // specialized conformance, collect the substitutions from the generic type.
-  // FIXME: The AST should do this for us.
-  if (NormalC->getType()->isSpecialized() && Subs.empty()) {
-    Subs = NormalC->getType()
-      ->gatherAllSubstitutions(NormalC->getDeclContext()->getParentModule(),
-                               nullptr);
-  }
-
+  const NormalProtocolConformance *NormalC = C->getRootNormalConformance();
   // Attempt to lookup the witness table from the table.
-  auto found = WitnessTableLookupCache.find(NormalC);
-  if (found == WitnessTableLookupCache.end()) {
+  auto found = WitnessTableMap.find(NormalC);
+  if (found == WitnessTableMap.end()) {
 #ifndef NDEBUG
     // Make sure that all witness tables are in the witness table lookup
     // cache.
@@ -216,28 +162,68 @@ lookUpWitnessTable(const ProtocolConformance *C, bool deserializeLazily) {
              "Found witness table that is not"
              " in the witness table lookup cache.");
 #endif
-    return {nullptr, Subs};
+    return nullptr;
   }
 
-  SILWitnessTable *wT = found->second;
-  assert(wT != nullptr && "Should never map a conformance to a null witness"
+  SILWitnessTable *wtable = found->second;
+  assert(wtable != nullptr && "Should never map a conformance to a null witness"
                           " table.");
 
   // If we have a definition, return it.
-  if (wT->isDefinition())
-    return {wT, Subs};
+  if (wtable->isDefinition())
+    return wtable;
 
   // Otherwise try to deserialize it. If we succeed return the deserialized
   // function.
   //
-  // *NOTE* In practice, wT will be deserializedTable, but I do not want to rely
+  // *NOTE* In practice, wtable will be deserializedTable, but I do not want to rely
   // on that behavior for now.
   if (deserializeLazily)
-    if (auto deserializedTable = getSILLoader()->lookupWitnessTable(wT))
-      return {deserializedTable, Subs};
+    if (auto deserialized = getSILLoader()->lookupWitnessTable(wtable))
+      return deserialized;
 
   // If we fail, just return the declaration.
-  return {wT, Subs};
+  return wtable;
+}
+
+SILDefaultWitnessTable *
+SILModule::lookUpDefaultWitnessTable(const ProtocolDecl *Protocol,
+                                     bool deserializeLazily) {
+  // Note: we only ever look up default witness tables in the translation unit
+  // that is currently being compiled, since they SILGen generates them when it
+  // visits the protocol declaration, and IRGen emits them when emitting the
+  // protocol descriptor metadata for the protocol.
+
+  auto found = DefaultWitnessTableMap.find(Protocol);
+  if (found == DefaultWitnessTableMap.end()) {
+    if (deserializeLazily) {
+      SILLinkage linkage =
+        getSILLinkage(getDeclLinkage(Protocol), ForDefinition);
+      SILDefaultWitnessTable *wtable =
+        SILDefaultWitnessTable::create(*this, linkage, Protocol);
+      wtable = getSILLoader()->lookupDefaultWitnessTable(wtable);
+      if (wtable)
+        DefaultWitnessTableMap[Protocol] = wtable;
+      return wtable;
+    }
+
+    return nullptr;
+  }
+
+  return found->second;
+}
+
+SILDefaultWitnessTable *
+SILModule::createDefaultWitnessTableDeclaration(const ProtocolDecl *Protocol,
+                                                SILLinkage Linkage) {
+  return SILDefaultWitnessTable::create(*this, Linkage, Protocol);
+}
+
+void SILModule::deleteWitnessTable(SILWitnessTable *Wt) {
+  NormalProtocolConformance *Conf = Wt->getConformance();
+  assert(lookUpWitnessTable(Conf, false) == Wt);
+  WitnessTableMap.erase(Conf);
+  witnessTables.erase(Wt);
 }
 
 SILFunction *SILModule::getOrCreateFunction(SILLocation loc,
@@ -251,14 +237,15 @@ SILFunction *SILModule::getOrCreateFunction(SILLocation loc,
                                             SILFunction::ClassVisibility_t CV) {
   if (auto fn = lookUpFunction(name)) {
     assert(fn->getLoweredFunctionType() == type);
-    assert(fn->getLinkage() == linkage);
+    assert(fn->getLinkage() == linkage ||
+           stripExternalFromLinkage(fn->getLinkage()) == linkage);
     return fn;
   }
 
   auto fn = SILFunction::create(*this, linkage, name, type, nullptr,
                                 loc, isBareSILFunction, isTransparent,
                                 isFragile, isThunk, CV);
-  fn->setDebugScope(new (*this) SILDebugScope(loc, *fn));
+  fn->setDebugScope(new (*this) SILDebugScope(loc, fn));
   return fn;
 }
 
@@ -280,7 +267,7 @@ static SILFunction::ClassVisibility_t getClassVisibility(SILDeclRef constant) {
   if (context->isExtensionContext())
     return SILFunction::NotRelevant;
 
-  auto *classType = context->isClassOrClassExtensionContext();
+  auto *classType = context->getAsClassOrClassExtensionContext();
   if (!classType || classType->isFinal())
     return SILFunction::NotRelevant;
 
@@ -292,12 +279,16 @@ static SILFunction::ClassVisibility_t getClassVisibility(SILDeclRef constant) {
 
   switch (classType->getEffectiveAccess()) {
     case Accessibility::Private:
+    case Accessibility::FilePrivate:
       return SILFunction::NotRelevant;
     case Accessibility::Internal:
       return SILFunction::InternalClass;
     case Accessibility::Public:
+    case Accessibility::Open:
       return SILFunction::PublicClass;
   }
+
+  llvm_unreachable("Unhandled Accessibility in switch.");
 }
 
 static bool verifySILSelfParameterType(SILDeclRef DeclRef,
@@ -338,7 +329,10 @@ SILFunction *SILModule::getOrCreateFunction(SILLocation loc,
 
   if (auto fn = lookUpFunction(name)) {
     assert(fn->getLoweredFunctionType() == constantType);
-    assert(fn->getLinkage() == linkage);
+    assert(fn->getLinkage() == linkage ||
+           (forDefinition == ForDefinition_t::NotForDefinition &&
+            fn->getLinkage() ==
+                constant.getLinkage(ForDefinition_t::ForDefinition)));
     if (forDefinition) {
       // In all the cases where getConstantLinkage returns something
       // different for ForDefinition, it returns an available-externally
@@ -350,16 +344,16 @@ SILFunction *SILModule::getOrCreateFunction(SILLocation loc,
     return fn;
   }
 
-  IsTransparent_t IsTrans = constant.isTransparent()?
-                              IsTransparent : IsNotTransparent;
-  IsFragile_t IsFrag = IsNotFragile;
-  if (IsTrans == IsTransparent && (linkage == SILLinkage::Public
-                                   || linkage == SILLinkage::PublicExternal)) {
-    IsFrag = IsFragile;
-  }
+  IsTransparent_t IsTrans = constant.isTransparent()
+                            ? IsTransparent
+                            : IsNotTransparent;
+  IsFragile_t IsFrag = constant.isFragile()
+                       ? IsFragile
+                       : IsNotFragile;
 
-  EffectsKind EK = constant.hasEffectsAttribute() ?
-  constant.getEffectsAttribute() : EffectsKind::Unspecified;
+  EffectsKind EK = constant.hasEffectsAttribute()
+                   ? constant.getEffectsAttribute()
+                   : EffectsKind::Unspecified;
 
   Inline_t inlineStrategy = InlineDefault;
   if (constant.isNoinline())
@@ -372,21 +366,30 @@ SILFunction *SILModule::getOrCreateFunction(SILLocation loc,
                                 None, IsNotBare, IsTrans, IsFrag, IsNotThunk,
                                 getClassVisibility(constant),
                                 inlineStrategy, EK);
-
-  if (forDefinition == ForDefinition_t::ForDefinition)
-    F->setDebugScope(new (*this) SILDebugScope(loc, *F));
+  F->setDebugScope(new (*this) SILDebugScope(loc, F));
 
   F->setGlobalInit(constant.isGlobal());
   if (constant.hasDecl()) {
-    if (constant.isForeign && constant.isClangGenerated())
-      F->setForeignBody(HasForeignBody);
+    auto decl = constant.getDecl();
 
-    auto Attrs = constant.getDecl()->getAttrs();
-    for (auto A : Attrs.getAttributes<SemanticsAttr, false /*AllowInvalid*/>())
+    if (constant.isForeign && decl->hasClangNode())
+      F->setClangNodeOwner(decl);
+
+    auto Attrs = decl->getAttrs();
+    for (auto *A : Attrs.getAttributes<SemanticsAttr, false /*AllowInvalid*/>())
       F->addSemanticsAttr(cast<SemanticsAttr>(A)->Value);
-  }
 
-  F->setDeclContext(constant.hasDecl() ? constant.getDecl() : nullptr);
+    for (auto *A :
+           Attrs.getAttributes<SpecializeAttr, false /*AllowInvalid*/>()) {
+      auto *SA = cast<SpecializeAttr>(A);
+      auto kind = SA->getSpecializationKind() ==
+                          SpecializeAttr::SpecializationKind::Full
+                      ? SILSpecializeAttr::SpecializationKind::Full
+                      : SILSpecializeAttr::SpecializationKind::Partial;
+      F->addSpecializeAttr(SILSpecializeAttr::create(
+          *this, SA->getRequirements(), SA->isExported(), kind));
+    }
+  }
 
   // If this function has a self parameter, make sure that it has a +0 calling
   // convention. This cannot be done for general function types, since
@@ -394,7 +397,7 @@ SILFunction *SILModule::getOrCreateFunction(SILLocation loc,
   // it.
   CanSILFunctionType FTy = F->getLoweredFunctionType();
   if (FTy->hasSelfParam()) {
-    (void)verifySILSelfParameterType;
+    (void)&verifySILSelfParameterType;
     assert(verifySILSelfParameterType(constant, F, FTy) &&
            "Invalid signature for SIL Self parameter type");
   }
@@ -416,58 +419,17 @@ SILFunction *SILModule::getOrCreateSharedFunction(SILLocation loc,
                              isThunk, SILFunction::NotRelevant);
 }
 
-SILFunction *SILModule::getOrCreateFunction(
+SILFunction *SILModule::createFunction(
     SILLinkage linkage, StringRef name, CanSILFunctionType loweredType,
-    GenericParamList *contextGenericParams, Optional<SILLocation> loc,
+    GenericEnvironment *genericEnv, Optional<SILLocation> loc,
     IsBare_t isBareSILFunction, IsTransparent_t isTrans, IsFragile_t isFragile,
     IsThunk_t isThunk, SILFunction::ClassVisibility_t classVisibility,
     Inline_t inlineStrategy, EffectsKind EK, SILFunction *InsertBefore,
-    const SILDebugScope *DebugScope, DeclContext *DC) {
-  return SILFunction::create(*this, linkage, name, loweredType,
-                             contextGenericParams, loc, isBareSILFunction,
-                             isTrans, isFragile, isThunk, classVisibility,
-                             inlineStrategy, EK, InsertBefore, DebugScope, DC);
-}
-
-ArrayRef<SILType> ValueBase::getTypes() const {
-  // No results.
-  if (TypeOrTypeList.isNull())
-    return ArrayRef<SILType>();
-  // Arbitrary list of results.
-  if (auto *TypeList = TypeOrTypeList.dyn_cast<SILTypeList*>())
-    return ArrayRef<SILType>(TypeList->Types, TypeList->NumTypes);
-  // Single result.
-  return TypeOrTypeList.get<SILType>();
-}
-
-
-
-/// getSILTypeList - Get a uniqued pointer to a SIL type list.  This can only
-/// be used by SILValue.
-SILTypeList *SILModule::getSILTypeList(ArrayRef<SILType> Types) const {
-  assert(Types.size() > 1 && "Shouldn't use type list for 0 or 1 types");
-  auto UniqueMap = (SILTypeListUniquingType*)TypeListUniquing;
-
-  llvm::FoldingSetNodeID ID;
-  for (auto T : Types) {
-    ID.AddPointer(T.getOpaqueValue());
-  }
-
-  // If we already have this type list, just return it.
-  void *InsertPoint = 0;
-  if (SILTypeList *TypeList = UniqueMap->FindNodeOrInsertPos(ID, InsertPoint))
-    return TypeList;
-
-  // Otherwise, allocate a new one.
-  void *NewListP = BPA.Allocate(sizeof(SILTypeList)+
-                                sizeof(SILType)*(Types.size()-1),
-                                alignof(SILTypeList));
-  SILTypeList *NewList = new (NewListP) SILTypeList();
-  NewList->NumTypes = Types.size();
-  std::copy(Types.begin(), Types.end(), NewList->Types);
-
-  UniqueMap->InsertNode(NewList, InsertPoint);
-  return NewList;
+    const SILDebugScope *DebugScope) {
+  return SILFunction::create(*this, linkage, name, loweredType, genericEnv, loc,
+                             isBareSILFunction, isTrans, isFragile, isThunk,
+                             classVisibility, inlineStrategy, EK, InsertBefore,
+                             DebugScope);
 }
 
 const IntrinsicInfo &SILModule::getIntrinsicInfo(Identifier ID) {
@@ -480,8 +442,7 @@ const IntrinsicInfo &SILModule::getIntrinsicInfo(Identifier ID) {
 
   // Otherwise, lookup the ID and Type and store them in the map.
   StringRef NameRef = getBuiltinBaseName(getASTContext(), ID.str(), Info.Types);
-  Info.ID =
-    (llvm::Intrinsic::ID)getLLVMIntrinsicID(NameRef, !Info.Types.empty());
+  Info.ID = (llvm::Intrinsic::ID)getLLVMIntrinsicID(NameRef);
 
   return Info;
 }
@@ -511,6 +472,8 @@ const BuiltinInfo &SILModule::getBuiltinInfo(Identifier ID) {
     Info.ID = BuiltinValueKind::AtomicLoad;
   else if (OperationName.startswith("atomicstore_"))
     Info.ID = BuiltinValueKind::AtomicStore;
+  else if (OperationName.startswith("allocWithTailElems_"))
+    Info.ID = BuiltinValueKind::AllocWithTailElems;
   else {
     // Switch through the rest of builtins.
     Info.ID = llvm::StringSwitch<BuiltinValueKind>(OperationName)
@@ -532,12 +495,79 @@ bool SILModule::linkFunction(SILFunction *Fun, SILModule::LinkingMode Mode) {
   return SILLinkerVisitor(*this, getSILLoader(), Mode).processFunction(Fun);
 }
 
-bool SILModule::linkFunction(SILDeclRef Decl, SILModule::LinkingMode Mode) {
-  return SILLinkerVisitor(*this, getSILLoader(), Mode).processDeclRef(Decl);
-}
-
 bool SILModule::linkFunction(StringRef Name, SILModule::LinkingMode Mode) {
   return SILLinkerVisitor(*this, getSILLoader(), Mode).processFunction(Name);
+}
+
+SILFunction *SILModule::findFunction(StringRef Name, SILLinkage Linkage) {
+  assert((Linkage == SILLinkage::Public ||
+          Linkage == SILLinkage::PublicExternal) &&
+         "Only a lookup of public functions is supported currently");
+
+  SILFunction *F = nullptr;
+
+  // First, check if there is a function with a required name in the
+  // current module.
+  SILFunction *CurF = lookUpFunction(Name);
+
+  // Nothing to do if the current module has a required function
+  // with a proper linkage already.
+  if (CurF && CurF->getLinkage() == Linkage) {
+    F = CurF;
+  } else {
+    assert((!CurF || CurF->getLinkage() != Linkage) &&
+           "hasFunction should be only called for functions that are not "
+           "contained in the SILModule yet or do not have a required linkage");
+  }
+
+  if (!F) {
+    SILLinkerVisitor Visitor(*this, getSILLoader(),
+                             SILModule::LinkingMode::LinkNormal);
+    if (CurF) {
+      // Perform this lookup only if a function with a given
+      // name is present in the current module.
+      // This is done to reduce the amount of IO from the
+      // swift module file.
+      if (!Visitor.hasFunction(Name, Linkage))
+        return nullptr;
+      // The function in the current module will be changed.
+      F = CurF;
+    }
+
+    // If function with a given name wasn't seen anywhere yet
+    // or if it is known to exist, perform a lookup.
+    if (!F) {
+      // Try to load the function from other modules.
+      F = Visitor.lookupFunction(Name, Linkage);
+      // Bail if nothing was found and we are not sure if
+      // this function exists elsewhere.
+      if (!F)
+        return nullptr;
+      assert(F && "SILFunction should be present in one of the modules");
+      assert(F->getLinkage() == Linkage && "SILFunction has a wrong linkage");
+    }
+  }
+
+  // If a function exists already and it is a non-optimizing
+  // compilation, simply convert it into an external declaration,
+  // so that a compiled version from the shared library is used.
+  if (F->isDefinition() &&
+      F->getModule().getOptions().Optimization <
+          SILOptions::SILOptMode::Optimize) {
+    F->convertToDeclaration();
+  }
+  if (F->isExternalDeclaration())
+    F->setFragile(IsFragile_t::IsNotFragile);
+  F->setLinkage(Linkage);
+  return F;
+}
+
+bool SILModule::hasFunction(StringRef Name) {
+  if (lookUpFunction(Name))
+    return true;
+  SILLinkerVisitor Visitor(*this, getSILLoader(),
+                           SILModule::LinkingMode::LinkNormal);
+  return Visitor.hasFunction(Name);
 }
 
 void SILModule::linkAllWitnessTables() {
@@ -550,6 +580,13 @@ void SILModule::linkAllVTables() {
 
 void SILModule::invalidateSILLoaderCaches() {
   getSILLoader()->invalidateCaches();
+}
+
+void SILModule::removeFromZombieList(StringRef Name) {
+  if (auto *Zombie = ZombieFunctionTable.lookup(Name)) {
+    ZombieFunctionTable.erase(Name);
+    zombieFunctions.remove(Zombie);
+  }
 }
 
 /// Erase a function from the module.
@@ -569,6 +606,7 @@ void SILModule::eraseFunction(SILFunction *F) {
     // or vtable stub generation. So we move it into the zombie list.
     getFunctionList().remove(F);
     zombieFunctions.push_back(F);
+    ZombieFunctionTable[copiedName] = F;
     F->setZombie();
 
     // This opens dead-function-removal opportunities for called functions.
@@ -580,9 +618,13 @@ void SILModule::eraseFunction(SILFunction *F) {
   }
 }
 
+void SILModule::invalidateFunctionInSILCache(SILFunction *F) {
+  getSILLoader()->invalidateFunction(F);
+}
+
 /// Erase a global SIL variable from the module.
 void SILModule::eraseGlobalVariable(SILGlobalVariable *G) {
-  GlobalVariableTable.erase(G->getName());
+  GlobalVariableMap.erase(G->getName());
   getSILGlobalList().erase(G);
 }
 
@@ -591,8 +633,8 @@ SILVTable *SILModule::lookUpVTable(const ClassDecl *C) {
     return nullptr;
 
   // First try to look up R from the lookup table.
-  auto R = VTableLookupTable.find(C);
-  if (R != VTableLookupTable.end())
+  auto R = VTableMap.find(C);
+  if (R != VTableMap.end())
     return R->second;
 
   // If that fails, try to deserialize it. If that fails, return nullptr.
@@ -603,7 +645,7 @@ SILVTable *SILModule::lookUpVTable(const ClassDecl *C) {
     return nullptr;
 
   // If we succeeded, map C -> VTbl in the table and return VTbl.
-  VTableLookupTable[C] = Vtbl;
+  VTableMap[C] = Vtbl;
   return Vtbl;
 }
 
@@ -616,41 +658,78 @@ SerializedSILLoader *SILModule::getSILLoader() {
   return SILLoader.get();
 }
 
-
-/// \brief Given a protocol \p Proto, a member method \p Member and a concrete
-/// class type \p ConcreteTy, search the witness tables and return the static
-/// function that matches the member with any specializations may be
-/// required. Notice that we do not scan the class hierarchy, just the concrete
-/// class type.
-std::tuple<SILFunction *, SILWitnessTable *, ArrayRef<Substitution>>
+/// \brief Given a conformance \p C and a protocol requirement \p Requirement,
+/// search the witness table for the conformance and return the witness thunk
+/// for the requirement.
+std::pair<SILFunction *, SILWitnessTable *>
 SILModule::lookUpFunctionInWitnessTable(ProtocolConformanceRef C,
-                                        SILDeclRef Member) {
+                                        SILDeclRef Requirement) {
   // Look up the witness table associated with our protocol conformance from the
   // SILModule.
   auto Ret = lookUpWitnessTable(C);
 
   // If no witness table was found, bail.
-  if (!Ret.first) {
+  if (!Ret) {
     DEBUG(llvm::dbgs() << "        Failed speculative lookup of witness for: ";
-          C.dump(); Member.dump());
-    return std::make_tuple(nullptr, nullptr, ArrayRef<Substitution>());
+          C.dump(); Requirement.dump());
+    return std::make_pair(nullptr, nullptr);
   }
 
   // Okay, we found the correct witness table. Now look for the method.
-  for (auto &Entry : Ret.first->getEntries()) {
+  for (auto &Entry : Ret->getEntries()) {
     // Look at method entries only.
     if (Entry.getKind() != SILWitnessTable::WitnessKind::Method)
       continue;
 
     SILWitnessTable::MethodWitness MethodEntry = Entry.getMethodWitness();
     // Check if this is the member we were looking for.
-    if (MethodEntry.Requirement != Member)
+    if (MethodEntry.Requirement != Requirement)
       continue;
 
-    return std::make_tuple(MethodEntry.Witness, Ret.first, Ret.second);
+    return std::make_pair(MethodEntry.Witness, Ret);
   }
 
-  return std::make_tuple(nullptr, nullptr, ArrayRef<Substitution>());
+  return std::make_pair(nullptr, nullptr);
+}
+
+/// \brief Given a protocol \p Protocol and a requirement \p Requirement,
+/// search the protocol's default witness table and return the default
+/// witness thunk for the requirement.
+std::pair<SILFunction *, SILDefaultWitnessTable *>
+SILModule::lookUpFunctionInDefaultWitnessTable(const ProtocolDecl *Protocol,
+                                               SILDeclRef Requirement,
+                                               bool deserializeLazily) {
+  // Look up the default witness table associated with our protocol from the
+  // SILModule.
+  auto Ret = lookUpDefaultWitnessTable(Protocol, deserializeLazily);
+
+  // If no default witness table was found, bail.
+  //
+  // FIXME: Could be an assert if we fix non-single-frontend mode to link
+  // together serialized SIL emitted by each translation unit.
+  if (!Ret) {
+    DEBUG(llvm::dbgs() << "        Failed speculative lookup of default "
+          "witness for " << Protocol->getName() << " ";
+          Requirement.dump());
+    return std::make_pair(nullptr, nullptr);
+  }
+
+  // Okay, we found the correct default witness table. Now look for the method.
+  for (auto &Entry : Ret->getEntries()) {
+    // Ignore dummy entries semitted for non-method requirements, as well as
+    // requirements without default implementations.
+    if (!Entry.isValid())
+      continue;
+
+    // Check if this is the member we were looking for.
+    if (Entry.getRequirement() != Requirement)
+      continue;
+
+    return std::make_pair(Entry.getWitness(), Ret);
+  }
+
+  // This requirement doesn't have a default implementation.
+  return std::make_pair(nullptr, nullptr);
 }
 
 static ClassDecl *getClassDeclSuperClass(ClassDecl *Class) {
@@ -705,5 +784,24 @@ removeDeleteNotificationHandler(DeleteNotificationHandler* Handler) {
 void SILModule::notifyDeleteHandlers(ValueBase *V) {
   for (auto *Handler : NotificationHandlers) {
     Handler->handleDeleteNotification(V);
+  }
+}
+
+// TODO: We should have an "isNoReturn" bit on Swift's BuiltinInfo, but for
+// now, let's recognize noreturn intrinsics and builtins specially here.
+bool SILModule::isNoReturnBuiltinOrIntrinsic(Identifier Name) {
+  const auto &IntrinsicInfo = getIntrinsicInfo(Name);
+  if (IntrinsicInfo.ID != llvm::Intrinsic::not_intrinsic) {
+    return IntrinsicInfo.hasAttribute(llvm::Attribute::NoReturn);
+  }
+  const auto &BuiltinInfo = getBuiltinInfo(Name);
+  switch (BuiltinInfo.ID) {
+  default:
+    return false;
+  case BuiltinValueKind::Unreachable:
+  case BuiltinValueKind::CondUnreachable:
+  case BuiltinValueKind::UnexpectedError:
+  case BuiltinValueKind::ErrorInMain:
+    return true;
   }
 }

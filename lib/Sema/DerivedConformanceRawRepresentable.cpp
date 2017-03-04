@@ -2,11 +2,11 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2016 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 //
@@ -16,7 +16,6 @@
 //===----------------------------------------------------------------------===//
 
 #include "TypeChecker.h"
-#include "swift/AST/ArchetypeBuilder.h"
 #include "swift/AST/Decl.h"
 #include "swift/AST/Stmt.h"
 #include "swift/AST/Expr.h"
@@ -57,8 +56,7 @@ static Type deriveRawRepresentable_Raw(TypeChecker &tc, Decl *parentDecl,
   //   typealias Raw = SomeType
   // }
   auto rawInterfaceType = enumDecl->getRawType();
-  return ArchetypeBuilder::mapTypeIntoContext(cast<DeclContext>(parentDecl),
-                                              rawInterfaceType);
+  return cast<DeclContext>(parentDecl)->mapTypeIntoContext(rawInterfaceType);
 }
 
 static void deriveBodyRawRepresentable_raw(AbstractFunctionDecl *toRawDecl) {
@@ -78,16 +76,19 @@ static void deriveBodyRawRepresentable_raw(AbstractFunctionDecl *toRawDecl) {
   auto parentDC = toRawDecl->getDeclContext();
   ASTContext &C = parentDC->getASTContext();
 
-  auto enumDecl = parentDC->isEnumOrEnumExtensionContext();
+  auto enumDecl = parentDC->getAsEnumOrEnumExtensionContext();
 
   Type rawTy = enumDecl->getRawType();
   assert(rawTy);
+  rawTy = toRawDecl->mapTypeIntoContext(rawTy);
+
+#ifndef NDEBUG
   for (auto elt : enumDecl->getAllElements()) {
-    if (!elt->getTypeCheckedRawValueExpr() ||
-        !elt->getTypeCheckedRawValueExpr()->getType()->isEqual(rawTy)) {
-      return;
-    }
+    assert(elt->getTypeCheckedRawValueExpr() &&
+           "Enum element has no literal - missing a call to checkEnumRawValues()");
+    assert(elt->getTypeCheckedRawValueExpr()->getType()->isEqual(rawTy));
   }
+#endif
 
   Type enumType = parentDC->getDeclaredTypeInContext();
 
@@ -128,12 +129,13 @@ static VarDecl *deriveRawRepresentable_raw(TypeChecker &tc,
   
   auto parentDC = cast<DeclContext>(parentDecl);
   auto rawInterfaceType = enumDecl->getRawType();
-  auto rawType = ArchetypeBuilder::mapTypeIntoContext(parentDC,
-                                                      rawInterfaceType);
+  auto rawType = parentDC->mapTypeIntoContext(rawInterfaceType);
   // Define the getter.
   auto getterDecl = declareDerivedPropertyGetter(tc, parentDecl, enumDecl,
                                                  rawInterfaceType,
-                                                 rawType);
+                                                 rawType,
+                                                 /*isStatic=*/false,
+                                                 /*isFinal=*/false);
   getterDecl->setBodySynthesizer(&deriveBodyRawRepresentable_raw);
 
   // Define the property.
@@ -141,9 +143,12 @@ static VarDecl *deriveRawRepresentable_raw(TypeChecker &tc,
   PatternBindingDecl *pbDecl;
   std::tie(propDecl, pbDecl)
     = declareDerivedReadOnlyProperty(tc, parentDecl, enumDecl,
-                                     C.Id_rawValue, rawType,
+                                     C.Id_rawValue,
                                      rawInterfaceType,
-                                     getterDecl);
+                                     rawType,
+                                     getterDecl,
+                                     /*isStatic=*/false,
+                                     /*isFinal=*/false);
   
   auto dc = cast<IterableDeclContext>(parentDecl);
   dc->addMember(getterDecl);
@@ -173,19 +178,20 @@ deriveBodyRawRepresentable_init(AbstractFunctionDecl *initDecl) {
   auto parentDC = initDecl->getDeclContext();
   ASTContext &C = parentDC->getASTContext();
 
-  auto nominalTypeDecl = parentDC->isNominalTypeOrNominalTypeExtensionContext();
+  auto nominalTypeDecl = parentDC->getAsNominalTypeOrNominalTypeExtensionContext();
   auto enumDecl = cast<EnumDecl>(nominalTypeDecl);
 
   Type rawTy = enumDecl->getRawType();
   assert(rawTy);
-  rawTy = ArchetypeBuilder::mapTypeIntoContext(initDecl, rawTy);
-  
+  rawTy = initDecl->mapTypeIntoContext(rawTy);
+
+#ifndef NDEBUG
   for (auto elt : enumDecl->getAllElements()) {
-    if (!elt->getTypeCheckedRawValueExpr() ||
-        !elt->getTypeCheckedRawValueExpr()->getType()->isEqual(rawTy)) {
-      return;
-    }
+    assert(elt->getTypeCheckedRawValueExpr() &&
+           "Enum element has no literal - missing a call to checkEnumRawValues()");
+    assert(elt->getTypeCheckedRawValueExpr()->getType()->isEqual(rawTy));
   }
+#endif
 
   Type enumType = parentDC->getDeclaredTypeInContext();
 
@@ -201,11 +207,12 @@ deriveBodyRawRepresentable_init(AbstractFunctionDecl *initDecl) {
     auto labelItem =
       CaseLabelItem(/*IsDefault=*/false, litPat, SourceLoc(), nullptr);
 
-    auto eltRef = new (C) DeclRefExpr(elt, SourceLoc(), /*implicit*/true);
+    auto eltRef = new (C) DeclRefExpr(elt, DeclNameLoc(), /*implicit*/true);
     auto metaTyRef = TypeExpr::createImplicit(enumType, C);
     auto valueExpr = new (C) DotSyntaxCallExpr(eltRef, SourceLoc(), metaTyRef);
     
-    auto selfRef = new (C) DeclRefExpr(selfDecl, SourceLoc(), /*implicit*/true,
+    auto selfRef = new (C) DeclRefExpr(selfDecl, DeclNameLoc(),
+                                       /*implicit*/true,
                                        AccessSemantics::DirectToStorage);
 
     auto assignment = new (C) AssignExpr(selfRef, SourceLoc(), valueExpr,
@@ -232,7 +239,7 @@ deriveBodyRawRepresentable_init(AbstractFunctionDecl *initDecl) {
                                    dfltBody));
 
   auto rawDecl = initDecl->getParameterList(1)->get(0);
-  auto rawRef = new (C) DeclRefExpr(rawDecl, SourceLoc(), /*implicit*/true);
+  auto rawRef = new (C) DeclRefExpr(rawDecl, DeclNameLoc(), /*implicit*/true);
   auto switchStmt = SwitchStmt::create(LabeledStmtInfo(), SourceLoc(), rawRef,
                                        SourceLoc(), cases, SourceLoc(), C);
   auto body = BraceStmt::create(C, SourceLoc(),
@@ -248,80 +255,55 @@ static ConstructorDecl *deriveRawRepresentable_init(TypeChecker &tc,
   
   auto parentDC = cast<DeclContext>(parentDecl);
   auto rawInterfaceType = enumDecl->getRawType();
-  auto rawType = ArchetypeBuilder::mapTypeIntoContext(parentDC,
-                                                      rawInterfaceType);
+  auto rawType = parentDC->mapTypeIntoContext(rawInterfaceType);
 
-  // Make sure that the raw type is Equatable. We need it to ensure that we have
-  // a suitable ~= for the switch.
   auto equatableProto = tc.getProtocol(enumDecl->getLoc(),
                                        KnownProtocolKind::Equatable);
-  if (!equatableProto)
-    return nullptr;
+  assert(equatableProto);
+  assert(tc.conformsToProtocol(rawType, equatableProto, enumDecl, None));
+  (void)equatableProto;
 
-  if (!tc.conformsToProtocol(rawType, equatableProto, enumDecl, None)) {
-    SourceLoc loc = enumDecl->getInherited()[0].getSourceRange().Start;
-    tc.diagnose(loc, diag::enum_raw_type_not_equatable, rawType);
-    return nullptr;
-  }
-
-  Type enumType = parentDC->getDeclaredTypeInContext();
   auto *selfDecl = ParamDecl::createSelf(SourceLoc(), parentDC,
                                          /*static*/false, /*inout*/true);
 
-  auto *rawDecl = new (C) ParamDecl(/*IsLet*/true, SourceLoc(),
+  auto *rawDecl = new (C) ParamDecl(/*IsLet*/true, SourceLoc(), SourceLoc(),
                                     C.Id_rawValue, SourceLoc(),
                                     C.Id_rawValue, rawType, parentDC);
+  rawDecl->setInterfaceType(rawInterfaceType);
   rawDecl->setImplicit();
   auto paramList = ParameterList::createWithoutLoc(rawDecl);
   
-  auto retTy = OptionalType::get(enumType);
   DeclName name(C, C.Id_init, paramList);
   
-  auto initDecl = new (C) ConstructorDecl(name, SourceLoc(),
-                                          /*failability*/ OTK_Optional,
-                                          SourceLoc(), selfDecl, paramList,
-                                          nullptr, SourceLoc(), parentDC);
+  auto initDecl =
+    new (C) ConstructorDecl(name, SourceLoc(),
+                            /*Failability=*/ OTK_Optional,
+                            /*FailabilityLoc=*/SourceLoc(),
+                            /*Throws=*/false, /*ThrowsLoc=*/SourceLoc(),
+                            selfDecl, paramList,
+                            /*GenericParams=*/nullptr, parentDC);
   
   initDecl->setImplicit();
   initDecl->setBodySynthesizer(&deriveBodyRawRepresentable_init);
 
   // Compute the type of the initializer.
-  GenericParamList *genericParams = initDecl->getGenericParamsOfContext();
-  
   TupleTypeElt element(rawType, C.Id_rawValue);
-  auto argType = TupleType::get(element, C);
   TupleTypeElt interfaceElement(rawInterfaceType, C.Id_rawValue);
   auto interfaceArgType = TupleType::get(interfaceElement, C);
-  
-  Type type = FunctionType::get(argType, retTy);
-
-  Type selfType = initDecl->computeSelfType();
-  selfDecl->overwriteType(selfType);
-  Type selfMetatype = MetatypeType::get(selfType->getInOutObjectType());
-  
-  Type allocType;
-  Type initType;
-  if (genericParams) {
-    allocType = PolymorphicFunctionType::get(selfMetatype, type, genericParams);
-    initType = PolymorphicFunctionType::get(selfType, type, genericParams);
-  } else {
-    allocType = FunctionType::get(selfMetatype, type);
-    initType = FunctionType::get(selfType, type);
-  }
-  initDecl->setType(allocType);
-  initDecl->setInitializerType(initType);
 
   // Compute the interface type of the initializer.
   Type retInterfaceType
     = OptionalType::get(parentDC->getDeclaredInterfaceType());
   Type interfaceType = FunctionType::get(interfaceArgType, retInterfaceType);
-  Type selfInterfaceType = initDecl->computeInterfaceSelfType(/*init*/ false);
+  Type selfInterfaceType = initDecl->computeInterfaceSelfType();
   Type selfInitializerInterfaceType
     = initDecl->computeInterfaceSelfType(/*init*/ true);
 
   Type allocIfaceType;
   Type initIfaceType;
   if (auto sig = parentDC->getGenericSignatureOfContext()) {
+    initDecl->setGenericEnvironment(parentDC->getGenericEnvironmentOfContext());
+
     allocIfaceType = GenericFunctionType::get(sig, selfInterfaceType,
                                               interfaceType,
                                               FunctionType::ExtInfo());
@@ -329,45 +311,81 @@ static ConstructorDecl *deriveRawRepresentable_init(TypeChecker &tc,
                                              interfaceType,
                                              FunctionType::ExtInfo());
   } else {
-    allocIfaceType = FunctionType::get(selfMetatype, type);
-    initIfaceType = FunctionType::get(selfType, type);
+    allocIfaceType = FunctionType::get(selfInterfaceType,
+                                       interfaceType);
+    initIfaceType = FunctionType::get(selfInitializerInterfaceType,
+                                      interfaceType);
   }
   initDecl->setInterfaceType(allocIfaceType);
   initDecl->setInitializerInterfaceType(initIfaceType);
-  initDecl->setAccessibility(enumDecl->getFormalAccess());
+  initDecl->setAccessibility(std::max(Accessibility::Internal,
+                                      enumDecl->getFormalAccess()));
 
+  // If the enum was not imported, the derived conformance is either from the
+  // enum itself or an extension, in which case we will emit the declaration
+  // normally.
   if (enumDecl->hasClangNode())
-    tc.implicitlyDefinedFunctions.push_back(initDecl);
+    tc.Context.addExternalDecl(initDecl);
 
   cast<IterableDeclContext>(parentDecl)->addMember(initDecl);
   return initDecl;
+}
+
+static bool canSynthesizeRawRepresentable(TypeChecker &tc, Decl *parentDecl,
+                                          EnumDecl *enumDecl) {
+
+  // It must have a valid raw type.
+  Type rawType = enumDecl->getRawType();
+  if (!rawType)
+    return false;
+  auto parentDC = cast<DeclContext>(parentDecl);
+  rawType       = parentDC->mapTypeIntoContext(rawType);
+
+  if (!enumDecl->getInherited().empty() &&
+      enumDecl->getInherited().front().isError())
+    return false;
+
+  // The raw type must be Equatable, so that we have a suitable ~= for
+  // synthesized switch statements.
+  auto equatableProto = tc.getProtocol(enumDecl->getLoc(),
+                                       KnownProtocolKind::Equatable);
+  if (!equatableProto)
+    return false;
+
+  if (!tc.conformsToProtocol(rawType, equatableProto, enumDecl, None))
+    return false;
+  
+  // There must be enum elements.
+  if (enumDecl->getAllElements().empty())
+    return false;
+
+  // Have the type-checker validate that:
+  // - the enum elements all have the same type
+  // - they all match the enum type
+  for (auto elt : enumDecl->getAllElements()) {
+    tc.validateDecl(elt);
+    if (elt->isInvalid()) {
+      return false;
+    }
+  }
+
+  // If it meets all of those requirements, we can synthesize RawRepresentable conformance.
+  return true;
 }
 
 ValueDecl *DerivedConformance::deriveRawRepresentable(TypeChecker &tc,
                                                       Decl *parentDecl,
                                                       NominalTypeDecl *type,
                                                       ValueDecl *requirement) {
-  // Check preconditions. These should already have been diagnosed by
-  // type-checking but we may still get here after recovery.
-  
-  // The type must be an enum.
+
+  // We can only synthesize RawRepresentable for enums.
   auto enumDecl = dyn_cast<EnumDecl>(type);
   if (!enumDecl)
     return nullptr;
-  
-  // It must have a valid raw type.
-  if (!enumDecl->hasRawType())
-    return nullptr;
-  if (!enumDecl->getInherited().empty() &&
-      enumDecl->getInherited().front().isError())
-    return nullptr;
-  
-  // There must be enum elements.
-  if (enumDecl->getAllElements().empty())
-    return nullptr;
 
-  for (auto elt : enumDecl->getAllElements())
-    tc.validateDecl(elt);
+  // Check other preconditions for synthesized conformance.
+  if (!canSynthesizeRawRepresentable(tc, parentDecl, enumDecl))
+    return nullptr;
 
   if (requirement->getName() == tc.Context.Id_rawValue)
     return deriveRawRepresentable_raw(tc, parentDecl, enumDecl);
@@ -384,27 +402,15 @@ Type DerivedConformance::deriveRawRepresentable(TypeChecker &tc,
                                                 Decl *parentDecl,
                                                 NominalTypeDecl *type,
                                                 AssociatedTypeDecl *assocType) {
-  // Check preconditions. These should already have been diagnosed by
-  // type-checking but we may still get here after recovery.
-  
-  // The type must be an enum.
+
+  // We can only synthesize RawRepresentable for enums.
   auto enumDecl = dyn_cast<EnumDecl>(type);
   if (!enumDecl)
     return nullptr;
-  
-  // It must have a valid raw type.
-  if (!enumDecl->hasRawType())
-    return nullptr;
-  if (!enumDecl->getInherited().empty() &&
-      enumDecl->getInherited().front().isError())
-    return nullptr;
-  
-  // There must be enum elements.
-  if (enumDecl->getAllElements().empty())
-    return nullptr;
 
-  for (auto elt : enumDecl->getAllElements())
-    tc.validateDecl(elt);
+  // Check other preconditions for synthesized conformance.
+  if (!canSynthesizeRawRepresentable(tc, parentDecl, enumDecl))
+    return nullptr;
 
   if (assocType->getName() == tc.Context.Id_RawValue) {
     return deriveRawRepresentable_Raw(tc, parentDecl, enumDecl);

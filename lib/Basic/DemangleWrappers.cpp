@@ -2,11 +2,11 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2016 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 
@@ -45,14 +45,18 @@ static void printNode(llvm::raw_ostream &Out, const Node *node,
   }
   Out << '\n';
   for (auto &child : *node) {
-    printNode(Out, child.get(), depth + 1);
+    printNode(Out, child, depth + 1);
   }
 }
 
 void NodeDumper::dump() const { print(llvm::errs()); }
 
 void NodeDumper::print(llvm::raw_ostream &Out) const {
-  printNode(Out, Root.get(), 0);
+  printNode(Out, Root, 0);
+}
+
+void swift::demangle_wrappers::dumpNode(const NodePointer &Root) {
+  NodeDumper(Root).dump();
 }
 
 namespace {
@@ -75,34 +79,8 @@ public:
 };
 } // end unnamed namespace
 
-NodePointer
-swift::demangle_wrappers::demangleSymbolAsNode(llvm::StringRef MangledName,
-                                               const DemangleOptions &Options) {
-  PrettyStackTraceStringAction prettyStackTrace("demangling string",
-                                                MangledName);
-  return swift::Demangle::demangleSymbolAsNode(MangledName.data(),
-                                               MangledName.size(), Options);
-}
-
 std::string nodeToString(NodePointer Root,
                          const DemangleOptions &Options) {
-  PrettyStackTraceNode trace("printing", Root.get());
+  PrettyStackTraceNode trace("printing", Root);
   return swift::Demangle::nodeToString(Root, Options);
 }
-
-std::string swift::demangle_wrappers::demangleSymbolAsString(
-    llvm::StringRef MangledName, const DemangleOptions &Options) {
-  PrettyStackTraceStringAction prettyStackTrace("demangling string",
-                                                MangledName);
-  return swift::Demangle::demangleSymbolAsString(MangledName.data(),
-                                                 MangledName.size(), Options);
-}
-
-std::string swift::demangle_wrappers::demangleTypeAsString(
-    llvm::StringRef MangledName, const DemangleOptions &Options) {
-  PrettyStackTraceStringAction prettyStackTrace("demangling type string",
-                                                MangledName);
-  return swift::Demangle::demangleTypeAsString(MangledName.data(),
-                                               MangledName.size(), Options);
-}
-

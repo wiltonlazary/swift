@@ -2,11 +2,11 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2016 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 
@@ -23,33 +23,22 @@ using namespace swift;
 // memory usage of this cache.
 static const int TypeExpansionAnalysisMaxCacheSize = 4096;
 
-const ProjectionPathList &
-TypeExpansionAnalysis::getTypeExpansionProjectionPaths(SILType B, SILModule *Mod,
-                                                       TEKind Kind) {
-  // Which cache we should be looking up.
-  bool IsLeaf = Kind == TEKind::TELeaf;
-  TypeExpansionMap &Cache = IsLeaf ? TELeafCache : TENodeCache;
-
+const ProjectionPathList&
+TypeExpansionAnalysis::getTypeExpansion(SILType B, SILModule *Mod) {
   // Check whether we have the type expansion.
-  auto Iter = Cache.find(B);
-  if (Iter != Cache.end()) {
+  auto Iter = ExpansionCache.find(B);
+  if (Iter != ExpansionCache.end()) {
     return Iter->second;
   }   
 
   // Flush the cache if the size of the cache is too large.
-  if (Cache.size() > TypeExpansionAnalysisMaxCacheSize) {
-    Cache.clear();
+  if (ExpansionCache.size() > TypeExpansionAnalysisMaxCacheSize) {
+    ExpansionCache.clear();
   }
 
   // Build the type expansion for the leaf nodes.
-  if (IsLeaf) {
-    ProjectionPath::expandTypeIntoLeafProjectionPaths(B, Mod, Cache[B]);
-    return Cache[B];
-  }
-
-  // Build the type expansion for the internal and leaf nodes.
-  ProjectionPath::expandTypeIntoNodeProjectionPaths(B, Mod, Cache[B]);
-  return Cache[B];
+  ProjectionPath::expandTypeIntoLeafProjectionPaths(B, Mod, ExpansionCache[B]);
+  return ExpansionCache[B];
 }
 
 SILAnalysis *swift::createTypeExpansionAnalysis(SILModule *M) {

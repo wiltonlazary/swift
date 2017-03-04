@@ -2,11 +2,11 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2016 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 //
@@ -16,14 +16,15 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/Support/ErrorHandling.h"
+#include "llvm/Support/Compiler.h"
 #include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/Intrinsics.h"
 
-#include "swift/Basic/Fallthrough.h"
 #include "swift/Basic/SourceLoc.h"
 #include "swift/ABI/MetadataValues.h"
+#include "swift/AST/GenericEnvironment.h"
 #include "swift/AST/IRGenOptions.h"
 
 #include "Explosion.h"
@@ -92,7 +93,7 @@ HeapNonFixedOffsets::HeapNonFixedOffsets(IRGenFunction &IGF,
         // Factor the non-fixed-size field's alignment into the total alignment.
         totalAlign = IGF.Builder.CreateOr(totalAlign,
                                     elt.getType().getAlignmentMask(IGF, eltTy));
-        SWIFT_FALLTHROUGH;
+        LLVM_FALLTHROUGH;
       case ElementLayout::Kind::Empty:
       case ElementLayout::Kind::Fixed:
         // Don't need to dynamically calculate this offset.
@@ -102,6 +103,13 @@ HeapNonFixedOffsets::HeapNonFixedOffsets(IRGenFunction &IGF,
       case ElementLayout::Kind::NonFixed:
         // Start calculating non-fixed offsets from the end of the first fixed
         // field.
+        if (i == 0) {
+          totalAlign = elt.getType().getAlignmentMask(IGF, eltTy);
+          offset = totalAlign;
+          Offsets.push_back(totalAlign);
+          break;
+        }
+
         assert(i > 0 && "shouldn't begin with a non-fixed field");
         auto &prevElt = layout.getElement(i-1);
         auto prevType = layout.getElementTypes()[i-1];
@@ -188,7 +196,10 @@ static llvm::Function *createDtorFn(IRGenModule &IGM,
     llvm::Function::Create(IGM.DeallocatingDtorTy,
                            llvm::Function::PrivateLinkage,
                            "objectdestroy", &IGM.Module);
-  fn->setAttributes(IGM.constructInitialAttributes());
+  auto attrs = IGM.constructInitialAttributes();
+  IGM.addSwiftSelfAttributes(attrs, 0);
+  fn->setAttributes(attrs);
+  fn->setCallingConv(IGM.SwiftCC);
 
   IRGenFunction IGF(IGM, fn);
   if (IGM.DebugInfo)
@@ -250,9 +261,10 @@ llvm::Constant *HeapLayout::createSizeFn(IRGenModule &IGM) const {
 static llvm::Constant *buildPrivateMetadata(IRGenModule &IGM,
                                             const HeapLayout &layout,
                                             llvm::Constant *dtorFn,
+                                            llvm::Constant *captureDescriptor,
                                             MetadataKind kind) {
   // Build the fields of the private metadata.
-  SmallVector<llvm::Constant*, 4> fields;
+  SmallVector<llvm::Constant*, 5> fields;
   fields.push_back(dtorFn);
   fields.push_back(llvm::ConstantPointerNull::get(IGM.WitnessTablePtrTy));
   fields.push_back(llvm::ConstantStruct::get(IGM.TypeMetadataStructTy,
@@ -267,6 +279,8 @@ static llvm::Constant *buildPrivateMetadata(IRGenModule &IGM,
   else
     offset = Size(0);
   fields.push_back(llvm::ConstantInt::get(IGM.Int32Ty, offset.getValue()));
+
+  fields.push_back(captureDescriptor);
 
   llvm::Constant *init =
     llvm::ConstantStruct::get(IGM.FullBoxMetadataStructTy, fields);
@@ -285,17 +299,21 @@ static llvm::Constant *buildPrivateMetadata(IRGenModule &IGM,
       /*Ty=*/nullptr, var, indices);
 }
 
-llvm::Constant *HeapLayout::getPrivateMetadata(IRGenModule &IGM) const {
+llvm::Constant *
+HeapLayout::getPrivateMetadata(IRGenModule &IGM,
+                               llvm::Constant *captureDescriptor) const {
   if (!privateMetadata)
     privateMetadata = buildPrivateMetadata(IGM, *this, createDtorFn(IGM, *this),
+                                           captureDescriptor,
                                            MetadataKind::HeapLocalVariable);
   return privateMetadata;
 }
 
 llvm::Value *IRGenFunction::emitUnmanagedAlloc(const HeapLayout &layout,
                                                const llvm::Twine &name,
+                                           llvm::Constant *captureDescriptor,
                                            const HeapNonFixedOffsets *offsets) {
-  llvm::Value *metadata = layout.getPrivateMetadata(IGM);
+  llvm::Value *metadata = layout.getPrivateMetadata(IGM, captureDescriptor);
   llvm::Value *size, *alignMask;
   if (offsets) {
     size = offsets->getSize();
@@ -322,7 +340,7 @@ namespace {
       return ReferenceCounting::Native;
     }
   };
-}
+} // end anonymous namespace
 
 const LoadableTypeInfo *TypeConverter::convertBuiltinNativeObject() {
   return new BuiltinNativeObjectTypeInfo(IGM.RefCountedPtrTy,
@@ -370,7 +388,7 @@ namespace {
       return storeHeapObjectExtraInhabitant(IGF, index, dest);
     }
   };
-}
+} // end anonymous namespace
 
 const LoadableTypeInfo *
 TypeConverter::createUnmanagedStorageType(llvm::Type *valueType) {
@@ -406,12 +424,14 @@ namespace {
       return IGF.Builder.CreateBitCast(addr, ValueType->getPointerTo());
     }
 
-    void emitScalarRetain(IRGenFunction &IGF, llvm::Value *value) const {
-      IGF.emitNativeUnownedRetain(value);
+    void emitScalarRetain(IRGenFunction &IGF, llvm::Value *value,
+                          Atomicity atomicity) const {
+      IGF.emitNativeUnownedRetain(value, atomicity);
     }
 
-    void emitScalarRelease(IRGenFunction &IGF, llvm::Value *value) const {
-      IGF.emitNativeUnownedRelease(value);
+    void emitScalarRelease(IRGenFunction &IGF, llvm::Value *value,
+                           Atomicity atomicity) const {
+      IGF.emitNativeUnownedRelease(value, atomicity);
     }
 
     void emitScalarFixLifetime(IRGenFunction &IGF, llvm::Value *value) const {
@@ -522,7 +542,7 @@ namespace {
       IGF.emitNativeWeakAssign(value, dest);
     }
   };
-}
+} // end anonymous namespace
 
 SpareBitVector IRGenModule::getWeakReferenceSpareBits() const {
   // The runtime needs to be able to freely manipulate live weak
@@ -750,7 +770,7 @@ namespace {
       IGF.emitUnknownWeakAssign(value, dest);
     }
   };
-}
+} // end anonymous namespace
 
 const TypeInfo *TypeConverter::createUnownedStorageType(llvm::Type *valueType,
                                                       ReferenceCounting style) {
@@ -817,6 +837,10 @@ static llvm::FunctionType *getTypeOfFunction(llvm::Constant *fn) {
 static void emitUnaryRefCountCall(IRGenFunction &IGF,
                                   llvm::Constant *fn,
                                   llvm::Value *value) {
+  auto cc = IGF.IGM.DefaultCC;
+  if (auto fun = dyn_cast<llvm::Function>(fn))
+    cc = fun->getCallingConv();
+
   // Instead of casting the input, we cast the function type.
   // This tends to produce less IR, but might be evil.
   if (value->getType() != getTypeOfFunction(fn)->getParamType(0)) {
@@ -827,8 +851,8 @@ static void emitUnaryRefCountCall(IRGenFunction &IGF,
   
   // Emit the call.
   llvm::CallInst *call = IGF.Builder.CreateCall(fn, value);
-  call->setCallingConv(IGF.IGM.RuntimeCC);
-  call->setDoesNotThrow();  
+  call->setCallingConv(cc);
+  call->setDoesNotThrow();
 }
 
 /// Emit a copy-like call to perform a ref-counting operation.
@@ -841,6 +865,10 @@ static void emitCopyLikeCall(IRGenFunction &IGF,
   assert(dest->getType() == src->getType() &&
          "type mismatch in binary refcounting operation");
 
+  auto cc = IGF.IGM.DefaultCC;
+  if (auto fun = dyn_cast<llvm::Function>(fn))
+    cc = fun->getCallingConv();
+
   // Instead of casting the inputs, we cast the function type.
   // This tends to produce less IR, but might be evil.
   if (dest->getType() != getTypeOfFunction(fn)->getParamType(0)) {
@@ -852,8 +880,8 @@ static void emitCopyLikeCall(IRGenFunction &IGF,
   
   // Emit the call.
   llvm::CallInst *call = IGF.Builder.CreateCall(fn, {dest, src});
-  call->setCallingConv(IGF.IGM.RuntimeCC);
-  call->setDoesNotThrow();  
+  call->setCallingConv(cc);
+  call->setDoesNotThrow();
 }
 
 /// Emit a call to a function with a loadWeak-like signature.
@@ -867,6 +895,11 @@ static llvm::Value *emitLoadWeakLikeCall(IRGenFunction &IGF,
           addr->getType() == IGF.IGM.UnownedReferencePtrTy) &&
          "address is not of a weak or unowned reference");
 
+  auto cc = IGF.IGM.DefaultCC;
+  if (auto fun = dyn_cast<llvm::Function>(fn))
+    cc = fun->getCallingConv();
+
+
   // Instead of casting the output, we cast the function type.
   // This tends to produce less IR, but might be evil.
   if (resultType != getTypeOfFunction(fn)->getReturnType()) {
@@ -878,7 +911,7 @@ static llvm::Value *emitLoadWeakLikeCall(IRGenFunction &IGF,
 
   // Emit the call.
   llvm::CallInst *call = IGF.Builder.CreateCall(fn, addr);
-  call->setCallingConv(IGF.IGM.RuntimeCC);
+  call->setCallingConv(cc);
   call->setDoesNotThrow();
 
   return call;
@@ -895,6 +928,10 @@ static void emitStoreWeakLikeCall(IRGenFunction &IGF,
           addr->getType() == IGF.IGM.UnownedReferencePtrTy) &&
          "address is not of a weak or unowned reference");
 
+  auto cc = IGF.IGM.DefaultCC;
+  if (auto fun = dyn_cast<llvm::Function>(fn))
+    cc = fun->getCallingConv();
+
   // Instead of casting the inputs, we cast the function type.
   // This tends to produce less IR, but might be evil.
   if (value->getType() != getTypeOfFunction(fn)->getParamType(1)) {
@@ -906,23 +943,25 @@ static void emitStoreWeakLikeCall(IRGenFunction &IGF,
 
   // Emit the call.
   llvm::CallInst *call = IGF.Builder.CreateCall(fn, {addr, value});
-  call->setCallingConv(IGF.IGM.RuntimeCC);
+  call->setCallingConv(cc);
   call->setDoesNotThrow();
 }
 
 /// Emit a call to swift_retain.
-void IRGenFunction::emitNativeStrongRetain(llvm::Value *value) {
+void IRGenFunction::emitNativeStrongRetain(llvm::Value *value,
+                                           Atomicity atomicity) {
   if (doesNotRequireRefCounting(value))
     return;
 
   // Make sure the input pointer is the right type.
   if (value->getType() != IGM.RefCountedPtrTy)
     value = Builder.CreateBitCast(value, IGM.RefCountedPtrTy);
-  
+
   // Emit the call.
-  llvm::CallInst *call =
-    Builder.CreateCall(IGM.getNativeStrongRetainFn(), value);
-  call->setCallingConv(IGM.RuntimeCC);
+  llvm::CallInst *call = Builder.CreateCall(
+      (atomicity == Atomicity::Atomic) ? IGM.getNativeStrongRetainFn()
+                                       : IGM.getNativeNonAtomicStrongRetainFn(),
+      value);
   call->setDoesNotThrow();
 }
 
@@ -936,7 +975,7 @@ void IRGenFunction::emitNativeStrongAssign(llvm::Value *newValue,
   Builder.CreateStore(newValue, address);
 
   // Release the old value.
-  emitNativeStrongRelease(oldValue);
+  emitNativeStrongRelease(oldValue, getDefaultAtomicity());
 }
 
 /// Emit an initialize of a live value to the given retaining variable.
@@ -948,31 +987,33 @@ void IRGenFunction::emitNativeStrongInit(llvm::Value *newValue,
 
 /// Emit a release of a live value with the given refcounting implementation.
 void IRGenFunction::emitStrongRelease(llvm::Value *value,
-                                      ReferenceCounting refcounting) {
+                                      ReferenceCounting refcounting,
+                                      Atomicity atomicity) {
   switch (refcounting) {
   case ReferenceCounting::Native:
-    return emitNativeStrongRelease(value);
+    return emitNativeStrongRelease(value, atomicity);
   case ReferenceCounting::ObjC:
     return emitObjCStrongRelease(value);
   case ReferenceCounting::Block:
     return emitBlockRelease(value);
   case ReferenceCounting::Unknown:
-    return emitUnknownStrongRelease(value);
+    return emitUnknownStrongRelease(value, atomicity);
   case ReferenceCounting::Bridge:
-    return emitBridgeStrongRelease(value);
+    return emitBridgeStrongRelease(value, atomicity);
   case ReferenceCounting::Error:
     return emitErrorStrongRelease(value);
   }
 }
 
 void IRGenFunction::emitStrongRetain(llvm::Value *value,
-                                     ReferenceCounting refcounting) {
+                                     ReferenceCounting refcounting,
+                                     Atomicity atomicity) {
   switch (refcounting) {
   case ReferenceCounting::Native:
-    emitNativeStrongRetain(value);
+    emitNativeStrongRetain(value, atomicity);
     return;
   case ReferenceCounting::Bridge:
-    emitBridgeStrongRetain(value);
+    emitBridgeStrongRetain(value, atomicity);
     return;
   case ReferenceCounting::ObjC:
     emitObjCStrongRetain(value);
@@ -981,7 +1022,7 @@ void IRGenFunction::emitStrongRetain(llvm::Value *value,
     emitBlockCopyCall(value);
     return;
   case ReferenceCounting::Unknown:
-    emitUnknownStrongRetain(value);
+    emitUnknownStrongRetain(value, atomicity);
     return;
   case ReferenceCounting::Error:
     emitErrorStrongRetain(value);
@@ -1004,6 +1045,8 @@ llvm::Type *IRGenModule::getReferenceType(ReferenceCounting refcounting) {
   case ReferenceCounting::Error:
     return ErrorPtrTy;
   }
+
+  llvm_unreachable("Not a valid ReferenceCounting.");
 }
 
 #define DEFINE_BINARY_OPERATION(KIND, RESULT, TYPE1, TYPE2)                    \
@@ -1063,53 +1106,69 @@ DEFINE_UNARY_OPERATION(UnownedDestroy, void, Address)
 #undef DEFINE_BINARY_OPERATION
 
 void IRGenFunction::emitUnownedRetain(llvm::Value *value,
-                                      ReferenceCounting style) {
+                                      ReferenceCounting style,
+                                      Atomicity atomicity) {
   assert(style == ReferenceCounting::Native &&
          "only native references support scalar unowned reference-counting");
-  emitNativeUnownedRetain(value);
+  emitNativeUnownedRetain(value, atomicity);
 }
 
 void IRGenFunction::emitUnownedRelease(llvm::Value *value,
-                                       ReferenceCounting style) {
+                                       ReferenceCounting style,
+                                       Atomicity atomicity) {
   assert(style == ReferenceCounting::Native &&
          "only native references support scalar unowned reference-counting");
-  emitNativeUnownedRelease(value);
+  emitNativeUnownedRelease(value, atomicity);
 }
 
 void IRGenFunction::emitStrongRetainUnowned(llvm::Value *value,
-                                            ReferenceCounting style) {
+                                            ReferenceCounting style,
+                                            Atomicity atomicity) {
   assert(style == ReferenceCounting::Native &&
          "only native references support scalar unowned reference-counting");
-  emitNativeStrongRetainUnowned(value);
+  emitNativeStrongRetainUnowned(value, atomicity);
 }
 
 void IRGenFunction::emitStrongRetainAndUnownedRelease(llvm::Value *value,
-                                                      ReferenceCounting style) {
+                                                      ReferenceCounting style,
+                                                      Atomicity atomicity) {
   assert(style == ReferenceCounting::Native &&
          "only native references support scalar unowned reference-counting");
-  emitNativeStrongRetainAndUnownedRelease(value);
+  emitNativeStrongRetainAndUnownedRelease(value, atomicity);
 }
 
 /// Emit a release of a live value.
-void IRGenFunction::emitNativeStrongRelease(llvm::Value *value) {
+void IRGenFunction::emitNativeStrongRelease(llvm::Value *value,
+                                            Atomicity atomicity) {
+  if (doesNotRequireRefCounting(value))
+    return;
+  emitUnaryRefCountCall(*this, (atomicity == Atomicity::Atomic)
+                                   ? IGM.getNativeStrongReleaseFn()
+                                   : IGM.getNativeNonAtomicStrongReleaseFn(),
+                        value);
+}
+
+void IRGenFunction::emitNativeSetDeallocating(llvm::Value *value) {
   if (doesNotRequireRefCounting(value)) return;
-  emitUnaryRefCountCall(*this, IGM.getNativeStrongReleaseFn(), value);
+  emitUnaryRefCountCall(*this, IGM.getNativeSetDeallocatingFn(), value);
 }
 
 void IRGenFunction::emitNativeUnownedInit(llvm::Value *value,
                                           Address dest) {
+  value = Builder.CreateBitCast(value, IGM.RefCountedPtrTy);
   dest = Builder.CreateStructGEP(dest, 0, Size(0));
   Builder.CreateStore(value, dest);
-  emitNativeUnownedRetain(value);
+  emitNativeUnownedRetain(value, getDefaultAtomicity());
 }
 
 void IRGenFunction::emitNativeUnownedAssign(llvm::Value *value,
                                             Address dest) {
+  value = Builder.CreateBitCast(value, IGM.RefCountedPtrTy);
   dest = Builder.CreateStructGEP(dest, 0, Size(0));
   auto oldValue = Builder.CreateLoad(dest);
   Builder.CreateStore(value, dest);
-  emitNativeUnownedRetain(value);
-  emitNativeUnownedRelease(oldValue);
+  emitNativeUnownedRetain(value, getDefaultAtomicity());
+  emitNativeUnownedRelease(oldValue, getDefaultAtomicity());
 }
 
 llvm::Value *IRGenFunction::emitNativeUnownedLoadStrong(Address src,
@@ -1117,7 +1176,7 @@ llvm::Value *IRGenFunction::emitNativeUnownedLoadStrong(Address src,
   src = Builder.CreateStructGEP(src, 0, Size(0));
   llvm::Value *value = Builder.CreateLoad(src);
   value = Builder.CreateBitCast(value, type);
-  emitNativeStrongRetainUnowned(value);
+  emitNativeStrongRetainUnowned(value, getDefaultAtomicity());
   return value;
 }
 
@@ -1126,14 +1185,14 @@ llvm::Value *IRGenFunction::emitNativeUnownedTakeStrong(Address src,
   src = Builder.CreateStructGEP(src, 0, Size(0));
   llvm::Value *value = Builder.CreateLoad(src);
   value = Builder.CreateBitCast(value, type);
-  emitNativeStrongRetainAndUnownedRelease(value);
+  emitNativeStrongRetainAndUnownedRelease(value, getDefaultAtomicity());
   return value;
 }
 
 void IRGenFunction::emitNativeUnownedDestroy(Address ref) {
   ref = Builder.CreateStructGEP(ref, 0, Size(0));
   llvm::Value *value = Builder.CreateLoad(ref);
-  emitNativeUnownedRelease(value);
+  emitNativeUnownedRelease(value, getDefaultAtomicity());
 }
 
 void IRGenFunction::emitNativeUnownedCopyInit(Address dest, Address src) {
@@ -1141,7 +1200,7 @@ void IRGenFunction::emitNativeUnownedCopyInit(Address dest, Address src) {
   dest = Builder.CreateStructGEP(dest, 0, Size(0));
   llvm::Value *newValue = Builder.CreateLoad(src);
   Builder.CreateStore(newValue, dest);
-  emitNativeUnownedRetain(newValue);
+  emitNativeUnownedRetain(newValue, getDefaultAtomicity());
 }
 
 void IRGenFunction::emitNativeUnownedTakeInit(Address dest, Address src) {
@@ -1157,8 +1216,8 @@ void IRGenFunction::emitNativeUnownedCopyAssign(Address dest, Address src) {
   llvm::Value *newValue = Builder.CreateLoad(src);
   llvm::Value *oldValue = Builder.CreateLoad(dest);
   Builder.CreateStore(newValue, dest);
-  emitNativeUnownedRetain(newValue);
-  emitNativeUnownedRelease(oldValue);
+  emitNativeUnownedRetain(newValue, getDefaultAtomicity());
+  emitNativeUnownedRelease(oldValue, getDefaultAtomicity());
 }
 
 void IRGenFunction::emitNativeUnownedTakeAssign(Address dest, Address src) {
@@ -1167,7 +1226,7 @@ void IRGenFunction::emitNativeUnownedTakeAssign(Address dest, Address src) {
   llvm::Value *newValue = Builder.CreateLoad(src);
   llvm::Value *oldValue = Builder.CreateLoad(dest);
   Builder.CreateStore(newValue, dest);
-  emitNativeUnownedRelease(oldValue);
+  emitNativeUnownedRelease(oldValue, getDefaultAtomicity());
 }
 
 llvm::Constant *IRGenModule::getFixLifetimeFn() {
@@ -1201,28 +1260,48 @@ llvm::Constant *IRGenModule::getFixLifetimeFn() {
 /// optimizer not to touch this value.
 void IRGenFunction::emitFixLifetime(llvm::Value *value) {
   // If we aren't running the LLVM ARC optimizer, we don't need to emit this.
-  if (!IGM.Opts.Optimize || IGM.Opts.DisableLLVMARCOpts)
+  if (!IGM.IRGen.Opts.Optimize || IGM.IRGen.Opts.DisableLLVMARCOpts)
     return;
   if (doesNotRequireRefCounting(value)) return;
   emitUnaryRefCountCall(*this, IGM.getFixLifetimeFn(), value);
 }
 
-void IRGenFunction::emitUnknownStrongRetain(llvm::Value *value) {
-  if (doesNotRequireRefCounting(value)) return;
-  emitUnaryRefCountCall(*this, IGM.getUnknownRetainFn(), value);
+void IRGenFunction::emitUnknownStrongRetain(llvm::Value *value,
+                                            Atomicity atomicity) {
+  if (doesNotRequireRefCounting(value))
+    return;
+  emitUnaryRefCountCall(*this, (atomicity == Atomicity::Atomic)
+                                   ? IGM.getUnknownRetainFn()
+                                   : IGM.getNonAtomicUnknownRetainFn(),
+                        value);
 }
 
-void IRGenFunction::emitUnknownStrongRelease(llvm::Value *value) {
-  if (doesNotRequireRefCounting(value)) return;
-  emitUnaryRefCountCall(*this, IGM.getUnknownReleaseFn(), value);
+void IRGenFunction::emitUnknownStrongRelease(llvm::Value *value,
+                                             Atomicity atomicity) {
+  if (doesNotRequireRefCounting(value))
+    return;
+  emitUnaryRefCountCall(*this, (atomicity == Atomicity::Atomic)
+                                   ? IGM.getUnknownReleaseFn()
+                                   : IGM.getNonAtomicUnknownReleaseFn(),
+                        value);
 }
 
-void IRGenFunction::emitBridgeStrongRetain(llvm::Value *value) {
-  emitUnaryRefCountCall(*this, IGM.getBridgeObjectStrongRetainFn(), value);
+void IRGenFunction::emitBridgeStrongRetain(llvm::Value *value,
+                                           Atomicity atomicity) {
+  emitUnaryRefCountCall(*this,
+                        (atomicity == Atomicity::Atomic)
+                            ? IGM.getBridgeObjectStrongRetainFn()
+                            : IGM.getNonAtomicBridgeObjectStrongRetainFn(),
+                        value);
 }
 
-void IRGenFunction::emitBridgeStrongRelease(llvm::Value *value) {
-  emitUnaryRefCountCall(*this, IGM.getBridgeObjectStrongReleaseFn(), value);
+void IRGenFunction::emitBridgeStrongRelease(llvm::Value *value,
+                                            Atomicity atomicity) {
+  emitUnaryRefCountCall(*this,
+                        (atomicity == Atomicity::Atomic)
+                            ? IGM.getBridgeObjectStrongReleaseFn()
+                            : IGM.getNonAtomicBridgeObjectStrongReleaseFn(),
+                        value);
 }
 
 void IRGenFunction::emitErrorStrongRetain(llvm::Value *value) {
@@ -1233,9 +1312,12 @@ void IRGenFunction::emitErrorStrongRelease(llvm::Value *value) {
   emitUnaryRefCountCall(*this, IGM.getErrorStrongReleaseFn(), value);
 }
 
-llvm::Value *IRGenFunction::emitNativeTryPin(llvm::Value *value) {
-  llvm::CallInst *call = Builder.CreateCall(IGM.getNativeTryPinFn(), value);
-  call->setCallingConv(IGM.RuntimeCC);
+llvm::Value *IRGenFunction::emitNativeTryPin(llvm::Value *value,
+                                             Atomicity atomicity) {
+  llvm::CallInst *call =
+      (atomicity == Atomicity::Atomic)
+          ? Builder.CreateCall(IGM.getNativeTryPinFn(), value)
+          : Builder.CreateCall(IGM.getNonAtomicNativeTryPinFn(), value);
   call->setDoesNotThrow();
 
   // Builtin.NativeObject? has representation i32/i64.
@@ -1243,12 +1325,14 @@ llvm::Value *IRGenFunction::emitNativeTryPin(llvm::Value *value) {
   return handle;
 }
 
-void IRGenFunction::emitNativeUnpin(llvm::Value *value) {
+void IRGenFunction::emitNativeUnpin(llvm::Value *value, Atomicity atomicity) {
   // Builtin.NativeObject? has representation i32/i64.
   value = Builder.CreateIntToPtr(value, IGM.RefCountedPtrTy);
 
-  llvm::CallInst *call = Builder.CreateCall(IGM.getNativeUnpinFn(), value);
-  call->setCallingConv(IGM.RuntimeCC);
+  llvm::CallInst *call =
+      (atomicity == Atomicity::Atomic)
+          ? Builder.CreateCall(IGM.getNativeUnpinFn(), value)
+          : Builder.CreateCall(IGM.getNonAtomicNativeUnpinFn(), value);
   call->setDoesNotThrow();
 }
 
@@ -1301,7 +1385,6 @@ emitIsUniqueCall(llvm::Value *value, SourceLoc loc, bool isNonNull,
     llvm_unreachable("Unexpected LLVM type for a refcounted pointer.");
   }
   llvm::CallInst *call = Builder.CreateCall(fn, value);
-  call->setCallingConv(IGM.RuntimeCC);
   call->setDoesNotThrow();
   return call;
 }
@@ -1322,7 +1405,7 @@ public:
 
   /// Allocate a box of the given type.
   virtual OwnedAddress
-  allocate(IRGenFunction &IGF, SILType boxedType,
+  allocate(IRGenFunction &IGF, SILType boxedType, GenericEnvironment *env,
            const llvm::Twine &name) const = 0;
 
   /// Deallocate an uninitialized box.
@@ -1340,7 +1423,7 @@ public:
   EmptyBoxTypeInfo(IRGenModule &IGM) : BoxTypeInfo(IGM) {}
 
   OwnedAddress
-  allocate(IRGenFunction &IGF, SILType boxedType,
+  allocate(IRGenFunction &IGF, SILType boxedType, GenericEnvironment *env,
            const llvm::Twine &name) const override {
     return OwnedAddress(IGF.getTypeInfo(boxedType).getUndefAddress(),
                         IGF.IGM.RefCountedNull);
@@ -1365,7 +1448,7 @@ public:
   NonFixedBoxTypeInfo(IRGenModule &IGM) : BoxTypeInfo(IGM) {}
 
   OwnedAddress
-  allocate(IRGenFunction &IGF, SILType boxedType,
+  allocate(IRGenFunction &IGF, SILType boxedType, GenericEnvironment *env,
            const llvm::Twine &name) const override {
     auto &ti = IGF.getTypeInfo(boxedType);
     // Use the runtime to allocate a box of the appropriate size.
@@ -1406,10 +1489,22 @@ public:
   {}
 
   OwnedAddress
-  allocate(IRGenFunction &IGF, SILType boxedType, const llvm::Twine &name)
+  allocate(IRGenFunction &IGF, SILType boxedType, GenericEnvironment *env,
+           const llvm::Twine &name)
   const override {
     // Allocate a new object using the layout.
-    llvm::Value *allocation = IGF.emitUnmanagedAlloc(layout, name);
+    auto boxedInterfaceType = boxedType;
+    if (env) {
+      boxedInterfaceType = SILType::getPrimitiveType(
+        env->mapTypeOutOfContext(boxedType.getSwiftRValueType())
+           ->getCanonicalType(),
+         boxedType.getCategory());
+    }
+
+    auto boxDescriptor = IGF.IGM.getAddrOfBoxDescriptor(
+        boxedInterfaceType.getSwiftRValueType());
+    llvm::Value *allocation = IGF.emitUnmanagedAlloc(layout, name,
+                                                     boxDescriptor);
     Address rawAddr = project(IGF, allocation, boxedType);
     return {rawAddr, allocation};
   }
@@ -1467,11 +1562,15 @@ public:
   {}
 };
 
-}
+} // end anonymous namespace
 
 const TypeInfo *TypeConverter::convertBoxType(SILBoxType *T) {
   // We can share a type info for all dynamic-sized heap metadata.
-  auto &eltTI = IGM.getTypeInfoForLowered(T->getBoxedType());
+  // TODO: Multi-field boxes
+  assert(T->getLayout()->getFields().size() == 1
+         && "multi-field boxes not implemented yet");
+  auto &eltTI = IGM.getTypeInfoForLowered(
+    T->getFieldLoweredType(IGM.getSILModule(), 0));
   if (!eltTI.isFixedSize()) {
     if (!NonFixedBoxTI)
       NonFixedBoxTI = new NonFixedBoxTypeInfo(IGM);
@@ -1513,34 +1612,49 @@ const TypeInfo *TypeConverter::convertBoxType(SILBoxType *T) {
   // TODO: Other common shapes? Optional-of-Refcounted would be nice.
 
   // Produce a tailored box metadata for the type.
-  return new FixedBoxTypeInfo(IGM, T->getBoxedAddressType());
+  assert(T->getLayout()->getFields().size() == 1
+         && "multi-field boxes not implemented yet");
+  return new FixedBoxTypeInfo(IGM, T->getFieldType(IGM.getSILModule(), 0));
 }
 
 OwnedAddress
 irgen::emitAllocateBox(IRGenFunction &IGF, CanSILBoxType boxType,
+                       GenericEnvironment *env,
                        const llvm::Twine &name) {
   auto &boxTI = IGF.getTypeInfoForLowered(boxType).as<BoxTypeInfo>();
-  return boxTI.allocate(IGF, boxType->getBoxedAddressType(), name);
+  assert(boxType->getLayout()->getFields().size() == 1
+         && "multi-field boxes not implemented yet");
+  return boxTI.allocate(IGF,
+                      boxType->getFieldType(IGF.IGM.getSILModule(), 0), env,
+                      name);
 }
 
 void irgen::emitDeallocateBox(IRGenFunction &IGF,
                               llvm::Value *box,
                               CanSILBoxType boxType) {
   auto &boxTI = IGF.getTypeInfoForLowered(boxType).as<BoxTypeInfo>();
-  return boxTI.deallocate(IGF, box, boxType->getBoxedAddressType());
+  assert(boxType->getLayout()->getFields().size() == 1
+         && "multi-field boxes not implemented yet");
+  return boxTI.deallocate(IGF, box,
+                          boxType->getFieldType(IGF.IGM.getSILModule(), 0));
 }
 
 Address irgen::emitProjectBox(IRGenFunction &IGF,
                               llvm::Value *box,
                               CanSILBoxType boxType) {
   auto &boxTI = IGF.getTypeInfoForLowered(boxType).as<BoxTypeInfo>();
-  return boxTI.project(IGF, box, boxType->getBoxedAddressType());
+  assert(boxType->getLayout()->getFields().size() == 1
+         && "multi-field boxes not implemented yet");
+  return boxTI.project(IGF, box,
+                       boxType->getFieldType(IGF.IGM.getSILModule(), 0));
 }
 
 #define DEFINE_VALUE_OP(ID)                                           \
-void IRGenFunction::emit##ID(llvm::Value *value) {                    \
+void IRGenFunction::emit##ID(llvm::Value *value, Atomicity atomicity) { \
   if (doesNotRequireRefCounting(value)) return;                       \
-  emitUnaryRefCountCall(*this, IGM.get##ID##Fn(), value);             \
+  emitUnaryRefCountCall(*this, (atomicity == Atomicity::Atomic)       \
+                        ? IGM.get##ID##Fn() : IGM.getNonAtomic##ID##Fn(), \
+                        value);                                       \
 }
 #define DEFINE_ADDR_OP(ID)                                            \
 void IRGenFunction::emit##ID(Address addr) {                          \

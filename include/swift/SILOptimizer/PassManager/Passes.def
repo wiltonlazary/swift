@@ -2,11 +2,11 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2016 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 //
@@ -23,9 +23,17 @@
 #error "Macro must be defined by includer"
 #endif
 
+/// IRGEN_PASS(Id, Name, Description)
+///   The pass is identified by PassKind::Id.
+///   An IRGen pass is created by IRGen and needs to be register with the pass
+///   manager dynamically.
+#ifndef IRGEN_PASS
+#define IRGEN_PASS(Id, Name, Description) PASS(Id, Name, Description)
+#endif
+
 /// PASS_RANGE(RANGE_ID, START, END)
 ///   Pass IDs between PassKind::START and PassKind::END, inclusive,
-///   fall within the set known as 
+///   fall within the set known as
 #ifndef PASS_RANGE
 #define PASS_RANGE(Id, First, Last)
 #endif
@@ -34,12 +42,22 @@ PASS(AADumper, "aa-dump",
      "Dump AA result for all pairs of ValueKinds in all functions")
 PASS(ABCOpt, "abcopts",
      "Optimization of array bounds checks")
+PASS(AddressLowering, "address-lowering",
+     "SIL AddressOnly lowering.")
 PASS(AllocBoxToStack, "allocbox-to-stack",
      "Promote heap allocations to stack allocations")
+IRGEN_PASS(AllocStackHoisting, "alloc-stack-hoisting",
+           "Hoist generic alloc_stack instructions to the entry block")
 PASS(ArrayCountPropagation, "array-count-propagation",
      "Propagate the count of arrays")
 PASS(ArrayElementPropagation, "array-element-propagation",
      "Propagate the value of array elements")
+PASS(AssumeSingleThreaded, "sil-assume-single-threaded",
+     "Assume that code will be executed in a single-threaded environment")
+PASS(BasicInstructionPropertyDumper, "basic-instruction-property-dump",
+     "Dump MemBehavior and ReleaseBehavior results from calling "
+     "SILInstruction::{getMemoryBehavior,getReleasingBehavior}()"
+     " on all instructions")
 PASS(BasicCalleePrinter, "basic-callee-printer",
      "Construct basic callee analysis and use it to print callees "
      "for testing purposes")
@@ -49,6 +67,8 @@ PASS(COWArrayOpts, "cowarray-opt",
      "COW Array optimizations")
 PASS(CSE, "cse",
      "Common subexpression elimination")
+PASS(CallerAnalysisPrinter, "caller-analysis-printer",
+     "Print callsites of every function in the module")
 PASS(CapturePromotion, "capture-promotion",
      "Promote captures from by-reference to by-value")
 PASS(CapturePropagation, "capture-prop",
@@ -63,12 +83,20 @@ PASS(ComputeDominanceInfo, "compute-dominance-info",
 PASS(ComputeLoopInfo, "compute-loop-info",
      "Utility pass that computes loop info for all functions in order to help "
      "test loop info updating")
+PASS(ConditionForwarding, "condition-forwarding",
+     "Forward conditional branch instructions")
 PASS(CopyForwarding, "copy-forwarding",
      "Eliminate redundant copies")
+PASS(EpilogueARCMatcherDumper, "sil-epilogue-arc-dumper",
+     "Dump epilogue retains for return value and releases for arguments")
+PASS(EpilogueRetainReleaseMatcherDumper, "sil-epilogue-retain-release-dumper",
+     "Dump epilogue retains for return value and releases for arguments")
 PASS(RedundantOverflowCheckRemoval, "remove-redundant-overflow-checks",
      "Removes redundant overflow checks")
 PASS(DCE, "dce",
      "Eliminate dead code")
+PASS(DeadArgSignatureOpt, "dead-arg-signature-opt",
+     "Create function with removed dead arguments")
 PASS(DeadFunctionElimination, "sil-deadfuncelim",
      "Remove unused functions")
 PASS(DeadObjectElimination, "deadobject-elim",
@@ -80,6 +108,8 @@ PASS(DiagnoseUnreachable, "diagnose-unreachable",
      "Diagnose Unreachable Code")
 PASS(DiagnosticConstantPropagation, "diagnostic-constant-propagation",
      "Propagate constants and emit diagnostics")
+PASS(EagerSpecializer, "eager-specializer",
+     "Specialize speculatively and insert dispatch guarded by type checks")
 PASS(EarlyCodeMotion, "early-codemotion",
      "Code motion without release hoisting")
 PASS(EarlyInliner, "early-inline",
@@ -95,7 +125,7 @@ PASS(ExternalFunctionDefinitionsElimination, "external-func-definition-elim",
 PASS(FunctionOrderPrinter, "function-order-printer",
      "Print function orderings for test purposes")
 PASS(FunctionSignatureOpts, "function-signature-opts",
-     "Optimize Function Signatures")
+     "Create function with optimized signatures")
 PASS(ARCSequenceOpts, "arc-sequence-opts",
      "Optimize sequences of retain/release opts by removing redundant inner "
      "retain/release sequences")
@@ -111,14 +141,14 @@ PASS(GlobalOpt, "global-opt",
      "Global variable optimizations")
 PASS(GlobalPropertyOpt, "global-property-opt",
      "Optimize properties")
+PASS(GuaranteedARCOpts, "guaranteed-arc-opts",
+     "Guaranteed ARC optimizations")
 PASS(HighLevelCSE, "high-level-cse",
      "Common subexpression elimination on High-level SIL")
 PASS(HighLevelLICM, "high-level-licm",
      "High Level Loop invariant code motion")
 PASS(IVInfoPrinter, "iv-info-printer",
      "Display induction variable information")
-PASS(InOutDeshadowing, "inout-deshadow",
-     "Remove inout argument shadow variables")
 PASS(InstCount, "inst-count",
      "Count all instructions in the module using llvm Statistics")
 PASS(JumpThreadSimplifyCFG, "simplify-cfg",
@@ -155,8 +185,14 @@ PASS(LSLocationPrinter, "lslocation-dump",
      "Dump LSLocation results from analyzing all accessed locations")
 PASS(MergeCondFails, "merge-cond_fails",
      "Remove redundant overflow checks")
+PASS(MoveCondFailToPreds, "move-cond-fail-to-preds",
+     "Test pass that hoists conditional fails to predecessors blocks when "
+     "profitable")
 PASS(NoReturnFolding, "noreturn-folding",
      "Add 'unreachable' after noreturn calls")
+PASS(OwnershipModelEliminator, "ownership-model-eliminator",
+     "Eliminate SIL ownership constructs that are not supported by the whole"
+     " compiler from the IR")
 PASS(RCIdentityDumper, "rc-id-dumper",
      "Dump the RCIdentity of all values in a function")
 // TODO: It makes no sense to have early inliner, late inliner, and
@@ -169,6 +205,12 @@ PASS(PredictableMemoryOptimizations, "predictable-memopt",
      "Predictable early memory optimizations")
 PASS(ReleaseDevirtualizer, "release-devirtualizer",
      "Devirtualize release-instructions")
+PASS(RetainSinking, "retain-sinking",
+     "Sink retains")
+PASS(ReleaseHoisting, "release-hoisting",
+     "Hoist releases")
+PASS(LateReleaseHoisting, "late-release-hoisting",
+     "Hoist releases")
 PASS(RemovePins, "remove-pins",
      "Remove pin/unpin pairs")
 PASS(SideEffectsDumper, "side-effects-dump",
@@ -177,6 +219,8 @@ PASS(SILCleanup, "cleanup",
      "Cleanup SIL in preparation for IRGen")
 PASS(SILCombine, "sil-combine",
      "Perform small peepholes and combine operations")
+PASS(SILDebugInfoGenerator, "sil-debuginfo-gen",
+     "Write a SIL file for debugging")
 PASS(SILLinker, "linker",
      "Link in all of the serialized SIL referenced in the module")
 PASS(SROA, "sroa",
@@ -200,9 +244,17 @@ PASS(StripDebugInfo, "strip-debug-info",
      "Strip debug info")
 PASS(SwiftArrayOpts, "array-specialize",
      "Specialize arrays")
+PASS(UnsafeGuaranteedPeephole, "unsafe-guaranteed-peephole",
+     "Peephole retain/release removal for regions denoted by "
+     "Builtin.unsafeGuaranteed")
 PASS(UsePrespecialized, "use-prespecialized",
      "Use pre-specialized functions")
-PASS_RANGE(AllPasses, AADumper, UsePrespecialized)
+PASS(ValueOwnershipKindDumper, "value-ownership-kind-dumper",
+     "Print the value ownership kind of all ValueBase in a SILModule")
+PASS(BugReducerTester, "bug-reducer-tester",
+     "Utility pass for testing sil-bug-reducer. Asserts when visits an apply that calls a specific function")
+PASS_RANGE(AllPasses, AADumper, BugReducerTester)
 
+#undef IRGEN_PASS
 #undef PASS
 #undef PASS_RANGE

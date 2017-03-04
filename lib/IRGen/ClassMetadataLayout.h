@@ -2,11 +2,11 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2016 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 //
@@ -73,37 +73,36 @@ public:
     asImpl().addIVarDestroyer();
 
     // Class members.
-    addClassMembers(Target);
+    addClassMembers(Target, Target->getDeclaredTypeInContext());
   }
 
 private:
   /// Add fields associated with the given class and its bases.
-  void addClassMembers(ClassDecl *theClass) {
+  void addClassMembers(ClassDecl *theClass, Type type) {
     // Add any fields associated with the superclass.
     // NB: We don't apply superclass substitutions to members because we want
     // consistent metadata layout between generic superclasses and concrete
     // subclasses.
-    if (Type superclass = theClass->getSuperclass()) {
+    if (Type superclass = type->getSuperclass(nullptr)) {
       ClassDecl *superclassDecl = superclass->getClassOrBoundGenericClass();
       // Skip superclass fields if superclass is resilient.
       // FIXME: Needs runtime support to ensure the field offset vector is
       // populated correctly.
-      if (!IGM.isResilient(superclassDecl, ResilienceExpansion::Maximal)) {
-        addClassMembers(superclass->getClassOrBoundGenericClass());
+      if (!IGM.Context.LangOpts.EnableClassResilience ||
+          !IGM.isResilient(superclassDecl, ResilienceExpansion::Maximal)) {
+        addClassMembers(superclassDecl, superclass);
       }
     }
 
     // Add a reference to the parent class, if applicable.
     if (theClass->getDeclContext()->isTypeContext()) {
-      asImpl().addParentMetadataRef(theClass);
+      asImpl().addParentMetadataRef(theClass, type);
     }
 
     // Add space for the generic parameters, if applicable.
     // Note that we only add references for the immediate parameters;
     // parameters for the parent context are handled by the parent.
-    if (auto generics = theClass->getGenericParams()) {
-      addGenericClassFields(theClass, *generics);
-    }
+    asImpl().addGenericFields(theClass, type, theClass);
 
     // Add entries for the methods.
     for (auto member : theClass->getMembers()) {
@@ -177,15 +176,6 @@ private:
   void noteEndOfFieldOffsets(ClassDecl *whichClass) {}
 
 private:
-  /// Add fields related to the generics of this class declaration.
-  /// TODO: don't add new fields that are implied by the superclass.
-  /// fields.  e.g., if B<T> extends A<T>, the witness for T in A's
-  /// section should be enough.
-  void addGenericClassFields(ClassDecl *theClass,
-                             const GenericParamList &generics) {
-    asImpl().addGenericFields(generics, theClass);
-  }
-
   void addFieldEntries(VarDecl *field) {
     asImpl().addFieldOffset(field);
   }
@@ -243,7 +233,7 @@ public:
   void addIVarDestroyer() { addPointer(); }
   void addValueWitnessTable() { addPointer(); }
   void addDestructorFunction() { addPointer(); }
-  void addParentMetadataRef(ClassDecl *forClass) { addPointer(); }
+  void addParentMetadataRef(ClassDecl *forClass, Type classType) {addPointer();}
   void addSuperClass() { addPointer(); }
   void addClassFlags() { addInt32(); }
   void addInstanceAddressPoint() { addInt32(); }
@@ -258,11 +248,10 @@ public:
     addPointer();
   }
   void addFieldOffset(VarDecl *var) { addPointer(); }
-  void addGenericArgument(ArchetypeType *argument, ClassDecl *forClass) {
+  void addGenericArgument(CanType argument, ClassDecl *forClass) {
     addPointer();
   }
-  void addGenericWitnessTable(ArchetypeType *argument,
-                              ProtocolDecl *protocol,
+  void addGenericWitnessTable(CanType argument, ProtocolConformanceRef conf,
                               ClassDecl *forClass) {
     addPointer();
   }

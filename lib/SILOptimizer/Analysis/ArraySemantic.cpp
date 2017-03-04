@@ -1,12 +1,12 @@
-//===- ArraySemantic.cpp - Wrapper around array semantic calls. -*- C++ -*-===//
+//===--- ArraySemantic.cpp - Wrapper around array semantic calls. ---------===//
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2016 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 
@@ -55,7 +55,7 @@ bool swift::ArraySemanticsCall::isValidSignature() {
   case ArrayCallKind::kCheckIndex: {
     // Int, @guaranteed/@owned Self
     if (SemanticsCall->getNumArguments() != 2 ||
-        !SemanticsCall->getArgument(0).getType().isTrivial(Mod))
+        !SemanticsCall->getArgument(0)->getType().isTrivial(Mod))
       return false;
     auto SelfConvention = FnTy->getSelfParameter().getConvention();
     return SelfConvention == ParameterConvention::Direct_Guaranteed ||
@@ -64,9 +64,9 @@ bool swift::ArraySemanticsCall::isValidSignature() {
   case ArrayCallKind::kCheckSubscript: {
     // Int, Bool, Self
     if (SemanticsCall->getNumArguments() != 3 ||
-        !SemanticsCall->getArgument(0).getType().isTrivial(Mod))
+        !SemanticsCall->getArgument(0)->getType().isTrivial(Mod))
       return false;
-    if (!SemanticsCall->getArgument(1).getType().isTrivial(Mod))
+    if (!SemanticsCall->getArgument(1)->getType().isTrivial(Mod))
       return false;
     auto SelfConvention = FnTy->getSelfParameter().getConvention();
     return SelfConvention == ParameterConvention::Direct_Guaranteed ||
@@ -80,24 +80,31 @@ bool swift::ArraySemanticsCall::isValidSignature() {
     // Make sure that if we are a _adoptStorage call that our storage is
     // uniquely referenced by us.
     SILValue Arg0 = SemanticsCall->getArgument(0);
-    if (Arg0.getType().isExistentialType()) {
+    if (Arg0->getType().isExistentialType()) {
       auto *AllocBufferAI = dyn_cast<ApplyInst>(Arg0);
       if (!AllocBufferAI)
         return false;
 
-      auto *AllocFn = AllocBufferAI->getCalleeFunction();
+      auto *AllocFn = AllocBufferAI->getReferencedFunction();
       if (!AllocFn)
         return false;
 
       StringRef AllocFuncName = AllocFn->getName();
-      if (AllocFuncName != "swift_bufferAllocate" &&
-          AllocFuncName != "swift_bufferAllocateOnStack")
+      if (AllocFuncName != "swift_bufferAllocate")
         return false;
 
-      if (!hasOneNonDebugUse(*AllocBufferAI))
+      if (!hasOneNonDebugUse(AllocBufferAI))
         return false;
     }
     return true;
+  }
+  case ArrayCallKind::kWithUnsafeMutableBufferPointer: {
+    SILFunctionConventions origConv(SemanticsCall->getOrigCalleeType(), Mod);
+    if (origConv.getNumIndirectSILResults() != 1
+        || SemanticsCall->getNumArguments() != 3)
+      return false;
+    auto SelfConvention = FnTy->getSelfParameter().getConvention();
+    return SelfConvention == ParameterConvention::Indirect_Inout;
   }
   }
 
@@ -109,9 +116,9 @@ swift::ArraySemanticsCall::ArraySemanticsCall(ValueBase *V,
                                               StringRef SemanticStr,
                                               bool MatchPartialName) {
   if (auto *AI = dyn_cast<ApplyInst>(V))
-    if (auto *Fn = AI->getCalleeFunction())
+    if (auto *Fn = AI->getReferencedFunction())
       if ((MatchPartialName &&
-           Fn->hasSemanticsAttrsThatStartsWith(SemanticStr)) ||
+           Fn->hasSemanticsAttrThatStartsWith(SemanticStr)) ||
           (!MatchPartialName && Fn->hasSemanticsAttr(SemanticStr))) {
         SemanticsCall = AI;
         // Need a 'self' argument otherwise this is not a semantic call that
@@ -155,6 +162,7 @@ ArrayCallKind swift::ArraySemanticsCall::getKind() const {
             .Case("array.get_element_address",
                   ArrayCallKind::kGetElementAddress)
             .Case("array.mutate_unknown", ArrayCallKind::kMutateUnknown)
+            .Case("array.withUnsafeMutableBufferPointer", ArrayCallKind::kWithUnsafeMutableBufferPointer)
             .Default(ArrayCallKind::kNone);
     if (Tmp != ArrayCallKind::kNone) {
       assert(Kind == ArrayCallKind::kNone && "Multiple array semantic "
@@ -187,6 +195,25 @@ bool swift::ArraySemanticsCall::hasGuaranteedSelf() const {
     ParameterConvention::Direct_Guaranteed;
 }
 
+bool swift::ArraySemanticsCall::hasGetElementDirectResult() const {
+  assert(getKind() == ArrayCallKind::kGetElement &&
+         "must be an array.get_element call");
+  bool DirectResult =
+      (SemanticsCall->getOrigCalleeConv().getNumIndirectSILResults() == 0);
+  assert((DirectResult && SemanticsCall->getNumArguments() == 4 ||
+          !DirectResult && SemanticsCall->getNumArguments() == 5) &&
+         "wrong number of array.get_element call arguments");
+  return DirectResult;
+}
+
+SILValue swift::ArraySemanticsCall::getTypeCheckedArgument() const {
+  return SemanticsCall->getArgument(hasGetElementDirectResult() ? 1 : 2);
+}
+
+SILValue swift::ArraySemanticsCall::getSubscriptCheckArgument() const {
+  return SemanticsCall->getArgument(hasGetElementDirectResult() ? 2 : 3);
+}
+
 SILValue swift::ArraySemanticsCall::getIndex() const {
   assert(SemanticsCall && "Must have a semantics call");
   assert(SemanticsCall->getNumArguments() && "Must have arguments");
@@ -196,7 +223,7 @@ SILValue swift::ArraySemanticsCall::getIndex() const {
          getKind() == ArrayCallKind::kGetElementAddress);
 
   if (getKind() == ArrayCallKind::kGetElement)
-    return SemanticsCall->getArgument(1);
+    return SemanticsCall->getArgument(hasGetElementDirectResult() ? 0 : 1);
 
   return SemanticsCall->getArgument(0);
 }
@@ -230,22 +257,22 @@ static bool canHoistArrayArgument(ApplyInst *SemanticsCall, SILValue Arr,
       Convention != ParameterConvention::Direct_Guaranteed)
     return false;
 
-  auto *SelfVal = Arr.getDef();
-  auto *SelfBB = SelfVal->getParentBB();
+  ValueBase *SelfVal = Arr;
+  auto *SelfBB = SelfVal->getParentBlock();
   if (DT->dominates(SelfBB, InsertBefore->getParent()))
     return true;
 
   if (auto LI = dyn_cast<LoadInst>(SelfVal)) {
     // Are we loading a value from an address in a struct defined at a point
     // dominating the hoist point.
-    auto Val = LI->getOperand().getDef();
+    auto Val = LI->getOperand();
     bool DoesNotDominate;
     StructElementAddrInst *SEI;
-    while ((DoesNotDominate = !DT->dominates(Val->getParentBB(),
+    while ((DoesNotDominate = !DT->dominates(Val->getParentBlock(),
                                              InsertBefore->getParent())) &&
            (SEI = dyn_cast<StructElementAddrInst>(Val)))
-      Val = SEI->getOperand().getDef();
-    return DoesNotDominate == false;
+      Val = SEI->getOperand();
+    return !DoesNotDominate;
   }
 
   return false;
@@ -271,7 +298,7 @@ bool swift::ArraySemanticsCall::canHoist(SILInstruction *InsertBefore,
 
   case ArrayCallKind::kCheckSubscript: {
     auto IsNativeArg = getArrayPropertyIsNativeTypeChecked();
-    ArraySemanticsCall IsNative(IsNativeArg.getDef(),
+    ArraySemanticsCall IsNative(IsNativeArg,
                                 "array.props.isNativeTypeChecked", true);
     if (!IsNative) {
       // Do we have a constant parameter?
@@ -299,23 +326,23 @@ bool swift::ArraySemanticsCall::canHoist(SILInstruction *InsertBefore,
 static SILValue copyArrayLoad(SILValue ArrayStructValue,
                                SILInstruction *InsertBefore,
                                DominanceInfo *DT) {
-  if (DT->dominates(ArrayStructValue.getDef()->getParentBB(),
+  if (DT->dominates(ArrayStructValue->getParentBlock(),
                     InsertBefore->getParent()))
     return ArrayStructValue;
 
-  auto *LI = cast<LoadInst>(ArrayStructValue.getDef());
+  auto *LI = cast<LoadInst>(ArrayStructValue);
 
   // Recursively move struct_element_addr.
-  auto *Val = LI->getOperand().getDef();
+  ValueBase *Val = LI->getOperand();
   auto *InsertPt = InsertBefore;
-  while (!DT->dominates(Val->getParentBB(), InsertBefore->getParent())) {
+  while (!DT->dominates(Val->getParentBlock(), InsertBefore->getParent())) {
     auto *Inst = cast<StructElementAddrInst>(Val);
     Inst->moveBefore(InsertPt);
-    Val = Inst->getOperand().getDef();
+    Val = Inst->getOperand();
     InsertPt = Inst;
   }
 
-  return SILValue(LI->clone(InsertBefore), 0);
+  return LI->clone(InsertBefore);
 }
 
 static ApplyInst *hoistOrCopyCall(ApplyInst *AI, SILInstruction *InsertBefore,
@@ -347,16 +374,19 @@ static SILValue hoistOrCopySelf(ApplyInst *SemanticsCall,
   bool IsOwnedSelf = SelfConvention == ParameterConvention::Direct_Owned;
 
   // Emit matching release for owned self if we are moving the original call.
-  if (!LeaveOriginal && IsOwnedSelf)
-    SILBuilderWithScope(SemanticsCall)
-        .createReleaseValue(SemanticsCall->getLoc(), Self);
+  if (!LeaveOriginal && IsOwnedSelf) {
+    SILBuilderWithScope Builder(SemanticsCall);
+    Builder.createReleaseValue(SemanticsCall->getLoc(), Self, Builder.getDefaultAtomicity());
+  }
 
   auto NewArrayStructValue = copyArrayLoad(Self, InsertBefore, DT);
 
   // Retain the array.
-  if (IsOwnedSelf)
-    SILBuilderWithScope(InsertBefore, SemanticsCall)
-      .createRetainValue(SemanticsCall->getLoc(), NewArrayStructValue);
+  if (IsOwnedSelf) {
+    SILBuilderWithScope Builder(InsertBefore, SemanticsCall);
+    Builder.createRetainValue(SemanticsCall->getLoc(), NewArrayStructValue,
+                              Builder.getDefaultAtomicity());
+  }
 
   return NewArrayStructValue;
 }
@@ -393,7 +423,7 @@ ApplyInst *swift::ArraySemanticsCall::hoistOrCopy(SILInstruction *InsertBefore,
     if (Kind == ArrayCallKind::kCheckSubscript) {
       // Copy the array.props argument call.
       auto IsNativeArg = getArrayPropertyIsNativeTypeChecked();
-      ArraySemanticsCall IsNative(IsNativeArg.getDef(),
+      ArraySemanticsCall IsNative(IsNativeArg,
                                   "array.props.isNativeTypeChecked", true);
       if (!IsNative) {
         // Do we have a constant parameter?
@@ -449,9 +479,11 @@ ApplyInst *swift::ArraySemanticsCall::hoistOrCopy(SILInstruction *InsertBefore,
 
 void swift::ArraySemanticsCall::removeCall() {
   if (getSelfParameterConvention(SemanticsCall) ==
-      ParameterConvention::Direct_Owned)
-    SILBuilderWithScope(SemanticsCall)
-        .createReleaseValue(SemanticsCall->getLoc(), getSelf());
+      ParameterConvention::Direct_Owned) {
+    SILBuilderWithScope Builder(SemanticsCall);
+    Builder.createReleaseValue(SemanticsCall->getLoc(), getSelf(),
+                               Builder.getDefaultAtomicity());
+  }
 
   switch (getKind()) {
   default: break;
@@ -465,16 +497,17 @@ void swift::ArraySemanticsCall::removeCall() {
   break;
   case ArrayCallKind::kGetElement: {
     // Remove the matching isNativeTypeChecked and check_subscript call.
-    ArraySemanticsCall IsNative(SemanticsCall->getArgument(2).getDef(),
+    ArraySemanticsCall IsNative(getTypeCheckedArgument(),
                                 "array.props.isNativeTypeChecked");
-    ArraySemanticsCall SubscriptCheck(SemanticsCall->getArgument(3).getDef(),
+    ArraySemanticsCall SubscriptCheck(getSubscriptCheckArgument(),
                                       "array.check_subscript");
     if (SubscriptCheck)
       SubscriptCheck.removeCall();
 
     // array.isNativeTypeChecked might be shared among several get_element
     // calls. The last user should delete it.
-    if (IsNative && getSingleNonDebugUser(*IsNative) == SemanticsCall) {
+    if (IsNative && getSingleNonDebugUser((ApplyInst *)IsNative) ==
+                      SemanticsCall) {
       deleteAllDebugUses(IsNative);
       (*IsNative).replaceAllUsesWithUndef();
       IsNative.removeCall();
@@ -487,39 +520,36 @@ void swift::ArraySemanticsCall::removeCall() {
   SemanticsCall = nullptr;
 }
 
-static bool hasArrayPropertyIsNativeTypeChecked(ArrayCallKind Kind,
-                                                unsigned &ArgIdx) {
-  switch (Kind) {
-  default: break;
-
-  case ArrayCallKind::kCheckSubscript:
-  case ArrayCallKind::kGetElement:
-    ArgIdx = 1;
-    return true;
-  }
-  return false;
-}
-
 SILValue
 swift::ArraySemanticsCall::getArrayPropertyIsNativeTypeChecked() const {
-  unsigned ArgIdx = 0;
-  bool HasArg = hasArrayPropertyIsNativeTypeChecked(getKind(), ArgIdx);
-  (void)HasArg;
-  assert(HasArg &&
-         "Must have an array.props argument");
+  switch (getKind()) {
+    case ArrayCallKind::kCheckSubscript:
+      return SemanticsCall->getArgument(1);
+    case ArrayCallKind::kGetElement:
+      return getTypeCheckedArgument();
+    default:
+      llvm_unreachable("Must have an array.props argument");
+  }
+}
 
-  return SemanticsCall->getArgument(ArgIdx);
+bool swift::ArraySemanticsCall::doesNotChangeArray() const {
+  switch (getKind()) {
+    default: return false;
+    case ArrayCallKind::kArrayPropsIsNativeTypeChecked:
+    case ArrayCallKind::kCheckSubscript:
+    case ArrayCallKind::kCheckIndex:
+    case ArrayCallKind::kGetCount:
+    case ArrayCallKind::kGetCapacity:
+    case ArrayCallKind::kGetElement:
+      return true;
+  }
 }
 
 bool swift::ArraySemanticsCall::mayHaveBridgedObjectElementType() const {
   assert(hasSelf() && "Need self parameter");
 
-  auto Ty = getSelf().getType().getSwiftRValueType();
-  auto Canonical = Ty.getCanonicalTypeOrNull();
-  if (Canonical.isNull())
-    return true;
-
-  auto *Struct = Canonical->getStructOrBoundGenericStruct();
+  auto Ty = getSelf()->getType().getSwiftRValueType();
+  auto *Struct = Ty->getStructOrBoundGenericStruct();
   assert(Struct && "Array must be a struct !?");
   if (Struct) {
     auto BGT = dyn_cast<BoundGenericType>(Ty);
@@ -528,10 +558,7 @@ bool swift::ArraySemanticsCall::mayHaveBridgedObjectElementType() const {
 
     // Check the array element type parameter.
     bool isClass = true;
-    for (auto TP : BGT->getGenericArgs()) {
-      auto EltTy = TP.getCanonicalTypeOrNull();
-      if (EltTy.isNull())
-        return true;
+    for (auto EltTy : BGT->getGenericArgs()) {
       if (EltTy->isBridgeableObjectType())
         return true;
       isClass = false;
@@ -548,14 +575,17 @@ SILValue swift::ArraySemanticsCall::getInitializationCount() const {
     // argument. The count is the second argument.
     // A call to _allocateUninitialized has the count as first argument.
     SILValue Arg0 = SemanticsCall->getArgument(0);
-    if (Arg0.getType().isExistentialType())
+    if (Arg0->getType().isExistentialType() ||
+        Arg0->getType().hasReferenceSemantics())
       return SemanticsCall->getArgument(1);
     else return SemanticsCall->getArgument(0);
   }
 
   if (getKind() == ArrayCallKind::kArrayInit &&
       SemanticsCall->getNumArguments() == 3)
-    return SemanticsCall->getArgument(0);
+    // Repeated-value array initializer. Arguments are the value to
+    // repeat, the count, and the value's type.
+    return SemanticsCall->getArgument(1);
 
   return SILValue();
 }
@@ -583,7 +613,7 @@ SILValue swift::ArraySemanticsCall::getArrayValue() const {
     return SILValue(ArrayDef);
   }
 
-  if(getKind() == ArrayCallKind::kArrayInit)
+  if (getKind() == ArrayCallKind::kArrayInit)
     return SILValue(SemanticsCall);
 
   return SILValue();
@@ -621,28 +651,33 @@ bool swift::ArraySemanticsCall::replaceByValue(SILValue V) {
   assert(getKind() == ArrayCallKind::kGetElement &&
          "Must be a get_element call");
   // We only handle loadable types.
-  if (!V.getType().isLoadable(SemanticsCall->getModule()))
+  if (!V->getType().isLoadable(SemanticsCall->getModule()))
    return false;
 
-  auto Dest = SemanticsCall->getArgument(0);
-
-  // Expect an alloc_stack initialization.
-  auto *ASI = dyn_cast<AllocStackInst>(Dest);
-  if (!ASI)
-    return false;
-
   // Expect a check_subscript call or the empty dependence.
-  auto SubscriptCheck = SemanticsCall->getArgument(3);
-  ArraySemanticsCall Check(SubscriptCheck.getDef(), "array.check_subscript");
+  auto SubscriptCheck = getSubscriptCheckArgument();
+  ArraySemanticsCall Check(SubscriptCheck, "array.check_subscript");
   auto *EmptyDep = dyn_cast<StructInst>(SubscriptCheck);
   if (!Check && (!EmptyDep || !EmptyDep->getElements().empty()))
     return false;
 
   SILBuilderWithScope Builder(SemanticsCall);
-  auto &ValLowering = Builder.getModule().getTypeLowering(V.getType());
-  ValLowering.emitRetainValue(Builder, SemanticsCall->getLoc(), V);
-  ValLowering.emitStoreOfCopy(Builder, SemanticsCall->getLoc(), V, Dest,
-                              IsInitialization_t::IsInitialization);
+  auto &ValLowering = Builder.getModule().getTypeLowering(V->getType());
+  if (hasGetElementDirectResult()) {
+    ValLowering.emitCopyValue(Builder, SemanticsCall->getLoc(), V);
+    SemanticsCall->replaceAllUsesWith(V);
+  } else {
+    auto Dest = SemanticsCall->getArgument(0);
+
+    // Expect an alloc_stack initialization.
+    auto *ASI = dyn_cast<AllocStackInst>(Dest);
+    if (!ASI)
+      return false;
+
+    ValLowering.emitCopyValue(Builder, SemanticsCall->getLoc(), V);
+    ValLowering.emitStoreOfCopy(Builder, SemanticsCall->getLoc(), V, Dest,
+                                IsInitialization_t::IsInitialization);
+  }
   removeCall();
   return true;
 }

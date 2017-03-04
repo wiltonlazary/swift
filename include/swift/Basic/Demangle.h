@@ -2,11 +2,17 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2016 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+//
+//===----------------------------------------------------------------------===//
+//
+// This file is the public API of the demangler library.
+// Tools which use the demangler library (like lldb) must include this - and
+// only this - header file.
 //
 //===----------------------------------------------------------------------===//
 
@@ -44,6 +50,7 @@ struct DemangleOptions {
   bool ShortenThunk = false;
   bool ShortenValueWitness = false;
   bool ShortenArchetype = false;
+  bool ShowPrivateDiscriminators = true;
 
   DemangleOptions() {}
 
@@ -62,12 +69,13 @@ struct DemangleOptions {
     Opt.ShortenThunk = true;
     Opt.ShortenValueWitness = true;
     Opt.ShortenArchetype = true;
+    Opt.ShowPrivateDiscriminators = false;
     return Opt;
   };
 };
 
 class Node;
-typedef std::shared_ptr<Node> NodePointer;
+typedef Node *NodePointer;
 
 enum class FunctionSigSpecializationParamKind : unsigned {
   // Option Flags use bits 0-5. This give us 6 bits implying 64 entries to
@@ -106,34 +114,19 @@ static inline char encodeSpecializationPass(SpecializationPass Pass) {
 }
 
 enum class ValueWitnessKind {
-  AllocateBuffer,
-  AssignWithCopy,
-  AssignWithTake,
-  DeallocateBuffer,
-  Destroy,
-  DestroyBuffer,
-  InitializeBufferWithCopyOfBuffer,
-  InitializeBufferWithCopy,
-  InitializeWithCopy,
-  InitializeBufferWithTake,
-  InitializeWithTake,
-  ProjectBuffer,
-  InitializeBufferWithTakeOfBuffer,
-  DestroyArray,
-  InitializeArrayWithCopy,
-  InitializeArrayWithTakeFrontToBack,
-  InitializeArrayWithTakeBackToFront,
-  StoreExtraInhabitant,
-  GetExtraInhabitantIndex,
-  GetEnumTag,
-  DestructiveProjectEnumData
+#define VALUE_WITNESS(MANGLING, NAME) \
+  NAME,
+#include "swift/Basic/ValueWitnessMangling.def"
 };
 
 enum class Directness {
   Direct, Indirect
 };
 
-class Node : public std::enable_shared_from_this<Node> {
+class NodeFactory;
+class Context;
+
+class Node {
 public:
   enum class Kind : uint16_t {
 #define NODE(ID) ID,
@@ -142,6 +135,8 @@ public:
 
   typedef uint64_t IndexType;
 
+  friend class NodeFactory;
+  
 private:
   Kind NodeKind;
 
@@ -151,20 +146,20 @@ private:
   PayloadKind NodePayloadKind;
 
   union {
-    std::string TextPayload;
+    llvm::StringRef TextPayload;
     IndexType IndexPayload;
   };
 
-  // FIXME: use allocator.
-  typedef std::vector<NodePointer> NodeVector;
-  NodeVector Children;
+  NodePointer *Children = nullptr;
+  size_t NumChildren = 0;
+  size_t ReservedChildren = 0;
 
   Node(Kind k)
       : NodeKind(k), NodePayloadKind(PayloadKind::None) {
   }
-  Node(Kind k, std::string &&t)
+  Node(Kind k, llvm::StringRef t)
       : NodeKind(k), NodePayloadKind(PayloadKind::Text) {
-    new (&TextPayload) std::string(std::move(t));
+    TextPayload = t;
   }
   Node(Kind k, IndexType index)
       : NodeKind(k), NodePayloadKind(PayloadKind::Index) {
@@ -173,15 +168,11 @@ private:
   Node(const Node &) = delete;
   Node &operator=(const Node &) = delete;
 
-  friend struct NodeFactory;
-
 public:
-  ~Node();
-
   Kind getKind() const { return NodeKind; }
 
   bool hasText() const { return NodePayloadKind == PayloadKind::Text; }
-  const std::string &getText() const {
+  llvm::StringRef getText() const {
     assert(hasText());
     return TextPayload;
   }
@@ -192,134 +183,233 @@ public:
     return IndexPayload;
   }
   
-  typedef NodeVector::iterator iterator;
-  typedef NodeVector::const_iterator const_iterator;
-  typedef NodeVector::size_type size_type;
+  typedef NodePointer *iterator;
+  typedef const NodePointer *const_iterator;
+  typedef size_t size_type;
 
-  bool hasChildren() const { return !Children.empty(); }
-  size_t getNumChildren() const { return Children.size(); }
-  iterator begin() { return Children.begin(); }
-  iterator end() { return Children.end(); }
-  const_iterator begin() const { return Children.begin(); }
-  const_iterator end() const { return Children.end(); }
+  bool hasChildren() const { return NumChildren != 0; }
+  size_t getNumChildren() const { return NumChildren; }
+  iterator begin() { return Children; }
+  iterator end() { return Children + NumChildren; }
+  const_iterator begin() const { return Children; }
+  const_iterator end() const { return Children + NumChildren; }
 
-  NodePointer getFirstChild() const { return Children.front(); }
-  NodePointer getChild(size_t index) const { return Children[index]; }
-
-  /// Add a new node as a child of this one.
-  ///
-  /// \param child - should have no parent or siblings
-  /// \returns child
-  NodePointer addChild(NodePointer child) {
-    assert(child && "adding null child!");
-    Children.push_back(child);
-    return child;
+  NodePointer getFirstChild() const {
+    assert(NumChildren >= 1);
+    return Children[0];
+  }
+  NodePointer getChild(size_t index) const {
+    assert(NumChildren > index);
+    return Children[index];
   }
 
-  /// A convenience method for adding two children at once.
-  void addChildren(NodePointer child1, NodePointer child2) {
-    addChild(std::move(child1));
-    addChild(std::move(child2));
-  }
+  void addChild(NodePointer Child, Context &Ctx);
+
+  // Only to be used by the demangler parsers.
+  void addChild(NodePointer Child, NodeFactory &Factory);
+
+  // Reverses the order of children.
+  void reverseChildren(size_t StartingAt = 0);
 };
 
-/// \brief Demangle the given string as a Swift symbol.
+/// Returns true if the mangledName starts with the swift mangling prefix.
 ///
-/// Typical usage:
-/// \code
-///   NodePointer aDemangledName =
-/// swift::Demangler::demangleSymbolAsNode("SomeSwiftMangledName")
-/// \endcode
-///
-/// \param mangledName The mangled string.
-/// \param options An object encapsulating options to use to perform this demangling.
-///
-///
-/// \returns A parse tree for the demangled string - or a null pointer
-/// on failure.
-///
-NodePointer
-demangleSymbolAsNode(const char *mangledName, size_t mangledNameLength,
-                     const DemangleOptions &options = DemangleOptions());
+/// \param mangledName A null-terminated string containing a mangled name.
+bool isSwiftSymbol(const char *mangledName);
 
-inline NodePointer
-demangleSymbolAsNode(const std::string &mangledName,
-                     const DemangleOptions &options = DemangleOptions()) {
-  return demangleSymbolAsNode(mangledName.data(), mangledName.size(), options);
-}
+class Demangler;
 
-/// \brief Demangle the given string as a Swift symbol.
+/// The demangler context.
 ///
-/// Typical usage:
+/// It owns the allocated nodes which are created during demangling.
+/// It is always preferable to use the demangling via this context class as it
+/// ensures efficient memory management. Especially if demangling is done for
+/// multiple symbols. Typical usage:
 /// \code
-///   std::string aDemangledName =
-/// swift::Demangler::demangleSymbol("SomeSwiftMangledName")
+///   Context Ctx;
+///   for (...) {
+///      NodePointer Root = Ctx.demangleSymbolAsNode(MangledName);
+///      // Do something with Root
+///      Ctx.clear(); // deallocates Root
+///   }
 /// \endcode
+/// Declaring the context out of the loop minimizes the amount of needed memory
+/// allocations.
 ///
-/// \param mangledName The mangled string.
-/// \param options An object encapsulating options to use to perform this demangling.
+class Context {
+  Demangler *D;
+
+  friend class Node;
+
+public:
+  Context();
+
+  ~Context();
+
+  /// Demangle the given symbol and return the parse tree.
+  ///
+  /// \param MangledName The mangled symbol string, which start with the
+  /// mangling prefix _T.
+  ///
+  /// \returns A parse tree for the demangled string - or a null pointer
+  /// on failure.
+  /// The lifetime of the returned node tree ends with the lifetime of the
+  /// context or with a call of clear().
+  NodePointer demangleSymbolAsNode(llvm::StringRef MangledName);
+
+  /// Demangle the given type and return the parse tree.
+  ///
+  /// \param MangledName The mangled type string, which does _not_ start with
+  /// the mangling prefix _T.
+  ///
+  /// \returns A parse tree for the demangled string - or a null pointer
+  /// on failure.
+  /// The lifetime of the returned node tree ends with the lifetime of the
+  /// context or with a call of clear().
+  NodePointer demangleTypeAsNode(llvm::StringRef MangledName);
+  
+  /// Demangle the given symbol and return the readable name.
+  ///
+  /// \param MangledName The mangled symbol string, which start with the
+  /// mangling prefix _T.
+  ///
+  /// \returns The demangled string.
+  std::string demangleSymbolAsString(llvm::StringRef MangledName,
+                            const DemangleOptions &Options = DemangleOptions());
+
+  /// Demangle the given type and return the readable name.
+  ///
+  /// \param MangledName The mangled type string, which does _not_ start with
+  /// the mangling prefix _T.
+  ///
+  /// \returns The demangled string.
+  std::string demangleTypeAsString(llvm::StringRef MangledName,
+                            const DemangleOptions &Options = DemangleOptions());
+
+  /// Returns true if the mangledName refers to a thunk function.
+  ///
+  /// Thunk functions are either (ObjC) partial apply forwarder, swift-as-ObjC
+  /// or ObjC-as-swift thunks.
+  bool isThunkSymbol(llvm::StringRef MangledName);
+
+  /// Returns the mangled name of the target of a thunk.
+  ///
+  /// \returns Returns the remaining name after removing the thunk mangling
+  /// characters from \p MangledName. If \p MangledName is not a thunk symbol,
+  /// an empty string is returned.
+  std::string getThunkTarget(llvm::StringRef MangledName);
+
+  /// Returns true if the \p mangledName refers to a function which conforms to
+  /// the Swift calling convention.
+  ///
+  /// The return value is unspecified if the \p MangledName does not refer to a
+  /// function symbol.
+  bool hasSwiftCallingConvention(llvm::StringRef MangledName);
+
+  /// Deallocates all nodes.
+  ///
+  /// The memory which is used for nodes is not freed but recycled for the next
+  /// demangling operation.
+  void clear();
+  
+  /// Creates a node of kind \p K.
+  ///
+  /// The lifetime of the returned node ends with the lifetime of the
+  /// context or with a call of clear().
+  NodePointer createNode(Node::Kind K);
+
+  /// Creates a node of kind \p K with an \p Index payload.
+  ///
+  /// The lifetime of the returned node ends with the lifetime of the
+  /// context or with a call of clear().
+  NodePointer createNode(Node::Kind K, Node::IndexType Index);
+
+  /// Creates a node of kind \p K with a \p Text payload.
+  ///
+  /// The lifetime of the returned node ends with the lifetime of the
+  /// context or with a call of clear().
+  NodePointer createNode(Node::Kind K, llvm::StringRef Text);
+};
+
+/// Standalong utility function to demangle the given symbol as string.
 ///
-///
-/// \returns A string representing the demangled name.
-///
+/// If performance is an issue when demangling multiple symbols,
+/// Context::demangleSymbolAsString should be used instead.
+/// \param mangledName The mangled name string pointer.
+/// \param mangledNameLength The length of the mangledName string.
+/// \returns The demangled string.
 std::string
 demangleSymbolAsString(const char *mangledName, size_t mangledNameLength,
                        const DemangleOptions &options = DemangleOptions());
 
+/// Standalong utility function to demangle the given symbol as string.
+///
+/// If performance is an issue when demangling multiple symbols,
+/// Context::demangleSymbolAsString should be used instead.
+/// \param mangledName The mangled name string.
+/// \returns The demangled string.
 inline std::string
 demangleSymbolAsString(const std::string &mangledName,
                        const DemangleOptions &options = DemangleOptions()) {
   return demangleSymbolAsString(mangledName.data(), mangledName.size(),
                                 options);
 }
-
-/// \brief Demangle the given string as a Swift type.
+  
+/// Standalong utility function to demangle the given symbol as string.
 ///
-/// Typical usage:
-/// \code
-///   NodePointer aDemangledName =
-/// swift::Demangler::demangleTypeAsNode("SomeSwiftMangledName")
-/// \endcode
-///
-/// \param mangledName The mangled string.
-/// \param options An object encapsulating options to use to perform this demangling.
-///
-///
-/// \returns A parse tree for the demangled string - or a null pointer
-/// on failure.
-///
-NodePointer
-demangleTypeAsNode(const char *mangledName, size_t mangledNameLength,
-                   const DemangleOptions &options = DemangleOptions());
-
-inline NodePointer
-demangleTypeAsNode(const std::string &mangledName,
-                   const DemangleOptions &options = DemangleOptions()) {
-  return demangleTypeAsNode(mangledName.data(), mangledName.size(), options);
+/// If performance is an issue when demangling multiple symbols,
+/// Context::demangleSymbolAsString should be used instead.
+/// \param MangledName The mangled name string.
+/// \returns The demangled string.
+inline std::string
+demangleSymbolAsString(llvm::StringRef MangledName,
+                       const DemangleOptions &Options = DemangleOptions()) {
+  return demangleSymbolAsString(MangledName.data(),
+                                MangledName.size(), Options);
 }
 
-/// \brief Demangle the given string as a Swift type mangling.
+/// Standalong utility function to demangle the given type as string.
 ///
-/// \param mangledName The mangled string.
-/// \param options An object encapsulating options to use to perform this demangling.
-///
-///
-/// \returns A string representing the demangled name.
+/// If performance is an issue when demangling multiple symbols,
+/// Context::demangleTypeAsString should be used instead.
+/// \param mangledName The mangled name string pointer.
+/// \param mangledNameLength The length of the mangledName string.
+/// \returns The demangled string.
 std::string
 demangleTypeAsString(const char *mangledName, size_t mangledNameLength,
                      const DemangleOptions &options = DemangleOptions());
 
+/// Standalong utility function to demangle the given type as string.
+///
+/// If performance is an issue when demangling multiple symbols,
+/// Context::demangleTypeAsString should be used instead.
+/// \param mangledName The mangled name string.
+/// \returns The demangled string.
 inline std::string
 demangleTypeAsString(const std::string &mangledName,
                      const DemangleOptions &options = DemangleOptions()) {
   return demangleTypeAsString(mangledName.data(), mangledName.size(), options);
 }
 
+/// Standalong utility function to demangle the given type as string.
+///
+/// If performance is an issue when demangling multiple symbols,
+/// Context::demangleTypeAsString should be used instead.
+/// \param MangledName The mangled name string.
+/// \returns The demangled string.
+inline std::string
+demangleTypeAsString(llvm::StringRef MangledName,
+                     const DemangleOptions &Options = DemangleOptions()) {
+  return demangleTypeAsString(MangledName.data(),
+                              MangledName.size(), Options);
+}
+  
+
 enum class OperatorKind {
   NotOperator,
   Prefix,
   Postfix,
-  Infix
+  Infix,
 };
 
 /// \brief Mangle an identifier using Swift's mangling rules.
@@ -330,9 +420,17 @@ void mangleIdentifier(const char *data, size_t length,
 /// \brief Remangle a demangled parse tree.
 ///
 /// This should always round-trip perfectly with demangleSymbolAsNode.
+std::string mangleNodeOld(const NodePointer &root);
+
 std::string mangleNode(const NodePointer &root);
 
-/// \brief Transform the node structure in a string.
+inline std::string mangleNode(const NodePointer &root, bool NewMangling) {
+  if (NewMangling)
+    return mangleNode(root);
+  return mangleNodeOld(root);
+}
+
+/// \brief Transform the node structure to a string.
 ///
 /// Typical usage:
 /// \code
@@ -348,30 +446,10 @@ std::string mangleNode(const NodePointer &root);
 std::string nodeToString(NodePointer Root,
                          const DemangleOptions &Options = DemangleOptions());
 
-struct NodeFactory {
-  static NodePointer create(Node::Kind K) {
-    return NodePointer(new Node(K));
-  }
-  static NodePointer create(Node::Kind K, Node::IndexType Index) {
-    return NodePointer(new Node(K, Index));
-  }
-  static NodePointer create(Node::Kind K, llvm::StringRef Text) {
-    return NodePointer(new Node(K, Text));
-  }
-  static NodePointer create(Node::Kind K, std::string &&Text) {
-    return NodePointer(new Node(K, std::move(Text)));
-  }
-  template <size_t N>
-  static NodePointer create(Node::Kind K, const char (&Text)[N]) {
-    return NodePointer(new Node(K, llvm::StringRef(Text)));
-  }
-};
-
-  /// A class for printing to a std::string.
+/// A class for printing to a std::string.
 class DemanglerPrinter {
 public:
-  DemanglerPrinter(std::string &out) : Stream(out) {}
-  DemanglerPrinter(std::string &&out) : Stream(out) {}
+  DemanglerPrinter() = default;
 
   DemanglerPrinter &operator<<(llvm::StringRef Value) & {
     Stream.append(Value.data(), Value.size());
@@ -403,10 +481,19 @@ public:
   }
   
   std::string &&str() && { return std::move(Stream); }
-  
+
+  llvm::StringRef getStringRef() const { return Stream; }
+
+  /// Returns a mutable reference to the last character added to the printer.
+  char &lastChar() { return Stream.back(); }
+
 private:
-  std::string &Stream;
+  std::string Stream;
 };
+
+bool mangleStandardSubstitution(Node *node, DemanglerPrinter &Out);
+bool isSpecialized(Node *node);
+NodePointer getUnspecialized(Node *node, NodeFactory &Factory);
 
 /// Is a character considered a digit by the demangling grammar?
 ///
@@ -415,9 +502,16 @@ private:
 static inline bool isDigit(int c) {
   return c >= '0' && c <= '9';
 }
-  
+
 } // end namespace Demangle
+
+
+/// Returns true if the new mangling scheme should be used.
+///
+/// TODO: remove this function when the old mangling is removed.
+bool useNewMangling(Demangle::NodePointer Node);
+
+
 } // end namespace swift
 
-#endif
-
+#endif // SWIFT_BASIC_DEMANGLE_H

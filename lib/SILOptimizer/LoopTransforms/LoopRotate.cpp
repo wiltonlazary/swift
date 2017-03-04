@@ -1,12 +1,12 @@
-//===--- LoopRotate.cpp - Loop structure simplify ---------------*- C++ -*-===//
+//===--- LoopRotate.cpp - Loop structure simplify -------------------------===//
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2016 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 
@@ -40,7 +40,7 @@ static bool hasLoopInvariantOperands(SILInstruction *I, SILLoop *L,
 
   return std::all_of(Opds.begin(), Opds.end(), [=](Operand &Op) {
 
-    auto *Def = Op.get().getDef();
+    ValueBase *Def = Op.get();
     // Operand is outside the loop or marked invariant.
     if (auto *Inst = dyn_cast<SILInstruction>(Def))
       return !L->contains(Inst->getParent()) || Inv.count(Inst);
@@ -92,51 +92,36 @@ static void mapOperands(SILInstruction *I,
                         const llvm::DenseMap<ValueBase *, SILValue> &ValueMap) {
   for (auto &Opd : I->getAllOperands()) {
     SILValue OrigVal = Opd.get();
-    ValueBase *OrigDef = OrigVal.getDef();
+    ValueBase *OrigDef = OrigVal;
     auto Found = ValueMap.find(OrigDef);
     if (Found != ValueMap.end()) {
       SILValue MappedVal = Found->second;
-      unsigned ResultIdx = OrigVal.getResultNumber();
-      // All mapped instructions have their result number set to zero. Except
-      // for arguments that we followed along one edge to their incoming value
-      // on that edge.
-      if (isa<SILArgument>(OrigDef))
-        ResultIdx = MappedVal.getResultNumber();
-      Opd.set(SILValue(MappedVal.getDef(), ResultIdx));
+      Opd.set(MappedVal);
     }
   }
 }
 
-static void
-updateSSAForUseOfInst(SILSSAUpdater &Updater,
-                      SmallVectorImpl<SILArgument*> &InsertedPHIs,
-                      const llvm::DenseMap<ValueBase *, SILValue> &ValueMap,
-                      SILBasicBlock *Header, SILBasicBlock *EntryCheckBlock,
-                      ValueBase *Inst) {
+static void updateSSAForUseOfInst(
+    SILSSAUpdater &Updater, SmallVectorImpl<SILPHIArgument *> &InsertedPHIs,
+    const llvm::DenseMap<ValueBase *, SILValue> &ValueMap,
+    SILBasicBlock *Header, SILBasicBlock *EntryCheckBlock, ValueBase *Inst) {
   if (Inst->use_empty())
     return;
 
   // Find the mapped instruction.
   assert(ValueMap.count(Inst) && "Expected to find value in map!");
   SILValue MappedValue = ValueMap.find(Inst)->second;
-  auto *MappedInst = MappedValue.getDef();
   assert(MappedValue);
-  assert(MappedInst);
 
   // For each use of a specific result value of the instruction.
-  for (unsigned i = 0, e = Inst->getNumTypes(); i != e; ++i) {
-    SILValue Res(Inst, i);
-    // For block arguments, MappedValue is already indexed to indicate the
-    // single result value that feeds the argument. In this case, i==0 because
-    // SILArgument only produces one value.
-    SILValue MappedRes =
-        isa<SILArgument>(Inst) ? MappedValue : SILValue(MappedInst, i);
-    assert(Res.getType() == MappedRes.getType() && "The types must match");
+  if (Inst->hasValue()) {
+    SILValue Res(Inst);
+    assert(Res->getType() == MappedValue->getType() && "The types must match");
 
     InsertedPHIs.clear();
-    Updater.Initialize(Res.getType());
+    Updater.Initialize(Res->getType());
     Updater.AddAvailableValue(Header, Res);
-    Updater.AddAvailableValue(EntryCheckBlock, MappedRes);
+    Updater.AddAvailableValue(EntryCheckBlock, MappedValue);
 
 
     // Because of the way that phi nodes are represented we have to collect all
@@ -146,7 +131,7 @@ updateSSAForUseOfInst(SILSSAUpdater &Updater,
     // Instead we collect uses wrapping uses in branches specially so that we
     // can reconstruct the use even after the branch has been modified.
     SmallVector<UseWrapper, 8> StoredUses;
-    for (auto *U : Res.getUses())
+    for (auto *U : Res->getUses())
       StoredUses.push_back(UseWrapper(U));
     for (auto U : StoredUses) {
       Operand *Use = U;
@@ -162,7 +147,7 @@ updateSSAForUseOfInst(SILSSAUpdater &Updater,
       Updater.RewriteUse(*Use);
     }
     // Canonicalize inserted phis to avoid extra BB Args.
-    for (SILArgument *Arg : InsertedPHIs) {
+    for (SILPHIArgument *Arg : InsertedPHIs) {
       if (SILInstruction *Inst = replaceBBArgWithCast(Arg)) {
         Arg->replaceAllUsesWith(Inst);
         // DCE+SimplifyCFG runs as a post-pass cleanup.
@@ -178,11 +163,11 @@ static void
 rewriteNewLoopEntryCheckBlock(SILBasicBlock *Header,
                               SILBasicBlock *EntryCheckBlock,
                         const llvm::DenseMap<ValueBase *, SILValue> &ValueMap) {
-  SmallVector<SILArgument*, 4> InsertedPHIs;
+  SmallVector<SILPHIArgument *, 4> InsertedPHIs;
   SILSSAUpdater Updater(&InsertedPHIs);
 
   // Fix PHIs (incoming arguments).
-  for (auto *Inst: Header->getBBArgs())
+  for (auto *Inst : Header->getArguments())
     updateSSAForUseOfInst(Updater, InsertedPHIs, ValueMap, Header,
                           EntryCheckBlock, Inst);
 
@@ -246,10 +231,11 @@ static bool isSingleBlockLoop(SILLoop *L) {
   if (BackEdge == Header)
     BackEdge = Blocks[0];
 
-  if (!BackEdge->getSingleSuccessor())
+  if (!BackEdge->getSingleSuccessorBlock())
     return false;
 
-  assert(BackEdge->getSingleSuccessor() == Header && "Loop not well formed");
+  assert(BackEdge->getSingleSuccessorBlock() == Header &&
+         "Loop not well formed");
 
   // Check whether the back-edge block is just a split-edge.
   return ++BackEdge->begin() == BackEdge->end();
@@ -328,7 +314,7 @@ bool swift::rotateLoop(SILLoop *L, DominanceInfo *DT, SILLoopInfo *LI,
   // We don't want to rotate such that we merge two headers of separate loops
   // into one. This can be turned into an assert again once we have guaranteed
   // preheader insertions.
-  if (!NewHeader->getSinglePredecessor() && Header != Latch)
+  if (!NewHeader->getSinglePredecessorBlock() && Header != Latch)
     return false;
 
   // Now that we know we can perform the rotation - move the instructions that
@@ -344,7 +330,7 @@ bool swift::rotateLoop(SILLoop *L, DominanceInfo *DT, SILLoopInfo *LI,
 
   // The original 'phi' argument values are just the values coming from the
   // preheader edge.
-  ArrayRef<SILArgument *> PHIs = Header->getBBArgs();
+  ArrayRef<SILArgument *> PHIs = Header->getArguments();
   OperandValueArrayRef PreheaderArgs =
       cast<BranchInst>(Preheader->getTerminator())->getArgs();
   assert(PHIs.size() == PreheaderArgs.size() &&
@@ -363,7 +349,7 @@ bool swift::rotateLoop(SILLoop *L, DominanceInfo *DT, SILLoopInfo *LI,
       mapOperands(I, ValueMap);
 
       // The actual operand will sort out which result idx to use.
-      ValueMap[&Inst] = SILValue(I, 0);
+      ValueMap[&Inst] = I;
     }
   }
 

@@ -16,7 +16,7 @@ func testUnreachableAfterIfReturn(a: Bool) -> Int {
 }
 
 func testUnreachableForAfterContinue(b: Bool) {
-  for (var i:Int = 0; i<10; i+=1) { // expected-warning {{C-style for statement is deprecated and will be removed in a future version of Swift}}
+  for _ in 0..<10 {
     var y: Int = 300
     y += 1
     if b {
@@ -43,9 +43,8 @@ func testUnreachableWhileAfterContinue(b: Bool) {
 }
 
 func testBreakAndContinue() {
-  var i = 0
   var m = 0
-  for (i = 0; i < 10; i += 1) { // expected-warning {{C-style for statement is deprecated and will be removed in a future version of Swift}}
+  for _ in 0 ..< 10 {
     m += 1
     if m == 15 {
       break
@@ -111,13 +110,13 @@ func testUnreachableCase5(a : Tree) {
 }
 
 
-func testUnreachableAfterThrow(e : ErrorType) throws {
+func testUnreachableAfterThrow(e: Error) throws {
   throw e
   return   // expected-warning {{code after 'throw' will never be executed}}
 }
 
 class TestThrowInInit {
-  required init(e : ErrorType) throws {
+  required init(e: Error) throws {
     throw e  // no unreachable code diagnostic for the implicit return.
   }
 }

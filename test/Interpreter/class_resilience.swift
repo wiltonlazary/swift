@@ -1,4 +1,4 @@
-// RUN: rm -rf %t && mkdir %t
+// RUN: rm -rf %t && mkdir -p %t
 
 // RUN: %target-build-swift -emit-library -Xfrontend -enable-resilience -c %S/../Inputs/resilient_struct.swift -o %t/resilient_struct.o
 // RUN: %target-build-swift -emit-module -Xfrontend -enable-resilience -c %S/../Inputs/resilient_struct.swift -o %t/resilient_struct.o
@@ -10,7 +10,11 @@
 
 // RUN: %target-run %t/main
 
+// REQUIRES: executable_test
+
 import StdlibUnittest
+
+
 import resilient_class
 import resilient_struct
 
@@ -18,7 +22,11 @@ var ResilientClassTestSuite = TestSuite("ResilientClass")
 
 // Concrete class with resilient stored property
 
-public class ClassWithResilientProperty {
+protocol ProtocolWithResilientProperty {
+  var s: Size { get }
+}
+
+public class ClassWithResilientProperty : ProtocolWithResilientProperty {
   public let p: Point
   public let s: Size
   public let color: Int32
@@ -28,6 +36,10 @@ public class ClassWithResilientProperty {
     self.s = s
     self.color = color
   }
+}
+
+@inline(never) func getS(_ p: ProtocolWithResilientProperty) -> Size {
+  return p.s
 }
 
 ResilientClassTestSuite.test("ClassWithResilientProperty") {
@@ -41,6 +53,10 @@ ResilientClassTestSuite.test("ClassWithResilientProperty") {
   expectEqual(c.s.w, 30)
   expectEqual(c.s.h, 40)
   expectEqual(c.color, 50)
+
+  // Make sure the conformance works
+  expectEqual(getS(c).w, 30)
+  expectEqual(getS(c).h, 40)
 }
 
 
@@ -219,6 +235,18 @@ ResilientClassTestSuite.test("ChildOfResilientOutsideParentWithResilientStoredPr
   expectEqual(c.color, 50)
 }
 #endif
+
+
+ResilientClassTestSuite.test("TypeByName") {
+  expectTrue(_typeByName("main.ClassWithResilientProperty")
+             == ClassWithResilientProperty.self)
+  expectTrue(_typeByName("main.ClassWithResilientlySizedProperty")
+             == ClassWithResilientlySizedProperty.self)
+  expectTrue(_typeByName("main.ChildOfParentWithResilientStoredProperty")
+             == ChildOfParentWithResilientStoredProperty.self)
+  expectTrue(_typeByName("main.ChildOfOutsideParentWithResilientStoredProperty")
+             == ChildOfOutsideParentWithResilientStoredProperty.self)
+}
 
 
 runAllTests()

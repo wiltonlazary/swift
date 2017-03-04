@@ -2,11 +2,11 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2016 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 
@@ -33,6 +33,7 @@ enum class ArrayCallKind {
   kGetElementAddress,
   kMakeMutable,
   kMutateUnknown,
+  kWithUnsafeMutableBufferPointer,
   // The following two semantic function kinds return the result @owned
   // instead of operating on self passed as parameter.
   kArrayInit,
@@ -77,6 +78,18 @@ public:
 
   /// Get the self argument operand.
   Operand &getSelfOperand() const;
+
+  /// Returns true if this array.get_element call returns the element
+  /// as a direct result (and not as an indirect result).
+  bool hasGetElementDirectResult() const;
+
+  /// Returns the wasNativeTypeChecked argument of this
+  /// array.get_element call.
+  SILValue getTypeCheckedArgument() const;
+
+  /// Returns the matchingSubscriptCheck argument of this
+  /// array.get_element call.
+  SILValue getSubscriptCheckArgument() const;
 
   /// Get the index for operations that have one.
   SILValue getIndex() const;
@@ -134,6 +147,9 @@ public:
   /// Is this a semantics call.
   operator bool() const { return SemanticsCall != nullptr; }
 
+  /// Is this a call which is not used to mutate the array.
+  bool doesNotChangeArray() const;
+
   /// Could this array be backed by an NSArray.
   bool mayHaveBridgedObjectElementType() const;
 
@@ -147,5 +163,5 @@ protected:
                          bool LeaveOriginal);
 };
 
-} // End namespace swift.
+} // end namespace swift
 #endif

@@ -1,7 +1,7 @@
 // Please keep this file in alphabetical order!
 
 // RUN: rm -rf %t
-// RUN: mkdir %t
+// RUN: mkdir -p %t
 
 // FIXME: BEGIN -enable-source-import hackaround
 // RUN:  %target-swift-frontend(mock-sdk: -sdk %S/../Inputs/clang-importer-sdk -I %t) -emit-module -o %t  %S/../Inputs/clang-importer-sdk/swift-modules/ObjectiveC.swift
@@ -10,9 +10,9 @@
 // FIXME: END -enable-source-import hackaround
 
 // RUN: %target-swift-frontend(mock-sdk: %clang-importer-sdk-nosource) -I %t -emit-module -o %t %s -disable-objc-attr-requires-foundation-module
-// RUN: %target-swift-frontend(mock-sdk: %clang-importer-sdk-nosource) -I %t -parse-as-library %t/protocols.swiftmodule -parse -emit-objc-header-path %t/protocols.h -import-objc-header %S/../Inputs/empty.h -disable-objc-attr-requires-foundation-module
-// RUN: FileCheck %s < %t/protocols.h
-// RUN: FileCheck --check-prefix=NEGATIVE %s < %t/protocols.h
+// RUN: %target-swift-frontend(mock-sdk: %clang-importer-sdk-nosource) -I %t -parse-as-library %t/protocols.swiftmodule -typecheck -emit-objc-header-path %t/protocols.h -import-objc-header %S/../Inputs/empty.h -disable-objc-attr-requires-foundation-module
+// RUN: %FileCheck %s < %t/protocols.h
+// RUN: %FileCheck --check-prefix=NEGATIVE %s < %t/protocols.h
 // RUN: %check-in-clang %t/protocols.h
 
 // REQUIRES: objc_interop
@@ -28,12 +28,12 @@ import Foundation
 @objc protocol B : A {}
 
 // CHECK: @protocol CustomName2;
-// CHECK-LABEL: SWIFT_PROTOCOL_NAMED("CustomNameType")
+// CHECK-LABEL: SWIFT_PROTOCOL_NAMED("CustomName")
 // CHECK-NEXT: @protocol CustomName{{$}}
 // CHECK-NEXT: - (void)forwardCustomName:(id <CustomName2> _Nonnull)_;
 // CHECK-NEXT: @end
 @objc(CustomName)
-protocol CustomNameType {
+protocol CustomName {
   func forwardCustomName(_: CustomNameType2)
 }
 
@@ -65,17 +65,18 @@ protocol CustomNameType2 {}
   func test()
   static func test2()
 
-  func testRawAnyTypes(any: AnyObject, other: AnyObject.Type)
+  func testRawAnyTypes(_ any: AnyObject, other: AnyObject.Type)
 
-  func testSingleProtocolTypes(a : A, aAgain a2: protocol<A>, b: B, bAgain b2: protocol<B>, both: protocol<A, B>)
-  func testSingleProtocolClassTypes(a : A.Type, aAgain a2: protocol<A>.Type, b: B.Type, bAgain b2: protocol<B>.Type, both: protocol<A, B>.Type)
-  func testComposition(x: protocol<A, ZZZ>, meta xClass: protocol<A, ZZZ>.Type)
+  func testSingleProtocolTypes(_ a : A, aAgain a2: A, b: B, bAgain b2: B, both: A & B)
+  func testSingleProtocolClassTypes(_ a : A.Type, aAgain a2: A.Type, b: B.Type, bAgain b2: B.Type, both: (A & B).Type)
+  func testComposition(_ x: A & ZZZ, meta xClass: (A & ZZZ).Type)
 
-  func testOptional(opt: A?, meta m: A.Type?)
+  func testOptional(_ opt: A?, meta m: A.Type?)
 }
 
 // CHECK-LABEL: @interface MyObject : NSObject <NSCoding>
-// CHECK-NEXT: init
+// CHECK-NEXT: initWithCoder
+// CHECK-NEXT: init SWIFT_UNAVAILABLE
 // CHECK-NEXT: @end
 // NEGATIVE-NOT: @protocol NSCoding
 class MyObject : NSObject, NSCoding {
@@ -110,12 +111,12 @@ extension NSString : A, ZZZ {}
   func a()
   func b()
 
-  optional func c()
-  optional func d()
+  @objc optional func c()
+  @objc optional func d()
 
   func e()
 
-  optional func f()
+  @objc optional func f()
 }
 
 // NEGATIVE-NOT: @protocol PrivateProto
@@ -140,7 +141,7 @@ extension NSString : A, ZZZ {}
 @objc protocol Properties {
   var a: Int { get }
   var b: Properties? { get set }
-  optional var c: String { get }
+  @objc optional var c: String { get }
 }
 
 

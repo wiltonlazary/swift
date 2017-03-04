@@ -2,11 +2,11 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2016 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 
@@ -23,13 +23,13 @@ namespace namelookup {
 /// Performs a qualified lookup into the given module and, if necessary, its
 /// reexports, observing proper shadowing rules.
 void
-lookupVisibleDeclsInModule(Module *M, Module::AccessPathTy accessPath,
+lookupVisibleDeclsInModule(ModuleDecl *M, ModuleDecl::AccessPathTy accessPath,
                            SmallVectorImpl<ValueDecl *> &decls,
                            NLKind lookupKind,
                            ResolutionKind resolutionKind,
                            LazyResolver *typeResolver,
                            const DeclContext *moduleScopeContext,
-                           ArrayRef<Module::ImportedModule> extraImports = {});
+                           ArrayRef<ModuleDecl::ImportedModule> extraImports = {});
 
 /// Searches through statements and patterns for local variable declarations.
 class FindLocalVal : public StmtVisitor<FindLocalVal> {
@@ -60,12 +60,6 @@ public:
       return checkPattern(Pat->getSemanticsProvidingPattern(), Reason);
     case PatternKind::Named:
       return checkValueDecl(cast<NamedPattern>(Pat)->getDecl(), Reason);
-
-    case PatternKind::NominalType: {
-      for (auto &elt : cast<NominalTypePattern>(Pat)->getElements())
-        checkPattern(elt.getSubPattern(), Reason);
-      return;
-    }
     case PatternKind::EnumElement: {
       auto *OP = cast<EnumElementPattern>(Pat);
       if (OP->hasSubPattern())
@@ -188,7 +182,8 @@ private:
     if (!isReferencePointInRange(S->getSourceRange()))
       return;
     visit(S->getBody());
-    checkPattern(S->getPattern(), DeclVisibilityKind::LocalVariable);
+    if (!isReferencePointInRange(S->getSequence()->getSourceRange()))
+      checkPattern(S->getPattern(), DeclVisibilityKind::LocalVariable);
   }
 
   void visitBraceStmt(BraceStmt *S, bool isTopLevelCode = false) {
@@ -223,12 +218,23 @@ private:
   void visitCaseStmt(CaseStmt *S) {
     if (!isReferencePointInRange(S->getSourceRange()))
       return;
-    for (const auto &CLI : S->getCaseLabelItems()) {
-      auto *P = CLI.getPattern();
-      if (!isReferencePointInRange(P->getSourceRange()))
-        checkPattern(P, DeclVisibilityKind::LocalVariable);
+    // Pattern names aren't visible in the patterns themselves,
+    // just in the body or in where guards.
+    auto body = S->getBody();
+    bool inPatterns = isReferencePointInRange(S->getLabelItemsRange());
+    auto items = S->getCaseLabelItems();
+    if (inPatterns) {
+      for (const auto &CLI : items) {
+        auto guard = CLI.getGuardExpr();
+        if (guard && isReferencePointInRange(guard->getSourceRange())) {
+          inPatterns = false;
+          break;
+        }
+      }
     }
-    visit(S->getBody());
+    if (!inPatterns && items.size() > 0)
+      checkPattern(items[0].getPattern(), DeclVisibilityKind::LocalVariable);
+    visit(body);
   }
 
   void visitDoCatchStmt(DoCatchStmt *S) {

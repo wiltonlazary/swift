@@ -2,11 +2,11 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2016 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 //
@@ -25,8 +25,6 @@
 #endif
 
 CONTEXT_NODE(Allocator)
-NODE(Archetype)
-NODE(ArchetypeRef)
 NODE(ArgumentTuple)
 NODE(AssociatedType)
 NODE(AssociatedTypeRef)
@@ -44,13 +42,15 @@ CONTEXT_NODE(Deallocator)
 NODE(DeclContext)
 CONTEXT_NODE(DefaultArgumentInitializer)
 NODE(DependentAssociatedTypeRef)
-NODE(DependentGenericSignature)
-NODE(DependentGenericParamCount)
 NODE(DependentGenericConformanceRequirement)
+NODE(DependentGenericParamCount)
+NODE(DependentGenericParamType)
 NODE(DependentGenericSameTypeRequirement)
+NODE(DependentGenericLayoutRequirement)
+NODE(DependentGenericSignature)
 NODE(DependentGenericType)
 NODE(DependentMemberType)
-NODE(DependentGenericParamType)
+NODE(DependentPseudogenericSignature)
 CONTEXT_NODE(Destructor)
 CONTEXT_NODE(DidSet)
 NODE(Directness)
@@ -70,12 +70,13 @@ NODE(FunctionSignatureSpecializationParam)
 NODE(FunctionSignatureSpecializationParamKind)
 NODE(FunctionSignatureSpecializationParamPayload)
 NODE(FunctionType)
-NODE(Generics)
+NODE(GenericPartialSpecialization)
+NODE(GenericPartialSpecializationNotReAbstracted)
 NODE(GenericProtocolWitnessTable)
 NODE(GenericProtocolWitnessTableInstantiationFunction)
 NODE(GenericSpecialization)
+NODE(GenericSpecializationNotReAbstracted)
 NODE(GenericSpecializationParam)
-NODE(GenericType)
 NODE(GenericTypeMetadataPattern)
 CONTEXT_NODE(Getter)
 NODE(Global)
@@ -131,9 +132,13 @@ NODE(ReabstractionThunk)
 NODE(ReabstractionThunkHelper)
 NODE(ReturnType)
 NODE(SILBoxType)
-NODE(SelfTypeRef)
+NODE(SILBoxTypeWithLayout)
+NODE(SILBoxLayout)
+NODE(SILBoxMutableField)
+NODE(SILBoxImmutableField)
 CONTEXT_NODE(Setter)
 NODE(SpecializationPassID)
+NODE(SpecializationIsFragile)
 CONTEXT_NODE(Static)
 CONTEXT_NODE(Structure)
 CONTEXT_NODE(Subscript)
@@ -161,7 +166,17 @@ NODE(VTableAttribute)
 NODE(Weak)
 CONTEXT_NODE(WillSet)
 NODE(WitnessTableOffset)
+NODE(ReflectionMetadataBuiltinDescriptor)
+NODE(ReflectionMetadataFieldDescriptor)
+NODE(ReflectionMetadataAssocTypeDescriptor)
+NODE(ReflectionMetadataSuperclassDescriptor)
+NODE(GenericTypeParamDecl)
+CONTEXT_NODE(CurryThunk)
 NODE(ThrowsAnnotation)
-
+NODE(EmptyList)
+NODE(FirstElementMarker)
+NODE(VariadicMarker)
+NODE(OutlinedCopy)
+NODE(OutlinedConsume)
 #undef CONTEXT_NODE
 #undef NODE

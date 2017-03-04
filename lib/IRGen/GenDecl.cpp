@@ -2,11 +2,11 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2016 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 //
@@ -16,7 +16,6 @@
 //===----------------------------------------------------------------------===//
 
 #include "swift/AST/ASTContext.h"
-#include "swift/AST/Attr.h"
 #include "swift/AST/Decl.h"
 #include "swift/AST/DiagnosticEngine.h"
 #include "swift/AST/DiagnosticsIRGen.h"
@@ -24,24 +23,28 @@
 #include "swift/AST/Module.h"
 #include "swift/AST/NameLookup.h"
 #include "swift/AST/Pattern.h"
+#include "swift/AST/ProtocolConformance.h"
 #include "swift/AST/TypeMemberVisitor.h"
 #include "swift/AST/Types.h"
-#include "swift/Basic/Fallthrough.h"
 #include "swift/ClangImporter/ClangModule.h"
 #include "swift/SIL/FormalLinkage.h"
 #include "swift/SIL/SILDebugScope.h"
 #include "swift/SIL/SILModule.h"
+#include "clang/AST/ASTContext.h"
+#include "clang/AST/DeclCXX.h"
+#include "clang/AST/GlobalDecl.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/TypeBuilder.h"
 #include "llvm/IR/Value.h"
 #include "llvm/IR/GlobalAlias.h"
 #include "llvm/ADT/SmallString.h"
+#include "llvm/Support/Compiler.h"
 #include "llvm/Support/Path.h"
 #include "llvm/Support/ConvertUTF.h"
 
-#include "CallingConvention.h"
 #include "Explosion.h"
 #include "FixedTypeInfo.h"
+#include "GenCall.h"
 #include "GenClass.h"
 #include "GenObjC.h"
 #include "GenOpaque.h"
@@ -106,7 +109,8 @@ public:
     class_addProtocol = IGM.getClassAddProtocolFn();
 
     CanType origTy = ext->getDeclaredTypeOfContext()->getCanonicalType();
-    classMetadata = tryEmitConstantTypeMetadataRef(IGM, origTy);
+    classMetadata =
+      tryEmitConstantHeapMetadataRef(IGM, origTy, /*allowUninit*/ true);
     assert(classMetadata &&
            "extended objc class doesn't have constant metadata?!");
     classMetadata = llvm::ConstantExpr::getBitCast(classMetadata,
@@ -117,9 +121,9 @@ public:
     metaclassMetadata = llvm::ConstantExpr::getBitCast(metaclassMetadata,
                                                    IGM.ObjCClassPtrTy);
 
-    // We need to make sure the Objective C runtime has initialized our
+    // We need to make sure the Objective-C runtime has initialized our
     // class. If you try to add or replace a method to a class that isn't
-    // initialized yet, the Objective C runtime will crash in the calls
+    // initialized yet, the Objective-C runtime will crash in the calls
     // to class_replaceMethod or class_addProtocol.
     Builder.CreateCall(IGM.getGetInitializedObjCClassFn(), classMetadata);
 
@@ -426,7 +430,7 @@ class PrettySourceFileEmission : public llvm::PrettyStackTraceEntry {
 public:
   explicit PrettySourceFileEmission(const SourceFile &SF) : SF(SF) {}
 
-  virtual void print(raw_ostream &os) const override {
+  void print(raw_ostream &os) const override {
     os << "While emitting IR for source file " << SF.getFilename() << '\n';
   }
 };
@@ -442,8 +446,8 @@ void IRGenModule::emitSourceFile(SourceFile &SF, unsigned StartElem) {
   for (auto *localDecl : SF.LocalTypeDecls)
     emitGlobalDecl(localDecl);
 
-  SF.forAllVisibleModules([&](swift::Module::ImportedModule import) {
-    swift::Module *next = import.second;
+  SF.forAllVisibleModules([&](swift::ModuleDecl::ImportedModule import) {
+    swift::ModuleDecl *next = import.second;
     if (next->getName() == SF.getParentModule()->getName())
       return;
 
@@ -454,6 +458,30 @@ void IRGenModule::emitSourceFile(SourceFile &SF, unsigned StartElem) {
 
   if (ObjCInterop)
     this->addLinkLibrary(LinkLibrary("objc", LibraryKind::Library));
+}
+
+/// Collect elements of an already-existing global list with the given
+/// \c name into \c list.
+///
+/// We use this when Clang code generation might populate the list.
+static void collectGlobalList(IRGenModule &IGM,
+                              SmallVectorImpl<llvm::WeakVH> &list,
+                              StringRef name) {
+  if (auto *existing = IGM.Module.getGlobalVariable(name)) {
+    auto *globals = cast<llvm::ConstantArray>(existing->getInitializer());
+    for (auto &use : globals->operands()) {
+      auto *global = use.get();
+      list.push_back(global);
+    }
+    existing->eraseFromParent();
+  }
+
+  std::for_each(list.begin(), list.end(),
+                [](const llvm::WeakVH &global) {
+    assert(!isa<llvm::GlobalValue>(global) ||
+           !cast<llvm::GlobalValue>(global)->isDeclaration() &&
+           "all globals in the 'used' list must be definitions");
+  });
 }
 
 /// Emit a global list, i.e. a global constant array holding all of a
@@ -500,18 +528,21 @@ emitGlobalList(IRGenModule &IGM, ArrayRef<llvm::WeakVH> handles,
 void IRGenModule::emitRuntimeRegistration() {
   // Duck out early if we have nothing to register.
   if (ProtocolConformances.empty()
+      && RuntimeResolvableTypes.empty()
       && (!ObjCInterop || (ObjCProtocols.empty() &&
                            ObjCClasses.empty() &&
                            ObjCCategoryDecls.empty())))
     return;
   
   // Find the entry point.
-  SILFunction *EntryPoint = SILMod->lookUpFunction(SWIFT_ENTRY_POINT_FUNCTION);
+  SILFunction *EntryPoint =
+    getSILModule().lookUpFunction(SWIFT_ENTRY_POINT_FUNCTION);
   
-  // If we're debugging, we probably don't have a main. Find a
-  // function marked with the LLDBDebuggerFunction attribute instead.
+  // If we're debugging (and not in the REPL), we don't have a
+  // main. Find a function marked with the LLDBDebuggerFunction
+  // attribute instead.
   if (!EntryPoint && Context.LangOpts.DebuggerSupport) {
-    for (SILFunction &SF : *SILMod) {
+    for (SILFunction &SF : getSILModule()) {
       if (SF.hasLocation()) {
         if (Decl* D = SF.getLocation().getAsASTNode<Decl>()) {
           if (FuncDecl *FD = dyn_cast<FuncDecl>(D)) {
@@ -544,12 +575,17 @@ void IRGenModule::emitRuntimeRegistration() {
   {
     llvm::BasicBlock *EntryBB = &EntryFunction->getEntryBlock();
     llvm::BasicBlock::iterator IP = EntryBB->getFirstInsertionPt();
-    IRBuilder Builder(getLLVMContext());
+    IRBuilder Builder(getLLVMContext(),
+                      DebugInfo && !Context.LangOpts.DebuggerSupport);
     Builder.llvm::IRBuilderBase::SetInsertPoint(EntryBB, IP);
+    if (DebugInfo && !Context.LangOpts.DebuggerSupport)
+      DebugInfo->setEntryPointLoc(Builder);
     Builder.CreateCall(RegistrationFunction, {});
   }
   
   IRGenFunction RegIGF(*this, RegistrationFunction);
+  if (DebugInfo && !Context.LangOpts.DebuggerSupport)
+    DebugInfo->emitArtificialFunction(RegIGF, RegistrationFunction);
   
   // Register ObjC protocols, classes, and extensions we added.
   if (ObjCInterop) {
@@ -620,6 +656,26 @@ void IRGenModule::emitRuntimeRegistration() {
     
     RegIGF.Builder.CreateCall(getRegisterProtocolConformancesFn(), {begin, end});
   }
+
+  if (!RuntimeResolvableTypes.empty()) {
+    llvm::Constant *records = emitTypeMetadataRecords();
+
+    llvm::Constant *beginIndices[] = {
+      llvm::ConstantInt::get(Int32Ty, 0),
+      llvm::ConstantInt::get(Int32Ty, 0),
+    };
+    auto begin = llvm::ConstantExpr::getGetElementPtr(
+        /*Ty=*/nullptr, records, beginIndices);
+    llvm::Constant *endIndices[] = {
+      llvm::ConstantInt::get(Int32Ty, 0),
+      llvm::ConstantInt::get(Int32Ty, RuntimeResolvableTypes.size()),
+    };
+    auto end = llvm::ConstantExpr::getGetElementPtr(
+        /*Ty=*/nullptr, records, endIndices);
+
+    RegIGF.Builder.CreateCall(getRegisterTypeMetadataRecordsFn(), {begin, end});
+  }
+
   RegIGF.Builder.CreateRetVoid();
 }
 
@@ -628,6 +684,13 @@ void IRGenModule::emitRuntimeRegistration() {
 /// This value must have a definition by the time the module is finalized.
 void IRGenModule::addUsedGlobal(llvm::GlobalValue *global) {
   LLVMUsed.push_back(global);
+}
+
+/// Add the given global value to @llvm.compiler.used.
+///
+/// This value must have a definition by the time the module is finalized.
+void IRGenModule::addCompilerUsedGlobal(llvm::GlobalValue *global) {
+  LLVMCompilerUsed.push_back(global);
 }
 
 /// Add the given global value to the Objective-C class list.
@@ -642,6 +705,42 @@ void IRGenModule::addObjCClass(llvm::Constant *classPtr, bool nonlazy) {
 void IRGenModule::addProtocolConformanceRecord(
                                        NormalProtocolConformance *conformance) {
   ProtocolConformances.push_back(conformance);
+}
+
+static bool
+hasExplicitProtocolConformance(NominalTypeDecl *decl) {
+  auto conformances = decl->getAllConformances();
+  for (auto conformance : conformances) {
+    // inherited protocols do not emit explicit conformance records
+    // TODO any special handling required for Specialized conformances?
+    if (conformance->getKind() == ProtocolConformanceKind::Inherited)
+      continue;
+
+    auto P = conformance->getProtocol();
+
+    // @objc protocols do not have conformance records
+    if (P->isObjC())
+      continue;
+
+    // neither does AnyObject
+    if (P->getKnownProtocolKind().hasValue() &&
+        *P->getKnownProtocolKind() == KnownProtocolKind::AnyObject)
+      continue;
+
+    return true;
+  }
+
+  return false;
+}
+
+void IRGenModule::addRuntimeResolvableType(CanType type) {
+  // Don't emit type metadata records for types that can be found in the protocol
+  // conformance table as the runtime will search both tables when resolving a
+  // type by name.
+  if (auto nom = type->getAnyNominal()) {
+    if (!hasExplicitProtocolConformance(nom))
+      RuntimeResolvableTypes.push_back(type);
+  }
 }
 
 void IRGenModule::emitGlobalLists() {
@@ -674,40 +773,32 @@ void IRGenModule::emitGlobalLists() {
   // @llvm.used
 
   // Collect llvm.used globals already in the module (coming from ClangCodeGen).
-  auto *ExistingLLVMUsed = Module.getGlobalVariable("llvm.used");
-  if (ExistingLLVMUsed) {
-    auto *Globals =
-        cast<llvm::ConstantArray>(ExistingLLVMUsed->getInitializer());
-    for (auto &Use : Globals->operands()) {
-      auto *Global = Use.get();
-      LLVMUsed.push_back(Global);
-    }
-    ExistingLLVMUsed->eraseFromParent();
-  }
-
-  std::for_each(LLVMUsed.begin(), LLVMUsed.end(),
-                [](const llvm::WeakVH &global) {
-    assert(!isa<llvm::GlobalValue>(global) ||
-           !cast<llvm::GlobalValue>(global)->isDeclaration() &&
-           "all globals in the 'used' list must be definitions");
-  });
+  collectGlobalList(*this, LLVMUsed, "llvm.used");
   emitGlobalList(*this, LLVMUsed, "llvm.used", "llvm.metadata",
+                 llvm::GlobalValue::AppendingLinkage,
+                 Int8PtrTy,
+                 false);
+
+  // Collect llvm.compiler.used globals already in the module (coming
+  // from ClangCodeGen).
+  collectGlobalList(*this, LLVMCompilerUsed, "llvm.compiler.used");
+  emitGlobalList(*this, LLVMCompilerUsed, "llvm.compiler.used", "llvm.metadata",
                  llvm::GlobalValue::AppendingLinkage,
                  Int8PtrTy,
                  false);
 }
 
-void IRGenModuleDispatcher::emitGlobalTopLevel() {
+void IRGenerator::emitGlobalTopLevel() {
   // Generate order numbers for the functions in the SIL module that
   // correspond to definitions in the LLVM module.
   unsigned nextOrderNumber = 0;
-  for (auto &silFn : PrimaryIGM->SILMod->getFunctions()) {
+  for (auto &silFn : PrimaryIGM->getSILModule().getFunctions()) {
     // Don't bother adding external declarations to the function order.
     if (!silFn.isDefinition()) continue;
     FunctionOrder.insert(std::make_pair(&silFn, nextOrderNumber++));
   }
 
-  for (SILGlobalVariable &v : PrimaryIGM->SILMod->getSILGlobals()) {
+  for (SILGlobalVariable &v : PrimaryIGM->getSILModule().getSILGlobals()) {
     Decl *decl = v.getDecl();
     CurrentIGMPtr IGM = getGenModule(decl ? decl->getDeclContext() : nullptr);
     IGM->emitSILGlobalVariable(&v);
@@ -715,8 +806,8 @@ void IRGenModuleDispatcher::emitGlobalTopLevel() {
   PrimaryIGM->emitCoverageMapping();
   
   // Emit SIL functions.
-  bool isWholeModule = PrimaryIGM->SILMod->isWholeModule();
-  for (SILFunction &f : *PrimaryIGM->SILMod) {
+  bool isWholeModule = PrimaryIGM->getSILModule().isWholeModule();
+  for (SILFunction &f : PrimaryIGM->getSILModule()) {
     // Only eagerly emit functions that are externally visible.
     if (!isPossiblyUsedExternally(f.getLinkage(), isWholeModule))
       continue;
@@ -728,13 +819,23 @@ void IRGenModuleDispatcher::emitGlobalTopLevel() {
   // Emit static initializers.
   for (auto Iter : *this) {
     IRGenModule *IGM = Iter.second;
-    IGM->emitSILStaticInitializer();
+    IGM->emitSILStaticInitializers();
   }
 
   // Emit witness tables.
-  for (SILWitnessTable &wt : PrimaryIGM->SILMod->getWitnessTableList()) {
+  for (SILWitnessTable &wt : PrimaryIGM->getSILModule().getWitnessTableList()) {
     CurrentIGMPtr IGM = getGenModule(wt.getConformance()->getDeclContext());
+#ifndef NDEBUG
+    IGM->EligibleConfs.collect(&wt);
+    IGM->CurrentWitnessTable = &wt;
+#endif
+
     IGM->emitSILWitnessTable(&wt);
+
+#ifndef NDEBUG
+    IGM->EligibleConfs.clear();
+    IGM->CurrentWitnessTable = nullptr;
+#endif
   }
   
   for (auto Iter : *this) {
@@ -751,21 +852,12 @@ void IRGenModule::finishEmitAfterTopLevel() {
     };
 
     auto Imp = ImportDecl::create(Context,
-                                  SILMod->getSwiftModule(),
+                                  getSwiftModule(),
                                   SourceLoc(),
                                   ImportKind::Module, SourceLoc(),
                                   AccessPath);
     DebugInfo->emitImport(Imp);
   }
-
-  // Emit external definitions used by this module.
-  for (auto def : Context.ExternalDefinitions) {
-    emitExternalDefinition(def);
-  }
-
-  // Let ClangCodeGen emit its global data structures (llvm.used, debug info,
-  // etc.)
-  finalizeClangCodeGen();
 }
 
 static void emitLazyTypeMetadata(IRGenModule &IGM, CanType type) {
@@ -783,15 +875,21 @@ static void emitLazyTypeMetadata(IRGenModule &IGM, CanType type) {
   }
 }
 
-void IRGenModuleDispatcher::emitProtocolConformances() {
+void IRGenerator::emitProtocolConformances() {
   for (auto &m : *this) {
     m.second->emitProtocolConformances();
   }
 }
 
+void IRGenerator::emitTypeMetadataRecords() {
+  for (auto &m : *this) {
+    m.second->emitTypeMetadataRecords();
+  }
+}
+
 /// Emit any lazy definitions (of globals or functions or whatever
 /// else) that we require.
-void IRGenModuleDispatcher::emitLazyDefinitions() {
+void IRGenerator::emitLazyDefinitions() {
   while (!LazyTypeMetadata.empty() ||
          !LazyFunctionDefinitions.empty() ||
          !LazyFieldTypeAccessors.empty()) {
@@ -815,7 +913,7 @@ void IRGenModuleDispatcher::emitLazyDefinitions() {
       SILFunction *f = LazyFunctionDefinitions.pop_back_val();
       CurrentIGMPtr IGM = getGenModule(f);
       assert(!isPossiblyUsedExternally(f->getLinkage(),
-                                       IGM->SILMod->isWholeModule())
+                                       IGM->getSILModule().isWholeModule())
              && "function with externally-visible linkage emitted lazily?");
       IGM->emitSILFunction(f);
     }
@@ -827,7 +925,8 @@ void IRGenModuleDispatcher::emitLazyDefinitions() {
 /// private method.
 void IRGenModule::emitVTableStubs() {
   llvm::Function *stub = nullptr;
-  for (auto I = SILMod->zombies_begin(); I != SILMod->zombies_end(); ++I) {
+  for (auto I = getSILModule().zombies_begin();
+           I != getSILModule().zombies_end(); ++I) {
     const SILFunction &F = *I;
     if (! F.isExternallyUsedSymbol())
       continue;
@@ -835,20 +934,22 @@ void IRGenModule::emitVTableStubs() {
     if (!stub) {
       // Create a single stub function which calls swift_deletedMethodError().
       stub = llvm::Function::Create(llvm::FunctionType::get(VoidTy, false),
-                                    llvm::GlobalValue::LinkOnceODRLinkage,
+                                    llvm::GlobalValue::InternalLinkage,
                                     "_swift_dead_method_stub");
       stub->setAttributes(constructInitialAttributes());
       Module.getFunctionList().push_back(stub);
-      stub->setVisibility(llvm::GlobalValue::HiddenVisibility);
-      stub->setCallingConv(RuntimeCC);
+      stub->setCallingConv(DefaultCC);
       auto *entry = llvm::BasicBlock::Create(getLLVMContext(), "entry", stub);
       auto *errorFunc = getDeletedMethodErrorFn();
       llvm::CallInst::Create(errorFunc, ArrayRef<llvm::Value *>(), "", entry);
       new llvm::UnreachableInst(getLLVMContext(), entry);
     }
+
     // For each eliminated method symbol create an alias to the stub.
-    llvm::GlobalAlias::create(llvm::GlobalValue::ExternalLinkage, F.getName(),
-                              stub);
+    auto *alias = llvm::GlobalAlias::create(llvm::GlobalValue::ExternalLinkage,
+                                            F.getName(), stub);
+    if (useDllStorage())
+      alias->setDLLStorageClass(llvm::GlobalValue::DLLExportStorageClass);
   }
 }
 
@@ -856,10 +957,10 @@ void IRGenModule::emitTypeVerifier() {
   // Look up the types to verify.
   
   SmallVector<CanType, 4> TypesToVerify;
-  for (auto name : Opts.VerifyTypeLayoutNames) {
+  for (auto name : IRGen.Opts.VerifyTypeLayoutNames) {
     // Look up the name in the module.
     SmallVector<ValueDecl*, 1> lookup;
-    swift::Module *M = SILMod->getSwiftModule();
+    swift::ModuleDecl *M = getSwiftModule();
     M->lookupMember(lookup, M, DeclName(Context.getIdentifier(name)),
                     Identifier());
     if (lookup.empty()) {
@@ -901,7 +1002,8 @@ void IRGenModule::emitTypeVerifier() {
     return;
 
   // Find the entry point.
-  SILFunction *EntryPoint = SILMod->lookUpFunction(SWIFT_ENTRY_POINT_FUNCTION);
+  SILFunction *EntryPoint =
+    getSILModule().lookUpFunction(SWIFT_ENTRY_POINT_FUNCTION);
 
   if (!EntryPoint)
     return;
@@ -922,12 +1024,17 @@ void IRGenModule::emitTypeVerifier() {
   {
     llvm::BasicBlock *EntryBB = &EntryFunction->getEntryBlock();
     llvm::BasicBlock::iterator IP = EntryBB->getFirstInsertionPt();
-    IRBuilder Builder(getLLVMContext());
+    IRBuilder Builder(getLLVMContext(), DebugInfo);
     Builder.llvm::IRBuilderBase::SetInsertPoint(EntryBB, IP);
+    if (DebugInfo)
+      DebugInfo->setEntryPointLoc(Builder);
     Builder.CreateCall(VerifierFunction, {});
   }
 
   IRGenFunction VerifierIGF(*this, VerifierFunction);
+  if (DebugInfo)
+    DebugInfo->emitArtificialFunction(VerifierIGF, VerifierFunction);
+
   emitTypeLayoutVerifier(VerifierIGF, TypesToVerify);
   VerifierIGF.Builder.CreateRetVoid();
 }
@@ -953,9 +1060,9 @@ static SILLinkage getNonUniqueSILLinkage(FormalLinkage linkage,
 
 static SILLinkage getConformanceLinkage(IRGenModule &IGM,
                                         const ProtocolConformance *conf) {
-  auto wt = IGM.SILMod->lookUpWitnessTable(conf);
-  if (wt.first) {
-    return wt.first->getLinkage();
+  if (auto wt = IGM.getSILModule().lookUpWitnessTable(conf,
+                                               /*deserializeLazily*/ false)) {
+    return wt->getLinkage();
   } else {
     return SILLinkage::PublicExternal;
   }
@@ -966,7 +1073,6 @@ SILLinkage LinkEntity::getLinkage(IRGenModule &IGM,
   switch (getKind()) {
   // Most type metadata depend on the formal linkage of their type.
   case Kind::ValueWitnessTable:
-  case Kind::TypeMangling:
     return getSILLinkage(getTypeLinkage(getType()), forDefinition);
 
   case Kind::TypeMetadata:
@@ -989,8 +1095,7 @@ SILLinkage LinkEntity::getLinkage(IRGenModule &IGM,
 
   case Kind::TypeMetadataAccessFunction:
   case Kind::TypeMetadataLazyCacheVariable:
-    switch (getTypeMetadataAccessStrategy(IGM, getType(),
-                                          /*preferDirectAccess=*/false)) {
+    switch (getTypeMetadataAccessStrategy(IGM, getType())) {
     case MetadataAccessStrategy::PublicUniqueAccessor:
       return getSILLinkage(FormalLinkage::PublicUnique, forDefinition);
     case MetadataAccessStrategy::HiddenUniqueAccessor:
@@ -998,10 +1103,12 @@ SILLinkage LinkEntity::getLinkage(IRGenModule &IGM,
     case MetadataAccessStrategy::PrivateAccessor:
       return getSILLinkage(FormalLinkage::Private, forDefinition);
     case MetadataAccessStrategy::NonUniqueAccessor:
-    case MetadataAccessStrategy::Direct:
       return SILLinkage::Shared;
     }
     llvm_unreachable("bad metadata access kind");
+
+  case Kind::ObjCClassRef:
+    return SILLinkage::Private;
 
   case Kind::WitnessTableOffset:
   case Kind::Function:
@@ -1039,6 +1146,90 @@ SILLinkage LinkEntity::getLinkage(IRGenModule &IGM,
       
   case Kind::SILGlobalVariable:
     return getSILGlobalVariable()->getLinkage();
+
+  case Kind::ReflectionBuiltinDescriptor:
+  case Kind::ReflectionFieldDescriptor:
+    // Reflection descriptors for imported types have shared linkage,
+    // since we may emit them in other TUs in the same module.
+    if (getTypeLinkage(getType()) == FormalLinkage::PublicNonUnique)
+      return SILLinkage::Shared;
+    return SILLinkage::Private;
+  case Kind::ReflectionAssociatedTypeDescriptor:
+    if (getConformanceLinkage(IGM, getProtocolConformance())
+          == SILLinkage::Shared)
+      return SILLinkage::Shared;
+    return SILLinkage::Private;
+  case Kind::ReflectionSuperclassDescriptor:
+    if (getDeclLinkage(getDecl()) == FormalLinkage::PublicNonUnique)
+      return SILLinkage::Shared;
+    return SILLinkage::Private;
+  }
+  llvm_unreachable("bad link entity kind");
+}
+
+static bool isAvailableExternally(IRGenModule &IGM, const DeclContext *dc) {
+  dc = dc->getModuleScopeContext();
+  if (isa<ClangModuleUnit>(dc) ||
+      dc == IGM.getSILModule().getAssociatedContext())
+    return false;
+  return true;
+}
+
+static bool isAvailableExternally(IRGenModule &IGM, const Decl *decl) {
+  return isAvailableExternally(IGM, decl->getDeclContext());
+}
+
+static bool isAvailableExternally(IRGenModule &IGM, Type type) {
+  if (auto decl = type->getAnyNominal())
+    return isAvailableExternally(IGM, decl->getDeclContext());
+  return true;
+}
+
+bool LinkEntity::isAvailableExternally(IRGenModule &IGM) const {
+  switch (getKind()) {
+  case Kind::ValueWitnessTable:
+  case Kind::TypeMetadata:
+    return ::isAvailableExternally(IGM, getType());
+
+  case Kind::ForeignTypeMetadataCandidate:
+    assert(!::isAvailableExternally(IGM, getType()));
+    return false;
+
+  case Kind::ObjCClass:
+  case Kind::ObjCMetaclass:
+    // FIXME: Removing this triggers a linker bug
+    return true;
+
+  case Kind::SwiftMetaclassStub:
+  case Kind::NominalTypeDescriptor:
+  case Kind::ProtocolDescriptor:
+    return ::isAvailableExternally(IGM, getDecl());
+
+  case Kind::DirectProtocolWitnessTable:
+    return ::isAvailableExternally(IGM, getProtocolConformance()->getDeclContext());
+
+  case Kind::ObjCClassRef:
+  case Kind::ValueWitness:
+  case Kind::WitnessTableOffset:
+  case Kind::TypeMetadataAccessFunction:
+  case Kind::TypeMetadataLazyCacheVariable:
+  case Kind::Function:
+  case Kind::Other:
+  case Kind::FieldOffset:
+  case Kind::ProtocolWitnessTableAccessFunction:
+  case Kind::ProtocolWitnessTableLazyAccessFunction:
+  case Kind::ProtocolWitnessTableLazyCacheVariable:
+  case Kind::AssociatedTypeMetadataAccessFunction:
+  case Kind::AssociatedTypeWitnessTableAccessFunction:
+  case Kind::GenericProtocolWitnessTableCache:
+  case Kind::GenericProtocolWitnessTableInstantiationFunction:
+  case Kind::SILFunction:
+  case Kind::SILGlobalVariable:
+  case Kind::ReflectionBuiltinDescriptor:
+  case Kind::ReflectionFieldDescriptor:
+  case Kind::ReflectionAssociatedTypeDescriptor:
+  case Kind::ReflectionSuperclassDescriptor:
+    llvm_unreachable("Relative reference to unsupported link entity");
   }
   llvm_unreachable("bad link entity kind");
 }
@@ -1051,82 +1242,137 @@ bool LinkEntity::isFragile(IRGenModule &IGM) const {
     case Kind::SILGlobalVariable:
       return getSILGlobalVariable()->isFragile();
       
-    case Kind::DirectProtocolWitnessTable: {
-      auto wt = IGM.SILMod->lookUpWitnessTable(getProtocolConformance());
-      if (wt.first) {
-        return wt.first->isFragile();
-      } else {
-        return false;
-      }
-    }
-      
+    case Kind::ReflectionAssociatedTypeDescriptor:
+    case Kind::ReflectionSuperclassDescriptor:
+      return false;
+
     default:
       break;
+  }
+  if (isProtocolConformanceKind(getKind())) {
+    if (SILWitnessTable *wt = IGM.getSILModule().lookUpWitnessTable(
+                                            getProtocolConformance(), false)) {
+      SILLinkage L = wt->getLinkage();
+      // We don't deserialize the fragile attribute correctly. But we know that
+      // if the witness table was deserialized (= available externally) and it's
+      // not public, it must be fragile.
+      if (swift::isAvailableExternally(L) && !hasPublicVisibility(L))
+        return true;
+      return wt->isFragile();
+    }
   }
   return false;
 }
 
-
-static std::pair<llvm::GlobalValue::LinkageTypes,
-                 llvm::GlobalValue::VisibilityTypes>
-getIRLinkage(IRGenModule &IGM,
-             SILLinkage linkage, bool isFragile, ForDefinition_t isDefinition,
+static std::tuple<llvm::GlobalValue::LinkageTypes,
+                  llvm::GlobalValue::VisibilityTypes,
+                  llvm::GlobalValue::DLLStorageClassTypes>
+getIRLinkage(IRGenModule &IGM, SILLinkage linkage, bool isFragile,
+             bool isSILOnly, ForDefinition_t isDefinition,
              bool isWeakImported) {
-  
-#define RESULT(LINKAGE, VISIBILITY)        \
-{ llvm::GlobalValue::LINKAGE##Linkage, \
-llvm::GlobalValue::VISIBILITY##Visibility }
-  
+#define RESULT(LINKAGE, VISIBILITY, DLL_STORAGE)                               \
+  std::make_tuple(llvm::GlobalValue::LINKAGE##Linkage,                         \
+                  llvm::GlobalValue::VISIBILITY##Visibility,                   \
+                  llvm::GlobalValue::DLL_STORAGE##StorageClass)
+
+  const auto ObjFormat = IGM.TargetInfo.OutputObjectFormat;
+  bool IsELFObject = ObjFormat == llvm::Triple::ELF;
+  bool UseDLLStorage = IGM.useDllStorage();
+
+  // Use protected visibility for public symbols we define on ELF.  ld.so
+  // doesn't support relative relocations at load time, which interferes with
+  // our metadata formats.  Default visibility should suffice for other object
+  // formats.
+  llvm::GlobalValue::VisibilityTypes PublicDefinitionVisibility =
+      IsELFObject ? llvm::GlobalValue::ProtectedVisibility
+                  : llvm::GlobalValue::DefaultVisibility;
+  llvm::GlobalValue::DLLStorageClassTypes ExportedStorage =
+      UseDLLStorage ? llvm::GlobalValue::DLLExportStorageClass
+                    : llvm::GlobalValue::DefaultStorageClass;
+  llvm::GlobalValue::DLLStorageClassTypes ImportedStorage =
+      UseDLLStorage ? llvm::GlobalValue::DLLImportStorageClass
+                    : llvm::GlobalValue::DefaultStorageClass;
+
   if (isFragile) {
     // Fragile functions/globals must be visible from outside, regardless of
     // their accessibility. If a caller is also fragile and inlined into another
     // module it must be able to access this (not-inlined) function/global.
     switch (linkage) {
-      case SILLinkage::Hidden:
-      case SILLinkage::Private:
-        linkage = SILLinkage::Public;
-        break;
+    case SILLinkage::Hidden:
+    case SILLinkage::Private:
+      linkage = SILLinkage::Public;
+      break;
 
-      case SILLinkage::Public:
-      case SILLinkage::Shared:
-      case SILLinkage::HiddenExternal:
-      case SILLinkage::PrivateExternal:
-      case SILLinkage::PublicExternal:
-      case SILLinkage::SharedExternal:
-        break;
+    case SILLinkage::Public:
+    case SILLinkage::Shared:
+    case SILLinkage::HiddenExternal:
+    case SILLinkage::PrivateExternal:
+    case SILLinkage::PublicExternal:
+    case SILLinkage::SharedExternal:
+      break;
     }
   }
-  
+
   switch (linkage) {
-  case SILLinkage::Public: return RESULT(External, Default);
+  case SILLinkage::Public:
+    // Don't code-gen transparent functions. Internal linkage will enable llvm
+    // to delete transparent functions except they are referenced from somewhere
+    // (i.e. the function pointer is taken).
+    //
+    // In case we are generating multiple LLVM modules, we still have to use
+    // ExternalLinkage so that modules can cross-reference transparent
+    // functions.
+    //
+    // TODO: In non-whole-module-opt the generated swiftmodules are "linked" and
+    // this strips all serialized transparent functions. So we have to code-gen
+    // transparent functions in non-whole-module-opt.
+    if (isSILOnly && !IGM.IRGen.hasMultipleIGMs() &&
+        IGM.getSILModule().isWholeModule())
+      return RESULT(Internal, Default, Default);
+    return std::make_tuple(llvm::GlobalValue::ExternalLinkage,
+                           PublicDefinitionVisibility, ExportedStorage);
+
   case SILLinkage::Shared:
-  case SILLinkage::SharedExternal: return RESULT(LinkOnceODR, Hidden);
-  case SILLinkage::Hidden: return RESULT(External, Hidden);
+  case SILLinkage::SharedExternal:
+    return RESULT(LinkOnceODR, Hidden, Default);
+
+  case SILLinkage::Hidden:
+    return RESULT(External, Hidden, Default);
+
   case SILLinkage::Private:
-    if (IGM.dispatcher.hasMultipleIGMs()) {
-      // In case of multiple llvm modules (in multi-threaded compilation) all
-      // private decls must be visible from other files.
-      return RESULT(External, Hidden);
-    }
-    return RESULT(Internal, Default);
-  case SILLinkage::PublicExternal:
+    // In case of multiple llvm modules (in multi-threaded compilation) all
+    // private decls must be visible from other files.
+    if (IGM.IRGen.hasMultipleIGMs())
+      return RESULT(External, Hidden, Default);
+    return RESULT(Internal, Default, Default);
+
+  case SILLinkage::PublicExternal: {
     if (isDefinition) {
-      return RESULT(AvailableExternally, Default);
+      // Transparent function are not available externally.
+      if (isSILOnly)
+        return RESULT(LinkOnceODR, Hidden, Default);
+      return std::make_tuple(llvm::GlobalValue::AvailableExternallyLinkage,
+                             llvm::GlobalValue::DefaultVisibility,
+                             ExportedStorage);
     }
 
-    if (isWeakImported)
-      return RESULT(ExternalWeak, Default);
-    return RESULT(External, Default);
+    auto linkage = isWeakImported ? llvm::GlobalValue::ExternalWeakLinkage
+                                  : llvm::GlobalValue::ExternalLinkage;
+    return std::make_tuple(linkage, llvm::GlobalValue::DefaultVisibility,
+                           ImportedStorage);
+  }
+
   case SILLinkage::HiddenExternal:
-  case SILLinkage::PrivateExternal: {
-    auto visibility = isFragile ? llvm::GlobalValue::DefaultVisibility
-                                : llvm::GlobalValue::HiddenVisibility;
-    if (isDefinition) {
-      return {llvm::GlobalValue::AvailableExternallyLinkage, visibility};
-    }
-    return {llvm::GlobalValue::ExternalLinkage, visibility};
+  case SILLinkage::PrivateExternal:
+    return std::make_tuple(isDefinition
+                               ? llvm::GlobalValue::AvailableExternallyLinkage
+                               : llvm::GlobalValue::ExternalLinkage,
+                           isFragile ? llvm::GlobalValue::DefaultVisibility
+                                     : llvm::GlobalValue::HiddenVisibility,
+                           ImportedStorage);
+
   }
-  }
+
   llvm_unreachable("bad SIL linkage");
 }
 
@@ -1137,14 +1383,13 @@ static void updateLinkageForDefinition(IRGenModule &IGM,
                                        const LinkEntity &entity) {
   // TODO: there are probably cases where we can avoid redoing the
   // entire linkage computation.
-  auto linkage = getIRLinkage(
-                   IGM,
-                   entity.getLinkage(IGM, ForDefinition),
-                   entity.isFragile(IGM),
-                   ForDefinition,
-                   entity.isWeakImported(IGM.SILMod->getSwiftModule()));
-  global->setLinkage(linkage.first);
-  global->setVisibility(linkage.second);
+  auto linkage =
+      getIRLinkage(IGM, entity.getLinkage(IGM, ForDefinition),
+                   entity.isFragile(IGM), entity.isSILOnly(), ForDefinition,
+                   entity.isWeakImported(IGM.getSwiftModule()));
+  global->setLinkage(std::get<0>(linkage));
+  global->setVisibility(std::get<1>(linkage));
+  global->setDLLStorageClass(std::get<2>(linkage));
 
   // Everything externally visible is considered used in Swift.
   // That mostly means we need to be good at not marking things external.
@@ -1152,11 +1397,10 @@ static void updateLinkageForDefinition(IRGenModule &IGM,
   // Exclude "main", because it should naturally be used, and because adding it
   // to llvm.used leaves a dangling use when the REPL attempts to discard
   // intermediate mains.
-  if (linkage.first == llvm::GlobalValue::ExternalLinkage &&
-      linkage.second == llvm::GlobalValue::DefaultVisibility &&
-      global->getName() != SWIFT_ENTRY_POINT_FUNCTION) {
+  if (LinkInfo::isUsed(std::get<0>(linkage), std::get<1>(linkage),
+                       std::get<2>(linkage)) &&
+      global->getName() != SWIFT_ENTRY_POINT_FUNCTION)
     IGM.addUsedGlobal(global);
-  }
 }
 
 LinkInfo LinkInfo::get(IRGenModule &IGM, const LinkEntity &entity,
@@ -1165,11 +1409,10 @@ LinkInfo LinkInfo::get(IRGenModule &IGM, const LinkEntity &entity,
 
   entity.mangle(result.Name);
 
-  std::tie(result.Linkage, result.Visibility) =
-    getIRLinkage(IGM, entity.getLinkage(IGM, isDefinition),
-                 entity.isFragile(IGM),
-                 isDefinition,
-                 entity.isWeakImported(IGM.SILMod->getSwiftModule()));
+  std::tie(result.Linkage, result.Visibility, result.DLLStorageClass) =
+      getIRLinkage(IGM, entity.getLinkage(IGM, isDefinition),
+                   entity.isFragile(IGM), entity.isSILOnly(), isDefinition,
+                   entity.isWeakImported(IGM.getSwiftModule()));
 
   result.ForDefinition = isDefinition;
 
@@ -1199,15 +1442,16 @@ llvm::Function *LinkInfo::createFunction(IRGenModule &IGM,
     existing->setName(getName() + ".unique");
   }
 
-  llvm::Function *fn
-    = llvm::Function::Create(fnType, getLinkage(), getName());
+  llvm::Function *fn = llvm::Function::Create(fnType, getLinkage(), getName());
+  fn->setVisibility(getVisibility());
+  fn->setDLLStorageClass(getDLLStorage());
+  fn->setCallingConv(cc);
+
   if (insertBefore) {
     IGM.Module.getFunctionList().insert(insertBefore->getIterator(), fn);
   } else {
     IGM.Module.getFunctionList().push_back(fn);
-  }
-  fn->setVisibility(getVisibility());
-  fn->setCallingConv(cc);
+ }
 
   auto initialAttrs = IGM.constructInitialAttributes();
   // Merge initialAttrs with attrs.
@@ -1222,9 +1466,7 @@ llvm::Function *LinkInfo::createFunction(IRGenModule &IGM,
   // Exclude "main", because it should naturally be used, and because adding it
   // to llvm.used leaves a dangling use when the REPL attempts to discard
   // intermediate mains.
-  if (ForDefinition &&
-      Linkage == llvm::GlobalValue::ExternalLinkage &&
-      Visibility == llvm::GlobalValue::DefaultVisibility &&
+  if (isUsed() &&
       getName() != SWIFT_ENTRY_POINT_FUNCTION) {
     IGM.addUsedGlobal(fn);
   }
@@ -1232,19 +1474,23 @@ llvm::Function *LinkInfo::createFunction(IRGenModule &IGM,
   return fn;
 }
 
-bool LinkInfo::isUsed() const {
+bool LinkInfo::isUsed(llvm::GlobalValue::LinkageTypes Linkage,
+                      llvm::GlobalValue::VisibilityTypes Visibility,
+                      llvm::GlobalValue::DLLStorageClassTypes DLLStorage) {
   // Everything externally visible is considered used in Swift.
   // That mostly means we need to be good at not marking things external.
-  return ForDefinition &&
-      Linkage == llvm::GlobalValue::ExternalLinkage &&
-      Visibility == llvm::GlobalValue::DefaultVisibility;
+  return Linkage == llvm::GlobalValue::ExternalLinkage &&
+         (Visibility == llvm::GlobalValue::DefaultVisibility ||
+          Visibility == llvm::GlobalValue::ProtectedVisibility) &&
+         (DLLStorage == llvm::GlobalValue::DefaultStorageClass ||
+          DLLStorage == llvm::GlobalValue::DLLExportStorageClass);
 }
 
 /// Get or create an LLVM global variable with these linkage rules.
 llvm::GlobalVariable *LinkInfo::createVariable(IRGenModule &IGM,
                                                llvm::Type *storageType,
                                                Alignment alignment,
-                                               DebugTypeInfo DebugType,
+                                               DebugTypeInfo DbgTy,
                                                Optional<SILLocation> DebugLoc,
                                                StringRef DebugName) {
   llvm::GlobalValue *existingValue = IGM.Module.getNamedGlobal(getName());
@@ -1262,10 +1508,10 @@ llvm::GlobalVariable *LinkInfo::createVariable(IRGenModule &IGM,
   }
 
   auto var = new llvm::GlobalVariable(IGM.Module, storageType,
-                                      /*constant*/ false,
-                                      getLinkage(), /*initializer*/ nullptr,
-                                      getName());
+                                      /*constant*/ false, getLinkage(),
+                                      /*initializer*/ nullptr, getName());
   var->setVisibility(getVisibility());
+  var->setDLLStorageClass(getDLLStorage());
   var->setAlignment(alignment.getValue());
 
   // Everything externally visible is considered used in Swift.
@@ -1274,11 +1520,10 @@ llvm::GlobalVariable *LinkInfo::createVariable(IRGenModule &IGM,
     IGM.addUsedGlobal(var);
   }
 
-  if (IGM.DebugInfo && ForDefinition)
-    IGM.DebugInfo->
-      emitGlobalVariableDeclaration(var,
-                                    DebugName.empty() ? getName() : DebugName,
-                                    getName(), DebugType, DebugLoc);
+  if (IGM.DebugInfo && !DbgTy.isNull() && ForDefinition)
+    IGM.DebugInfo->emitGlobalVariableDeclaration(
+        var, DebugName.empty() ? getName() : DebugName, getName(), DbgTy,
+        var->hasInternalLinkage(), DebugLoc);
 
   return var;
 }
@@ -1349,6 +1594,7 @@ void IRGenModule::emitGlobalDecl(Decl *D) {
   case DeclKind::InfixOperator:
   case DeclKind::PrefixOperator:
   case DeclKind::PostfixOperator:
+  case DeclKind::PrecedenceGroup:
     return;
 
   case DeclKind::Module:
@@ -1358,55 +1604,27 @@ void IRGenModule::emitGlobalDecl(Decl *D) {
   llvm_unreachable("bad decl kind!");
 }
 
-void IRGenModule::emitExternalDefinition(Decl *D) {
-  switch (D->getKind()) {
-  case DeclKind::Extension:
-  case DeclKind::PatternBinding:
-  case DeclKind::EnumCase:
-  case DeclKind::EnumElement:
-  case DeclKind::TopLevelCode:
-  case DeclKind::TypeAlias:
-  case DeclKind::GenericTypeParam:
-  case DeclKind::AssociatedType:
-  case DeclKind::Import:
-  case DeclKind::Subscript:
-  case DeclKind::Destructor:
-  case DeclKind::InfixOperator:
-  case DeclKind::PrefixOperator:
-  case DeclKind::PostfixOperator:
-  case DeclKind::IfConfig:
-  case DeclKind::Param:
-    llvm_unreachable("Not a valid external definition for IRgen");
-
-  case DeclKind::Var:
-    assert(D->getClangDecl() && "Not a valid external var for IRGen");
-    return emitClangDecl(const_cast<clang::Decl *>(D->getClangDecl()));
-
-  case DeclKind::Func:
-    if (auto *clangDecl = D->getClangDecl())
-      emitClangDecl(const_cast<clang::Decl *>(clangDecl));
-    break;
-
-  case DeclKind::Constructor:
-    // Do nothing.
-    break;
-
-  // No need to eagerly emit Swift metadata for external types.
-  case DeclKind::Struct:
-  case DeclKind::Enum:
-  case DeclKind::Class:
-  case DeclKind::Protocol:
-    break;
-
-  case DeclKind::Module:
-    break;
-  }
-}
-
 Address IRGenModule::getAddrOfSILGlobalVariable(SILGlobalVariable *var,
                                                 const TypeInfo &ti,
                                                 ForDefinition_t forDefinition) {
+  if (auto clangDecl = var->getClangDecl()) {
+    auto addr = getAddrOfClangGlobalDecl(cast<clang::VarDecl>(clangDecl),
+                                         forDefinition);
+
+    // If we're not emitting this to define it, make sure we cast it to the
+    // right type.
+    if (!forDefinition) {
+      auto ptrTy = ti.getStorageType()->getPointerTo();
+      addr = llvm::ConstantExpr::getBitCast(addr, ptrTy);
+    }
+
+    auto alignment =
+      Alignment(getClangASTContext().getDeclAlign(clangDecl).getQuantity());
+    return Address(addr, alignment);
+  }
+
   LinkEntity entity = LinkEntity::forSILGlobalVariable(var);
+  ResilienceExpansion expansion = getResilienceExpansionForLayout(var);
 
   llvm::Type *storageType;
   Size fixedSize;
@@ -1415,7 +1633,7 @@ Address IRGenModule::getAddrOfSILGlobalVariable(SILGlobalVariable *var,
   // If the type has a fixed size, allocate static storage. Otherwise, allocate
   // a fixed-size buffer and possibly heap-allocate a payload at runtime if the
   // runtime size of the type does not fit in the buffer.
-  if (ti.isFixedSize(ResilienceExpansion::Minimal)) {
+  if (ti.isFixedSize(expansion)) {
     auto &fixedTI = cast<FixedTypeInfo>(ti);
 
     storageType = fixedTI.getStorageType();
@@ -1443,20 +1661,14 @@ Address IRGenModule::getAddrOfSILGlobalVariable(SILGlobalVariable *var,
   }
 
   LinkInfo link = LinkInfo::get(*this, entity, forDefinition);
+  auto DbgTy =
+      DebugTypeInfo::getGlobal(var, storageType, fixedSize, fixedAlignment);
   if (var->getDecl()) {
     // If we have the VarDecl, use it for more accurate debugging information.
-    DebugTypeInfo DbgTy(var->getDecl(),
-                        var->getLoweredType().getSwiftType(),
-                        storageType, fixedSize, fixedAlignment);
     gvar = link.createVariable(*this, storageType, fixedAlignment,
                                DbgTy, SILLocation(var->getDecl()),
                                var->getDecl()->getName().str());
   } else {
-    // There is no VarDecl for a SILGlobalVariable, and thus also no context.
-    DeclContext *DeclCtx = nullptr;
-    DebugTypeInfo DbgTy(var->getLoweredType().getSwiftRValueType(),
-                        storageType, fixedSize, fixedAlignment, DeclCtx);
-
     Optional<SILLocation> loc;
     if (var->hasLocation())
       loc = var->getLocation();
@@ -1479,12 +1691,33 @@ static bool isReadOnlyFunction(SILFunction *f) {
   // Check if the function has any 'owned' parameters. Owned parameters may
   // call the destructor of the object which could violate the readonly-ness
   // of the function.
-  if (f->hasOwnedParameters())
+  if (f->hasOwnedParameters() || f->hasIndirectFormalResults())
     return false;
 
   auto Eff = f->getEffectsKind();
-  return Eff == EffectsKind::ReadNone ||
-         Eff == EffectsKind::ReadOnly;
+
+  // Swift's readonly does not automatically match LLVM's readonly.
+  // Swift SIL optimizer relies on @effects(readonly) to remove e.g.
+  // dead code remaining from initializers of strings or dictionaries
+  // of variables that are not used. But those initializers are often
+  // not really readonly in terms of LLVM IR. For example, the
+  // Dictionary.init() is marked as @effects(readonly) in Swift, but
+  // it does invoke reference-counting operations.
+  if (Eff == EffectsKind::ReadOnly || Eff == EffectsKind::ReadNone) {
+    // TODO: Analyze the body of function f and return true if it is
+    // really readonly.
+    return false;
+  }
+
+  return false;
+}
+
+static clang::GlobalDecl getClangGlobalDeclForFunction(const clang::Decl *decl) {
+  if (auto ctor = dyn_cast<clang::CXXConstructorDecl>(decl))
+    return clang::GlobalDecl(ctor, clang::Ctor_Complete);
+  if (auto dtor = dyn_cast<clang::CXXDestructorDecl>(decl))
+    return clang::GlobalDecl(dtor, clang::Dtor_Complete);
+  return clang::GlobalDecl(cast<clang::FunctionDecl>(decl));
 }
 
 /// Find the entry point for a SIL function.
@@ -1494,13 +1727,23 @@ llvm::Function *IRGenModule::getAddrOfSILFunction(SILFunction *f,
 
   // Check whether we've created the function already.
   // FIXME: We should integrate this into the LinkEntity cache more cleanly.
-  llvm::Function *fn = Module.getFunction(f->getName());
+  llvm::Function *fn = Module.getFunction(f->getName());  
   if (fn) {
     if (forDefinition) updateLinkageForDefinition(*this, fn, entity);
     return fn;
   }
 
-  bool hasOrderNumber = f->isDefinition();
+  // If it's a Clang declaration, ask Clang to generate the IR declaration.
+  // This might generate new functions, so we should do it before computing
+  // the insert-before point.
+  llvm::Constant *clangAddr = nullptr;
+  if (auto clangDecl = f->getClangDecl()) {
+    auto globalDecl = getClangGlobalDeclForFunction(clangDecl);
+    clangAddr = getAddrOfClangGlobalDecl(globalDecl, forDefinition);
+  }
+
+  bool isDefinition = f->isDefinition();
+  bool hasOrderNumber = isDefinition;
   unsigned orderNumber = ~0U;
   llvm::Function *insertBefore = nullptr;
 
@@ -1508,21 +1751,39 @@ llvm::Function *IRGenModule::getAddrOfSILFunction(SILFunction *f,
   // number for it; make sure to insert it in that position relative
   // to other ordered functions.
   if (hasOrderNumber) {
-    orderNumber = dispatcher.getFunctionOrder(f);
+    orderNumber = IRGen.getFunctionOrder(f);
     if (auto emittedFunctionIterator
           = EmittedFunctionsByOrder.findLeastUpperBound(orderNumber))
       insertBefore = *emittedFunctionIterator;
-
-    // Also, if we have a lazy definition for it, be sure to queue that up.
-    if (!forDefinition &&
-        !isPossiblyUsedExternally(f->getLinkage(), SILMod->isWholeModule()))
-      dispatcher.addLazyFunction(f);
   }
-    
+
+  // If it's a Clang declaration, check whether Clang gave us a declaration.
+  if (clangAddr) {
+    fn = dyn_cast<llvm::Function>(clangAddr->stripPointerCasts());
+
+    // If we have a function, move it to the appropriate position.
+    if (fn) {
+      if (hasOrderNumber) {
+        auto &fnList = Module.getFunctionList();
+        fnList.remove(fn);
+        fnList.insert(llvm::Module::iterator(insertBefore), fn);
+
+        EmittedFunctionsByOrder.insert(orderNumber, fn);
+      }
+      return fn;
+    }
+
+  // Otherwise, if we have a lazy definition for it, be sure to queue that up.
+  } else if (isDefinition && !forDefinition &&
+             !isPossiblyUsedExternally(f->getLinkage(),
+                                       getSILModule().isWholeModule())) {
+    IRGen.addLazyFunction(f);
+  }
+
   llvm::AttributeSet attrs;
   llvm::FunctionType *fnType = getFunctionType(f->getLoweredFunctionType(),
                                                attrs);
-  
+
   auto cc = expandCallingConv(*this, f->getRepresentation());
   LinkInfo link = LinkInfo::get(*this, entity, forDefinition);
 
@@ -1553,7 +1814,7 @@ static llvm::GlobalVariable *createGOTEquivalent(IRGenModule &IGM,
                                       llvm::GlobalValue::PrivateLinkage,
                                       global,
                                       llvm::Twine("got.") + globalName);
-  gotEquivalent->setUnnamedAddr(true);
+  gotEquivalent->setUnnamedAddr(llvm::GlobalValue::UnnamedAddr::Global);
   return gotEquivalent;
 }
 
@@ -1566,6 +1827,119 @@ static llvm::Constant *getElementBitCast(llvm::Constant *ptr,
     auto newPtrType = newEltType->getPointerTo(ptrType->getAddressSpace());
     return llvm::ConstantExpr::getBitCast(ptr, newPtrType);
   }
+}
+
+/// Return a reference to an object that's suitable for being used for
+/// the given kind of reference.
+///
+/// Note that, if the requested reference kind is a relative reference.
+/// the returned constant will not actually be a relative reference.
+/// To form the actual relative reference, you must pass the returned
+/// result to emitRelativeReference, passing the correct base-address
+/// information.
+ConstantReference
+IRGenModule::getAddrOfLLVMVariable(LinkEntity entity, Alignment alignment,
+                                   llvm::Type *definitionType,
+                                   llvm::Type *defaultType,
+                                   DebugTypeInfo debugType,
+                                   SymbolReferenceKind refKind) {
+  switch (refKind) {
+  case SymbolReferenceKind::Relative_Direct:
+  case SymbolReferenceKind::Far_Relative_Direct:
+    assert(definitionType == nullptr);
+    // FIXME: don't just fall through; force the creation of a weak
+    // definition so that we can emit a relative reference.
+    LLVM_FALLTHROUGH;
+
+  case SymbolReferenceKind::Absolute:
+    return { getAddrOfLLVMVariable(entity, alignment, definitionType,
+                                   defaultType, debugType),
+             ConstantReference::Direct };
+
+
+  case SymbolReferenceKind::Relative_Indirectable:
+  case SymbolReferenceKind::Far_Relative_Indirectable:
+    assert(definitionType == nullptr);
+    return getAddrOfLLVMVariableOrGOTEquivalent(entity, alignment, defaultType);
+  }
+  llvm_unreachable("bad reference kind");
+}
+
+void IRGenModule::checkEligibleConf(const ProtocolConformance *Conf) {
+#ifndef NDEBUG
+  if (!ConformanceCollector::verifyInIRGen())
+    return;
+
+  if (EligibleConfs.isUsed(Conf))
+    return;
+
+  if (CurrentInst) {
+    llvm::errs() << "## Conformance: ";
+    Conf->dump();
+    llvm::errs() << "## Inst: ";
+    CurrentInst->dump();
+    llvm_unreachable(
+                "ConformanceCollector is missing a conformance in instruction");
+  }
+  if (CurrentWitnessTable) {
+    llvm_unreachable(
+              "ConformanceCollector is missing a conformance in witness table");
+  }
+#endif
+}
+
+void IRGenModule::checkEligibleMetaType(NominalTypeDecl *NT) {
+#ifndef NDEBUG
+  if (!ConformanceCollector::verifyInIRGen())
+    return;
+
+  if (!NT || EligibleConfs.isMetaTypeEscaping(NT))
+    return;
+
+  if (CurrentInst) {
+    // Ignore instructions which may use a metatype but do not let escape it.
+    switch (CurrentInst->getKind()) {
+      case ValueKind::DestroyAddrInst:
+      case ValueKind::StructElementAddrInst:
+      case ValueKind::TupleElementAddrInst:
+      case ValueKind::InjectEnumAddrInst:
+      case ValueKind::SwitchEnumAddrInst:
+      case ValueKind::SelectEnumAddrInst:
+      case ValueKind::IndexAddrInst:
+      case ValueKind::RefElementAddrInst:
+      case ValueKind::RefTailAddrInst:
+      case ValueKind::TailAddrInst:
+      case ValueKind::AllocValueBufferInst:
+      case ValueKind::ProjectValueBufferInst:
+      case ValueKind::ProjectBoxInst:
+      case ValueKind::CopyAddrInst:
+      case ValueKind::UncheckedRefCastAddrInst:
+      case ValueKind::AllocStackInst:
+      case ValueKind::SuperMethodInst:
+      case ValueKind::WitnessMethodInst:
+      case ValueKind::DeallocRefInst:
+      case ValueKind::AllocGlobalInst:
+        return;
+      case ValueKind::ApplyInst:
+      case ValueKind::TryApplyInst:
+      case ValueKind::PartialApplyInst:
+        // It's not trivial to find the non-escaping vs. escaping meta-
+        // types of an apply. Therefore we just trust the ConformanceCollector
+        // that it does the right job.
+        return;
+      default:
+        break;
+    }
+    llvm::errs() << "## NominalType: " << NT->getName() << "\n## Inst: ";
+    CurrentInst->dump();
+    llvm_unreachable(
+                  "ConformanceCollector is missing a metatype in instruction");
+  }
+  if (CurrentWitnessTable) {
+    llvm_unreachable(
+                "ConformanceCollector is missing a metatype in witness table");
+  }
+#endif
 }
 
 /// A convenient wrapper around getAddrOfLLVMVariable which uses the
@@ -1589,7 +1963,7 @@ llvm::Constant *
 IRGenModule::getAddrOfLLVMVariable(LinkEntity entity, Alignment alignment,
                                    llvm::Type *definitionType,
                                    llvm::Type *defaultType,
-                                   DebugTypeInfo debugType) {
+                                   DebugTypeInfo DbgTy) {
   // This function assumes that 'globals' only contains GlobalValue
   // values for the entities that it will look up.
 
@@ -1631,7 +2005,7 @@ IRGenModule::getAddrOfLLVMVariable(LinkEntity entity, Alignment alignment,
   if (!definitionType) definitionType = defaultType;
 
   // Create the variable.
-  auto var = link.createVariable(*this, definitionType, alignment, debugType);
+  auto var = link.createVariable(*this, definitionType, alignment, DbgTy);
 
   // If we have an existing entry, destroy it, replacing it with the
   // new variable.
@@ -1669,7 +2043,7 @@ IRGenModule::getAddrOfLLVMVariable(LinkEntity entity, Alignment alignment,
 /// Creates a private, unnamed constant containing the address of another
 /// global variable. LLVM can replace relative references to this variable with
 /// relative references to the GOT entry for the variable in the object file.
-std::pair<llvm::Constant *, IRGenModule::DirectOrGOT>
+ConstantReference
 IRGenModule::getAddrOfLLVMVariableOrGOTEquivalent(LinkEntity entity,
                                                   Alignment alignment,
                                                   llvm::Type *defaultType) {
@@ -1707,66 +2081,58 @@ IRGenModule::getAddrOfLLVMVariableOrGOTEquivalent(LinkEntity entity,
   // relative references too, to avoid producing unnecessary GOT entries in
   // the final image.
   auto entry = GlobalVars[entity];
-  if (!hasPublicVisibility(entity.getLinkage(*this, NotForDefinition))
-      || isDefinition(entry)) {
+  if (!entity.isAvailableExternally(*this) || isDefinition(entry)) {
     // FIXME: Relative references to aliases break MC on 32-bit Mach-O
     // platforms (rdar://problem/22450593 ), so substitute an alias with its
     // aliasee to work around that.
     if (auto alias = dyn_cast<llvm::GlobalAlias>(entry))
       entry = alias->getAliasee();
-    return {entry, DirectOrGOT::Direct};
+    return {entry, ConstantReference::Direct};
   }
 
   auto &gotEntry = GlobalGOTEquivalents[entity];
   if (gotEntry) {
-    return {gotEntry, DirectOrGOT::GOT};
+    return {gotEntry, ConstantReference::Indirect};
   }
 
   // Look up the global variable.
-  auto global = cast<llvm::GlobalValue>(GlobalVars[entity]);
+  auto global = cast<llvm::GlobalValue>(entry);
   // Use it as the initializer for an anonymous constant. LLVM can treat this as
   // equivalent to the global's GOT entry.
   llvm::SmallString<64> name;
   entity.mangle(name);
   auto gotEquivalent = createGOTEquivalent(*this, global, name);
   gotEntry = gotEquivalent;
-  return {gotEquivalent, DirectOrGOT::GOT};
+  return {gotEquivalent, ConstantReference::Indirect};
 }
 
 namespace {
 struct TypeEntityInfo {
-  unsigned flags;
+  ProtocolConformanceFlags flags;
   LinkEntity entity;
   llvm::Type *defaultTy, *defaultPtrTy;
 };
 } // end anonymous namespace
 
 static TypeEntityInfo
-getTypeEntityForProtocolConformanceRecord(IRGenModule &IGM,
-                                       NormalProtocolConformance *conformance) {
-  ProtocolConformanceTypeKind typeKind;
+getTypeEntityInfo(IRGenModule &IGM, CanType conformingType) {
+  TypeMetadataRecordKind typeKind;
   Optional<LinkEntity> entity;
   llvm::Type *defaultTy, *defaultPtrTy;
 
-  // TODO: Should use accessor kind for lazy conformances
-  ProtocolConformanceReferenceKind conformanceKind
-    = ProtocolConformanceReferenceKind::WitnessTable;
-
-  auto conformingType = conformance->getType()->getCanonicalType();
-  if (auto bgt = dyn_cast<BoundGenericType>(conformingType)) {
-    // Conformances for generics are represented by referencing the metadata
-    // pattern for the generic type.
-    typeKind = ProtocolConformanceTypeKind::UniqueGenericPattern;
-    entity = LinkEntity::forTypeMetadata(
-                         bgt->getDecl()->getDeclaredType()->getCanonicalType(),
-                         TypeMetadataAddress::AddressPoint,
-                         /*isPattern*/ true);
-    defaultTy = IGM.TypeMetadataPatternStructTy;
-    defaultPtrTy = IGM.TypeMetadataPatternPtrTy;
-  } else if (auto ct = dyn_cast<ClassType>(conformingType)) {
-    auto clas = ct->getDecl();
+  auto nom = conformingType->getAnyNominal();
+  auto clas = dyn_cast<ClassDecl>(nom);
+  if ((nom->isGenericContext() && (!clas || !clas->usesObjCGenericsModel())) ||
+      (clas && doesClassMetadataRequireDynamicInitialization(IGM, clas))) {
+    // Conformances for generics and concrete subclasses of generics
+    // are represented by referencing the nominal type descriptor.
+    typeKind = TypeMetadataRecordKind::UniqueNominalTypeDescriptor;
+    entity = LinkEntity::forNominalTypeDescriptor(nom);
+    defaultTy = IGM.NominalTypeDescriptorTy;
+    defaultPtrTy = IGM.NominalTypeDescriptorPtrTy;
+  } else if (clas) {
     if (clas->isForeign()) {
-      typeKind = ProtocolConformanceTypeKind::NonuniqueDirectType;
+      typeKind = TypeMetadataRecordKind::NonuniqueDirectType;
       entity = LinkEntity::forForeignTypeMetadataCandidate(conformingType);
       defaultTy = IGM.TypeMetadataStructTy;
       defaultPtrTy = IGM.TypeMetadataPtrTy;
@@ -1774,7 +2140,7 @@ getTypeEntityForProtocolConformanceRecord(IRGenModule &IGM,
       // TODO: We should indirectly reference classes. For now directly
       // reference the class object, which is totally wrong for ObjC interop.
 
-      typeKind = ProtocolConformanceTypeKind::UniqueDirectClass;
+      typeKind = TypeMetadataRecordKind::UniqueDirectClass;
       if (hasKnownSwiftMetadata(IGM, clas))
         entity = LinkEntity::forTypeMetadata(
                          conformingType,
@@ -1785,17 +2151,17 @@ getTypeEntityForProtocolConformanceRecord(IRGenModule &IGM,
       defaultTy = IGM.TypeMetadataStructTy;
       defaultPtrTy = IGM.TypeMetadataPtrTy;
     }
-  } else if (auto nom = conformingType->getNominalOrBoundGenericNominal()) {
+  } else {
     // Metadata for Clang types should be uniqued like foreign classes.
     if (nom->hasClangNode()) {
-      typeKind = ProtocolConformanceTypeKind::NonuniqueDirectType;
+      typeKind = TypeMetadataRecordKind::NonuniqueDirectType;
       entity = LinkEntity::forForeignTypeMetadataCandidate(conformingType);
       defaultTy = IGM.TypeMetadataStructTy;
       defaultPtrTy = IGM.TypeMetadataPtrTy;
     } else {
       // We can reference the canonical metadata for native value types
       // directly.
-      typeKind = ProtocolConformanceTypeKind::UniqueDirectType;
+      typeKind = TypeMetadataRecordKind::UniqueDirectType;
       entity = LinkEntity::forTypeMetadata(
                        conformingType,
                        TypeMetadataAddress::AddressPoint,
@@ -1803,37 +2169,28 @@ getTypeEntityForProtocolConformanceRecord(IRGenModule &IGM,
       defaultTy = IGM.TypeMetadataStructTy;
       defaultPtrTy = IGM.TypeMetadataPtrTy;
     }
-  } else {
-    // TODO: Universal and/or structural conformances
-    llvm_unreachable("unhandled protocol conformance");
   }
 
-  auto flags = ProtocolConformanceFlags()
-    .withTypeKind(typeKind)
-    .withConformanceKind(conformanceKind);
+  auto flags = ProtocolConformanceFlags().withTypeKind(typeKind);
 
-  return {flags.getValue(), *entity, defaultTy, defaultPtrTy};
+  return {flags, *entity, defaultTy, defaultPtrTy};
 }
 
 /// Form an LLVM constant for the relative distance between a reference
-/// (appearing at gep (0, arrayIndex, structIndex) of `base`) and
-/// `target`.
-static llvm::Constant *emitRelativeReference(IRGenModule &IGM,
-                               std::pair<llvm::Constant *,
-                                         IRGenModule::DirectOrGOT> target,
-                               llvm::Constant *base,
-                               unsigned arrayIndex,
-                               unsigned structIndex) {
+/// (appearing at gep (0, indices) of `base`) and `target`.
+llvm::Constant *
+IRGenModule::emitRelativeReference(ConstantReference target,
+                                   llvm::Constant *base,
+                                   ArrayRef<unsigned> baseIndices) {
   llvm::Constant *relativeAddr =
-    IGM.emitDirectRelativeReference(target.first, base,
-                                    { arrayIndex, structIndex });
+    emitDirectRelativeReference(target.getValue(), base, baseIndices);
 
-  // If the reference is to a GOT entry, flag it by setting the low bit.
+  // If the reference is indirect, flag it by setting the low bit.
   // (All of the base, direct target, and GOT entry need to be pointer-aligned
   // for this to be OK.)
-  if (target.second == IRGenModule::DirectOrGOT::GOT) {
+  if (target.isIndirect()) {
     relativeAddr = llvm::ConstantExpr::getAdd(relativeAddr,
-                             llvm::ConstantInt::get(IGM.RelativeAddressTy, 1));
+                             llvm::ConstantInt::get(RelativeAddressTy, 1));
   }
 
   return relativeAddr;
@@ -1883,6 +2240,9 @@ llvm::Constant *IRGenModule::emitProtocolConformances() {
   case llvm::Triple::ELF:
     sectionName = ".swift2_protocol_conformances";
     break;
+  case llvm::Triple::COFF:
+    sectionName = ".sw2prtc";
+    break;
   default:
     llvm_unreachable("Don't know how to emit protocol conformances for "
                      "the selected object format.");
@@ -1908,32 +2268,47 @@ llvm::Constant *IRGenModule::emitProtocolConformances() {
 
   SmallVector<llvm::Constant*, 8> elts;
   for (auto *conformance : ProtocolConformances) {
+    emitAssociatedTypeMetadataRecord(conformance);
+
     auto descriptorRef = getAddrOfLLVMVariableOrGOTEquivalent(
                   LinkEntity::forProtocolDescriptor(conformance->getProtocol()),
                   getPointerAlignment(), ProtocolDescriptorStructTy);
+    auto typeEntity = getTypeEntityInfo(*this,
+                                    conformance->getType()->getCanonicalType());
+    auto flags = typeEntity.flags;
 
-    auto typeEntity
-      = getTypeEntityForProtocolConformanceRecord(*this, conformance);
+    llvm::Constant *witnessTableVar;
 
-    // If the conformance is in this object's table, then the witness table
-    // should also be in this object file, so we can always directly reference
-    // it.
-    // TODO: Produce a relative reference to a private generator function
-    // if the witness table requires lazy initialization, instantiation, or
-    // conditional conformance checking.
-    std::pair<llvm::Constant*, DirectOrGOT> witnessTableRef;
-    auto witnessTableVar = getAddrOfWitnessTable(conformance);
-    witnessTableRef = std::make_pair(witnessTableVar,
-                                     DirectOrGOT::Direct);
+    if (!isResilient(conformance->getProtocol(),
+                     ResilienceExpansion::Maximal)) {
+      flags = flags.withConformanceKind(
+          ProtocolConformanceReferenceKind::WitnessTable);
+
+      // If the conformance is in this object's table, then the witness table
+      // should also be in this object file, so we can always directly reference
+      // it.
+      witnessTableVar = getAddrOfWitnessTable(conformance);
+    } else {
+      flags = flags.withConformanceKind(
+          ProtocolConformanceReferenceKind::WitnessTableAccessor);
+
+      witnessTableVar = getAddrOfWitnessTableAccessFunction(
+          conformance, ForDefinition);
+    }
+
+    auto witnessTableRef =
+      ConstantReference(witnessTableVar, ConstantReference::Direct);
 
     auto typeRef = getAddrOfLLVMVariableOrGOTEquivalent(
       typeEntity.entity, getPointerAlignment(), typeEntity.defaultTy);
 
+    unsigned arrayIdx = elts.size();
+
     llvm::Constant *recordFields[] = {
-      emitRelativeReference(*this, descriptorRef,   var, elts.size(), 0),
-      emitRelativeReference(*this, typeRef,         var, elts.size(), 1),
-      emitRelativeReference(*this, witnessTableRef, var, elts.size(), 2),
-      llvm::ConstantInt::get(Int32Ty, typeEntity.flags),
+      emitRelativeReference(descriptorRef,   var, { arrayIdx, 0 }),
+      emitRelativeReference(typeRef,         var, { arrayIdx, 1 }),
+      emitRelativeReference(witnessTableRef, var, { arrayIdx, 2 }),
+      llvm::ConstantInt::get(Int32Ty, flags.getValue()),
     };
 
     auto record = llvm::ConstantStruct::get(ProtocolConformanceRecordTy,
@@ -1950,14 +2325,104 @@ llvm::Constant *IRGenModule::emitProtocolConformances() {
   return var;
 }
 
+/// Emit type metadata for types that might not have explicit protocol conformances.
+llvm::Constant *IRGenModule::emitTypeMetadataRecords() {
+  std::string sectionName;
+  switch (TargetInfo.OutputObjectFormat) {
+  case llvm::Triple::MachO:
+    sectionName = "__TEXT, __swift2_types, regular, no_dead_strip";
+    break;
+  case llvm::Triple::ELF:
+    sectionName = ".swift2_type_metadata";
+    break;
+  case llvm::Triple::COFF:
+    sectionName = ".sw2tymd";
+    break;
+  default:
+    llvm_unreachable("Don't know how to emit type metadata table for "
+                     "the selected object format.");
+  }
+
+  // Do nothing if the list is empty.
+  if (RuntimeResolvableTypes.empty())
+    return nullptr;
+
+  // Define the global variable for the conformance list.
+  // We have to do this before defining the initializer since the entries will
+  // contain offsets relative to themselves.
+  auto arrayTy = llvm::ArrayType::get(TypeMetadataRecordTy,
+                                      RuntimeResolvableTypes.size());
+
+  // FIXME: This needs to be a linker-local symbol in order for Darwin ld to
+  // resolve relocations relative to it.
+  auto var = new llvm::GlobalVariable(Module, arrayTy,
+                                      /*isConstant*/ true,
+                                      llvm::GlobalValue::PrivateLinkage,
+                                      /*initializer*/ nullptr,
+                                      "\x01l_type_metadata_table");
+
+  SmallVector<llvm::Constant *, 8> elts;
+  for (auto type : RuntimeResolvableTypes) {
+    auto typeEntity = getTypeEntityInfo(*this, type);
+    auto typeRef = getAddrOfLLVMVariableOrGOTEquivalent(
+            typeEntity.entity, getPointerAlignment(), typeEntity.defaultTy);
+
+    unsigned arrayIdx = elts.size();
+    llvm::Constant *recordFields[] = {
+      emitRelativeReference(typeRef, var, { arrayIdx, 0 }),
+      llvm::ConstantInt::get(Int32Ty, typeEntity.flags.getValue()),
+    };
+
+    auto record = llvm::ConstantStruct::get(TypeMetadataRecordTy,
+                                            recordFields);
+    elts.push_back(record);
+  }
+
+  auto initializer = llvm::ConstantArray::get(arrayTy, elts);
+
+  var->setInitializer(initializer);
+  var->setSection(sectionName);
+  var->setAlignment(getPointerAlignment().getValue());
+  addUsedGlobal(var);
+  return var;
+}
+
+/// Fetch a global reference to a reference to the given Objective-C class.
+/// The result is of type ObjCClassPtrTy->getPointerTo().
+Address IRGenModule::getAddrOfObjCClassRef(ClassDecl *theClass) {
+  assert(ObjCInterop && "getting address of ObjC class ref in no-interop mode");
+
+  Alignment alignment = getPointerAlignment();
+
+  LinkEntity entity = LinkEntity::forObjCClassRef(theClass);
+  auto DbgTy = DebugTypeInfo::getObjCClass(
+      theClass, ObjCClassPtrTy, getPointerSize(), getPointerAlignment());
+  auto addr = getAddrOfLLVMVariable(entity, alignment, NotForDefinition,
+                                    ObjCClassPtrTy, DbgTy);
+
+  // Define it lazily.
+  if (auto global = dyn_cast<llvm::GlobalVariable>(addr)) {
+    if (global->isDeclaration()) {
+      global->setSection("__DATA,__objc_classrefs,regular,no_dead_strip");
+      global->setLinkage(llvm::GlobalVariable::PrivateLinkage);
+      global->setExternallyInitialized(true);
+      global->setInitializer(getAddrOfObjCClass(theClass, NotForDefinition));
+      addCompilerUsedGlobal(global);
+    }
+  }
+
+  return Address(addr, alignment);
+}
+
 /// Fetch a global reference to the given Objective-C class.  The
 /// result is of type ObjCClassPtrTy.
 llvm::Constant *IRGenModule::getAddrOfObjCClass(ClassDecl *theClass,
                                                 ForDefinition_t forDefinition) {
   assert(ObjCInterop && "getting address of ObjC class in no-interop mode");
+  assert(!theClass->isForeign());
   LinkEntity entity = LinkEntity::forObjCClass(theClass);
-  DebugTypeInfo DbgTy(theClass, ObjCClassPtrTy,
-                      getPointerSize(), getPointerAlignment());
+  auto DbgTy = DebugTypeInfo::getObjCClass(
+      theClass, ObjCClassPtrTy, getPointerSize(), getPointerAlignment());
   auto addr = getAddrOfLLVMVariable(entity, getPointerAlignment(),
                                     forDefinition, ObjCClassStructTy, DbgTy);
   return addr;
@@ -1968,9 +2433,10 @@ llvm::Constant *IRGenModule::getAddrOfObjCClass(ClassDecl *theClass,
 llvm::Constant *IRGenModule::getAddrOfObjCMetaclass(ClassDecl *theClass,
                                                 ForDefinition_t forDefinition) {
   assert(ObjCInterop && "getting address of ObjC metaclass in no-interop mode");
+  assert(!theClass->isForeign());
   LinkEntity entity = LinkEntity::forObjCMetaclass(theClass);
-  DebugTypeInfo DbgTy(theClass, ObjCClassPtrTy,
-                      getPointerSize(), getPointerAlignment());
+  auto DbgTy = DebugTypeInfo::getObjCClass(
+      theClass, ObjCClassPtrTy, getPointerSize(), getPointerAlignment());
   auto addr = getAddrOfLLVMVariable(entity, getPointerAlignment(),
                                     forDefinition, ObjCClassStructTy, DbgTy);
   return addr;
@@ -1982,8 +2448,8 @@ llvm::Constant *IRGenModule::getAddrOfSwiftMetaclassStub(ClassDecl *theClass,
                                                 ForDefinition_t forDefinition) {
   assert(ObjCInterop && "getting address of metaclass stub in no-interop mode");
   LinkEntity entity = LinkEntity::forSwiftMetaclassStub(theClass);
-  DebugTypeInfo DbgTy(theClass, ObjCClassPtrTy,
-                      getPointerSize(), getPointerAlignment());
+  auto DbgTy = DebugTypeInfo::getObjCClass(
+      theClass, ObjCClassPtrTy, getPointerSize(), getPointerAlignment());
   auto addr = getAddrOfLLVMVariable(entity, getPointerAlignment(),
                                     forDefinition, ObjCClassStructTy, DbgTy);
   return addr;
@@ -1994,7 +2460,7 @@ llvm::Constant *IRGenModule::getAddrOfSwiftMetaclassStub(ClassDecl *theClass,
 /// on whether the class is published as an ObjC class.
 llvm::Constant *IRGenModule::getAddrOfMetaclassObject(ClassDecl *decl,
                                                 ForDefinition_t forDefinition) {
-  assert(!decl->isGenericContext()
+  assert((!decl->isGenericContext() || decl->hasClangNode())
          && "generic classes do not have a static metaclass object");
   if (decl->checkObjCAncestry() != ObjCClassKind::NonObjC ||
       decl->hasClangNode()) {
@@ -2009,6 +2475,7 @@ llvm::Function *
 IRGenModule::getAddrOfTypeMetadataAccessFunction(CanType type,
                                               ForDefinition_t forDefinition) {
   assert(!type->hasArchetype() && !type->hasTypeParameter());
+  checkEligibleMetaType(type->getNominalOrBoundGenericNominal());
   LinkEntity entity = LinkEntity::forTypeMetadataAccessFunction(type);
   llvm::Function *&entry = GlobalFuncs[entity];
   if (entry) {
@@ -2018,7 +2485,32 @@ IRGenModule::getAddrOfTypeMetadataAccessFunction(CanType type,
 
   auto fnType = llvm::FunctionType::get(TypeMetadataPtrTy, false);
   LinkInfo link = LinkInfo::get(*this, entity, forDefinition);
-  entry = link.createFunction(*this, fnType, RuntimeCC, llvm::AttributeSet());
+  entry = link.createFunction(*this, fnType, DefaultCC, llvm::AttributeSet());
+  return entry;
+}
+
+/// Fetch the type metadata access function for the given generic type.
+llvm::Function *
+IRGenModule::getAddrOfGenericTypeMetadataAccessFunction(
+                                           NominalTypeDecl *nominal,
+                                           ArrayRef<llvm::Type *> genericArgs,
+                                           ForDefinition_t forDefinition) {
+  assert(!genericArgs.empty());
+  assert(nominal->isGenericContext());
+  checkEligibleMetaType(nominal);
+
+  auto type = nominal->getDeclaredType()->getCanonicalType();
+  assert(type->hasUnboundGenericType());
+  LinkEntity entity = LinkEntity::forTypeMetadataAccessFunction(type);
+  llvm::Function *&entry = GlobalFuncs[entity];
+  if (entry) {
+    if (forDefinition) updateLinkageForDefinition(*this, entry, entity);
+    return entry;
+  }
+
+  auto fnType = llvm::FunctionType::get(TypeMetadataPtrTy, genericArgs, false);
+  LinkInfo link = LinkInfo::get(*this, entity, forDefinition);
+  entry = link.createFunction(*this, fnType, DefaultCC, llvm::AttributeSet());
   return entry;
 }
 
@@ -2028,6 +2520,7 @@ llvm::Constant *
 IRGenModule::getAddrOfTypeMetadataLazyCacheVariable(CanType type,
                                               ForDefinition_t forDefinition) {
   assert(!type->hasArchetype() && !type->hasTypeParameter());
+  checkEligibleMetaType(type->getNominalOrBoundGenericNominal());
   LinkEntity entity = LinkEntity::forTypeMetadataLazyCacheVariable(type);
   return getAddrOfLLVMVariable(entity, getPointerAlignment(), forDefinition,
                                TypeMetadataPtrTy, DebugTypeInfo());
@@ -2040,11 +2533,12 @@ IRGenModule::getAddrOfTypeMetadataLazyCacheVariable(CanType type,
 /// existing external declaration to the address point as an alias into the
 /// full metadata object.
 llvm::GlobalValue *IRGenModule::defineTypeMetadata(CanType concreteType,
-                                                   bool isIndirect,
-                                                   bool isPattern,
-                                                   bool isConstant,
-                                                   llvm::Constant *init,
-                                                   llvm::StringRef section) {
+                                 bool isIndirect,
+                                 bool isPattern,
+                                 bool isConstant,
+                                 llvm::Constant *init,
+                                 std::unique_ptr<llvm::GlobalVariable> replace,
+                                 llvm::StringRef section) {
   assert(init);
   assert(!isIndirect && "indirect type metadata not used yet");
 
@@ -2073,9 +2567,9 @@ llvm::GlobalValue *IRGenModule::defineTypeMetadata(CanType concreteType,
 
   auto entity = LinkEntity::forTypeMetadata(concreteType, addrKind, isPattern);
 
-  auto DbgTy = DebugTypeInfo(MetatypeType::get(concreteType),
-                             defaultVarTy->getPointerTo(),
-                             0, 1, nullptr);
+  auto DbgTy = DebugTypeInfo::getMetadata(MetatypeType::get(concreteType),
+                                          defaultVarTy->getPointerTo(), Size(0),
+                                          Alignment(1));
 
   // Define the variable.
   llvm::GlobalVariable *var = cast<llvm::GlobalVariable>(
@@ -2086,6 +2580,16 @@ llvm::GlobalValue *IRGenModule::defineTypeMetadata(CanType concreteType,
   var->setConstant(isConstant);
   if (!section.empty())
     var->setSection(section);
+  
+  // Replace the placeholder if we were given one.
+  if (replace) {
+    auto replacer = llvm::ConstantExpr::getBitCast(var, replace->getType());
+    replace->replaceAllUsesWith(replacer);
+  }
+
+  // Keep type metadata around for all types, although the runtime can currently
+  // only perform name lookup of non-generic types.
+  addRuntimeResolvableType(concreteType);
 
   // For metadata patterns, we're done.
   if (isPattern)
@@ -2123,6 +2627,7 @@ llvm::GlobalValue *IRGenModule::defineTypeMetadata(CanType concreteType,
       ptrTy->getElementType(), ptrTy->getAddressSpace(), link.getLinkage(),
       link.getName(), addr, &Module);
   alias->setVisibility(link.getVisibility());
+  alias->setDLLStorageClass(link.getDLLStorage());
 
   // The full metadata is used based on the visibility of the address point,
   // not the metadata itself.
@@ -2166,8 +2671,16 @@ llvm::GlobalValue *IRGenModule::defineTypeMetadata(CanType concreteType,
 ///     for a type metadata and it will have type TypeMetadataPtrTy.
 llvm::Constant *IRGenModule::getAddrOfTypeMetadata(CanType concreteType,
                                                    bool isPattern) {
+  return getAddrOfTypeMetadata(concreteType, isPattern,
+                               SymbolReferenceKind::Absolute).getDirectValue();
+}
+
+ConstantReference IRGenModule::getAddrOfTypeMetadata(CanType concreteType,
+                                                     bool isPattern,
+                                               SymbolReferenceKind refKind) {
   assert(isPattern || !isa<UnboundGenericType>(concreteType));
 
+  checkEligibleMetaType(concreteType->getNominalOrBoundGenericNominal());
   llvm::Type *defaultVarTy;
   unsigned adjustmentIndex;
   Alignment alignment = getPointerAlignment();
@@ -2216,7 +2729,7 @@ llvm::Constant *IRGenModule::getAddrOfTypeMetadata(CanType concreteType,
   // If this is a use, and the type metadata is emitted lazily,
   // trigger lazy emission of the metadata.
   if (isTypeMetadataEmittedLazily(concreteType)) {
-    dispatcher.addLazyTypeMetadata(concreteType);
+    IRGen.addLazyTypeMetadata(concreteType);
   }
 
   LinkEntity entity
@@ -2225,21 +2738,22 @@ llvm::Constant *IRGenModule::getAddrOfTypeMetadata(CanType concreteType,
                                      TypeMetadataAddress::AddressPoint,
                                      isPattern);
 
-  auto DbgTy = ObjCClass 
-    ? DebugTypeInfo(ObjCClass, ObjCClassPtrTy,
-                    getPointerSize(), getPointerAlignment())
-    : DebugTypeInfo(MetatypeType::get(concreteType),
-                    defaultVarTy->getPointerTo(),
-                    0, 1, nullptr);
+  auto DbgTy =
+      ObjCClass
+          ? DebugTypeInfo::getObjCClass(ObjCClass, ObjCClassPtrTy,
+                                        getPointerSize(), getPointerAlignment())
+          : DebugTypeInfo::getMetadata(MetatypeType::get(concreteType),
+                                       defaultVarTy->getPointerTo(), Size(0),
+                                       Alignment(1));
 
   auto addr = getAddrOfLLVMVariable(entity, alignment,
-                                    nullptr, defaultVarTy, DbgTy);
+                                    nullptr, defaultVarTy, DbgTy, refKind);
 
   // FIXME: MC breaks when emitting alias references on some platforms
   // (rdar://problem/22450593 ). Work around this by referring to the aliasee
   // instead.
-  if (auto alias = dyn_cast<llvm::GlobalAlias>(addr))
-    addr = alias->getAliasee();
+  if (auto alias = dyn_cast<llvm::GlobalAlias>(addr.getValue()))
+    addr = ConstantReference(alias->getAliasee(), addr.isIndirect());
 
   // Adjust if necessary.
   if (adjustmentIndex) {
@@ -2247,47 +2761,13 @@ llvm::Constant *IRGenModule::getAddrOfTypeMetadata(CanType concreteType,
       llvm::ConstantInt::get(Int32Ty, 0),
       llvm::ConstantInt::get(Int32Ty, adjustmentIndex)
     };
-    addr = llvm::ConstantExpr::getInBoundsGetElementPtr(
-                                                 /*Ty=*/nullptr, addr, indices);
+    addr = ConstantReference(
+             llvm::ConstantExpr::getInBoundsGetElementPtr(
+                                    /*Ty=*/nullptr, addr.getValue(), indices),
+                             addr.isIndirect());
   }
   
   return addr;
-}
-
-/// Return the address of a foreign-type metadata candidate.  There is no
-/// single translation unit which can uniquely emit foreign-type metadata,
-/// and we don't want to force the dynamic linker to eagerly unique them
-/// by symbol name, so instead we emit a "candidate" metadata and ask
-/// the runtime to unique them.
-llvm::Constant *
-IRGenModule::getAddrOfForeignTypeMetadataCandidate(CanType type) {
-  // What we save in GlobalVars is actually the offsetted value.
-  auto entity = LinkEntity::forForeignTypeMetadataCandidate(type);
-  if (auto entry = GlobalVars[entity])
-    return entry;
-
-  // Compute the constant initializer and the offset of the type
-  // metadata candidate within it.
-  Size addressPoint;
-  auto init = emitForeignTypeMetadataInitializer(*this, type, addressPoint);
-
-  // Create the global variable.
-  LinkInfo link = LinkInfo::get(*this, entity, ForDefinition);
-  auto var = link.createVariable(*this, init->getType(),
-                                 getPointerAlignment());
-  var->setInitializer(init);
-
-  // Apply the offset.
-  llvm::Constant *result = var;
-  result = llvm::ConstantExpr::getBitCast(result, Int8PtrTy);
-  result = llvm::ConstantExpr::getInBoundsGetElementPtr(
-      Int8Ty, result, getSize(addressPoint));
-  result = llvm::ConstantExpr::getBitCast(result, TypeMetadataPtrTy);
-
-  // Only remember the offset.
-  GlobalVars[entity] = result;
-
-  return result;
 }
 
 /// Return the address of a nominal type descriptor.  Right now, this
@@ -2295,6 +2775,7 @@ IRGenModule::getAddrOfForeignTypeMetadataCandidate(CanType type) {
 llvm::Constant *IRGenModule::getAddrOfNominalTypeDescriptor(NominalTypeDecl *D,
                                                   llvm::Type *definitionType) {
   assert(definitionType && "not defining nominal type descriptor?");
+  checkEligibleMetaType(D);
   auto entity = LinkEntity::forNominalTypeDescriptor(D);
   return getAddrOfLLVMVariable(entity, getPointerAlignment(),
                                definitionType, definitionType,
@@ -2302,14 +2783,14 @@ llvm::Constant *IRGenModule::getAddrOfNominalTypeDescriptor(NominalTypeDecl *D,
 }
 
 llvm::Constant *IRGenModule::getAddrOfProtocolDescriptor(ProtocolDecl *D,
-                                                ForDefinition_t forDefinition) {
+                                                ForDefinition_t forDefinition,
+                                                llvm::Type *definitionType) {
   if (D->isObjC())
     return getAddrOfObjCProtocolRecord(D, forDefinition);
-  
+
   auto entity = LinkEntity::forProtocolDescriptor(D);
-  auto ty = ProtocolDescriptorStructTy;
-  return getAddrOfLLVMVariable(entity, getPointerAlignment(),
-                               forDefinition, ty, DebugTypeInfo());
+  return getAddrOfLLVMVariable(entity, getPointerAlignment(), definitionType,
+                               ProtocolDescriptorStructTy, DebugTypeInfo());
 }
 
 /// Fetch the declaration of the ivar initializer for the given class.
@@ -2326,7 +2807,7 @@ Optional<llvm::Function*> IRGenModule::getAddrOfIVarInitDestroy(
                     isForeign);
 
   // Find the SILFunction for the ivar initializer or destroyer.
-  if (auto silFn = SILMod->lookUpFunction(silRef)) {
+  if (auto silFn = getSILModule().lookUpFunction(silRef)) {
     return getAddrOfSILFunction(silFn, forDefinition);
   }
 
@@ -2355,7 +2836,7 @@ llvm::Function *IRGenModule::getAddrOfValueWitness(CanType abstractType,
       cast<llvm::PointerType>(getValueWitnessTy(index))
         ->getElementType());
   LinkInfo link = LinkInfo::get(*this, entity, forDefinition);
-  entry = link.createFunction(*this, fnType, RuntimeCC, llvm::AttributeSet());
+  entry = link.createFunction(*this, fnType, DefaultCC, llvm::AttributeSet());
   return entry;
 }
 
@@ -2366,11 +2847,8 @@ llvm::Function *IRGenModule::getAddrOfValueWitness(CanType abstractType,
 llvm::Constant *IRGenModule::getAddrOfValueWitnessTable(CanType concreteType,
                                                   llvm::Type *definitionType) {
   LinkEntity entity = LinkEntity::forValueWitnessTable(concreteType);
-  DebugTypeInfo DbgTy(concreteType, WitnessTablePtrTy,
-                      getPointerSize(), getPointerAlignment(),
-                      nullptr);
   return getAddrOfLLVMVariable(entity, getPointerAlignment(), definitionType,
-                               WitnessTableTy, DbgTy);
+                               WitnessTableTy, DebugTypeInfo());
 }
 
 static Address getAddrOfSimpleVariable(IRGenModule &IGM,
@@ -2448,6 +2926,7 @@ void IRGenModule::emitNestedTypeDecls(DeclRange members) {
     case DeclKind::PostfixOperator:
     case DeclKind::Param:
     case DeclKind::Module:
+    case DeclKind::PrecedenceGroup:
       llvm_unreachable("decl not allowed in type context");
 
     case DeclKind::IfConfig:
@@ -2523,7 +3002,7 @@ void IRGenModule::emitExtension(ExtensionDecl *ext) {
 
   if (shouldEmitCategory(*this, ext)) {
     assert(origClass && !origClass->isForeign() &&
-           "CF types cannot have categories emitted");
+           "foreign types cannot have categories emitted");
     llvm::Constant *category = emitCategoryData(*this, ext);
     category = llvm::ConstantExpr::getBitCast(category, Int8PtrTy);
     ObjCCategories.push_back(category);
@@ -2541,6 +3020,17 @@ Address IRGenFunction::createAlloca(llvm::Type *type,
   return Address(alloca, alignment);
 }
 
+/// Create an allocation of an array on the stack.
+Address IRGenFunction::createAlloca(llvm::Type *type,
+                                    llvm::Value *ArraySize,
+                                    Alignment alignment,
+                                    const llvm::Twine &name) {
+  llvm::AllocaInst *alloca = new llvm::AllocaInst(type, ArraySize,
+                                                  alignment.getValue(), name,
+                                                  AllocaIP);
+  return Address(alloca, alignment);
+}
+
 /// Allocate a fixed-size buffer on the stack.
 Address IRGenFunction::createFixedSizeBufferAlloca(const llvm::Twine &name) {
   return createAlloca(IGM.getFixedBufferTy(),
@@ -2552,27 +3042,24 @@ Address IRGenFunction::createFixedSizeBufferAlloca(const llvm::Twine &name) {
 ///
 /// \returns an i8* with a null terminator; note that embedded nulls
 ///   are okay
-llvm::Constant *IRGenModule::getAddrOfGlobalString(StringRef data) {
+///
+/// FIXME: willBeRelativelyAddressed is only needed to work around an ld64 bug
+/// resolving relative references to coalesceable symbols.
+/// It should be removed when fixed. rdar://problem/22674524
+llvm::Constant *IRGenModule::getAddrOfGlobalString(StringRef data,
+                                               bool willBeRelativelyAddressed) {
   // Check whether this string already exists.
   auto &entry = GlobalStrings[data];
-  if (entry) return entry;
+  if (entry.second) {
+    // FIXME: Clear unnamed_addr if the global will be relative referenced
+    // to work around an ld64 bug. rdar://problem/22674524
+    if (willBeRelativelyAddressed)
+      entry.first->setUnnamedAddr(llvm::GlobalValue::UnnamedAddr::None);
+    return entry.second;
+  }
 
-  // If not, create it.  This implicitly adds a trailing null.
-  auto init = llvm::ConstantDataArray::getString(LLVMContext, data);
-  auto global = new llvm::GlobalVariable(Module, init->getType(), true,
-                                         llvm::GlobalValue::PrivateLinkage,
-                                         init);
-  global->setUnnamedAddr(true);
-
-  // Drill down to make an i8*.
-  auto zero = llvm::ConstantInt::get(SizeTy, 0);
-  llvm::Constant *indices[] = { zero, zero };
-  auto address = llvm::ConstantExpr::getInBoundsGetElementPtr(
-      global->getValueType(), global, indices);
-
-  // Cache and return.
-  entry = address;
-  return address;
+  entry = createStringConstant(data, willBeRelativelyAddressed);
+  return entry.second;
 }
 
 /// Get or create a global UTF-16 string constant.
@@ -2585,25 +3072,25 @@ llvm::Constant *IRGenModule::getAddrOfGlobalUTF16String(StringRef utf8) {
   if (entry) return entry;
 
   // If not, first transcode it to UTF16.
-  SmallVector<UTF16, 128> buffer(utf8.size() + 1); // +1 for ending nulls.
-  const UTF8 *fromPtr = (const UTF8 *) utf8.data();
-  UTF16 *toPtr = &buffer[0];
+  SmallVector<llvm::UTF16, 128> buffer(utf8.size() + 1); // +1 for ending nulls.
+  const llvm::UTF8 *fromPtr = (const llvm::UTF8 *) utf8.data();
+  llvm::UTF16 *toPtr = &buffer[0];
   (void) ConvertUTF8toUTF16(&fromPtr, fromPtr + utf8.size(),
                             &toPtr, toPtr + utf8.size(),
-                            strictConversion);
+                            llvm::strictConversion);
 
   // The length of the transcoded string in UTF-8 code points.
   size_t utf16Length = toPtr - &buffer[0];
 
   // Null-terminate the UTF-16 string.
   *toPtr = 0;
-  ArrayRef<UTF16> utf16(&buffer[0], utf16Length + 1);
+  ArrayRef<llvm::UTF16> utf16(&buffer[0], utf16Length + 1);
 
   auto init = llvm::ConstantDataArray::get(LLVMContext, utf16);
   auto global = new llvm::GlobalVariable(Module, init->getType(), true,
                                          llvm::GlobalValue::PrivateLinkage,
                                          init);
-  global->setUnnamedAddr(true);
+  global->setUnnamedAddr(llvm::GlobalValue::UnnamedAddr::Global);
 
   // Drill down to make an i16*.
   auto zero = llvm::ConstantInt::get(SizeTy, 0);
@@ -2616,12 +3103,6 @@ llvm::Constant *IRGenModule::getAddrOfGlobalUTF16String(StringRef utf8) {
   return address;
 }
 
-/// Mangle the name of a type.
-StringRef IRGenModule::mangleType(CanType type, SmallVectorImpl<char> &buffer) {
-  LinkEntity::forTypeMangling(type).mangle(buffer);
-  return StringRef(buffer.data(), buffer.size());
-}
-
 /// Do we have to use resilient access patterns when working with this
 /// declaration?
 ///
@@ -2630,26 +3111,15 @@ StringRef IRGenModule::mangleType(CanType type, SmallVectorImpl<char> &buffer) {
 /// - For enums, new cases can be added
 /// - For classes, the superclass might change the size or number
 ///   of stored properties
-bool IRGenModule::isResilient(Decl *D, ResilienceExpansion expansion) {
-  auto NTD = dyn_cast<NominalTypeDecl>(D);
-  if (!NTD)
-    return false;
-
-  switch (expansion) {
-  case ResilienceExpansion::Maximal:
-    return !NTD->hasFixedLayout(SILMod->getSwiftModule());
-  case ResilienceExpansion::Minimal:
-    return !NTD->hasFixedLayout();
-  }
-
-  llvm_unreachable("Bad resilience scope");
+bool IRGenModule::isResilient(NominalTypeDecl *D, ResilienceExpansion expansion) {
+  return !D->hasFixedLayout(getSwiftModule(), expansion);
 }
 
 // The most general resilience expansion where the given declaration is visible.
 ResilienceExpansion
 IRGenModule::getResilienceExpansionForAccess(NominalTypeDecl *decl) {
-  if (decl->getModuleContext() == SILMod->getSwiftModule() &&
-      decl->getFormalAccess() != Accessibility::Public)
+  if (decl->getModuleContext() == getSwiftModule() &&
+      decl->getEffectiveAccess() < Accessibility::Public)
     return ResilienceExpansion::Maximal;
   return ResilienceExpansion::Minimal;
 }
@@ -2664,9 +3134,19 @@ IRGenModule::getResilienceExpansionForLayout(NominalTypeDecl *decl) {
   return getResilienceExpansionForAccess(decl);
 }
 
+// The most general resilience expansion which has knowledge of the global
+// variable's layout.
+ResilienceExpansion
+IRGenModule::getResilienceExpansionForLayout(SILGlobalVariable *global) {
+  if (hasPublicVisibility(global->getLinkage()))
+    return ResilienceExpansion::Minimal;
+  return ResilienceExpansion::Maximal;
+}
+
 llvm::Constant *IRGenModule::
 getAddrOfGenericWitnessTableCache(const NormalProtocolConformance *conf,
                                   ForDefinition_t forDefinition) {
+  checkEligibleConf(conf);
   auto entity = LinkEntity::forGenericProtocolWitnessTableCache(conf);
   auto expectedTy = getGenericWitnessTableCacheTy();
   auto storageTy = (forDefinition ? expectedTy : nullptr);
@@ -2677,6 +3157,7 @@ getAddrOfGenericWitnessTableCache(const NormalProtocolConformance *conf,
 llvm::Function *
 IRGenModule::getAddrOfGenericWitnessTableInstantiationFunction(
                                       const NormalProtocolConformance *conf) {
+  checkEligibleConf(conf);
   auto forDefinition = ForDefinition;
 
   LinkEntity entity =
@@ -2693,7 +3174,7 @@ IRGenModule::getAddrOfGenericWitnessTableInstantiationFunction(
                                           Int8PtrPtrTy },
                                         /*varargs*/ false);
   LinkInfo link = LinkInfo::get(*this, entity, forDefinition);
-  entry = link.createFunction(*this, fnType, RuntimeCC, llvm::AttributeSet());
+  entry = link.createFunction(*this, fnType, DefaultCC, llvm::AttributeSet());
   return entry;
 }
 
@@ -2701,7 +3182,18 @@ llvm::StructType *IRGenModule::getGenericWitnessTableCacheTy() {
   if (auto ty = GenericWitnessTableCacheTy) return ty;
 
   GenericWitnessTableCacheTy = llvm::StructType::create(getLLVMContext(),
-    { Int16Ty, Int16Ty, RelativeAddressTy, RelativeAddressTy,
+    {
+      // WitnessTableSizeInWords
+      Int16Ty,
+      // WitnessTablePrivateSizeInWords
+      Int16Ty,
+      // Protocol
+      RelativeAddressTy,
+      // Pattern
+      RelativeAddressTy,
+      // Instantiator
+      RelativeAddressTy,
+      // PrivateData
       llvm::ArrayType::get(Int8PtrTy, swift::NumGenericMetadataPrivateDataWords)
     }, "swift.generic_witness_table_cache");
   return GenericWitnessTableCacheTy;
@@ -2712,6 +3204,7 @@ llvm::Function *
 IRGenModule::getAddrOfWitnessTableAccessFunction(
                                       const NormalProtocolConformance *conf,
                                               ForDefinition_t forDefinition) {
+  checkEligibleConf(conf);
   LinkEntity entity = LinkEntity::forProtocolWitnessTableAccessFunction(conf);
   llvm::Function *&entry = GlobalFuncs[entity];
   if (entry) {
@@ -2728,7 +3221,7 @@ IRGenModule::getAddrOfWitnessTableAccessFunction(
   }
 
   LinkInfo link = LinkInfo::get(*this, entity, forDefinition);
-  entry = link.createFunction(*this, fnType, RuntimeCC, llvm::AttributeSet());
+  entry = link.createFunction(*this, fnType, DefaultCC, llvm::AttributeSet());
   return entry;
 }
 
@@ -2738,6 +3231,7 @@ IRGenModule::getAddrOfWitnessTableLazyAccessFunction(
                                       const NormalProtocolConformance *conf,
                                               CanType conformingType,
                                               ForDefinition_t forDefinition) {
+  checkEligibleConf(conf);
   LinkEntity entity =
     LinkEntity::forProtocolWitnessTableLazyAccessFunction(conf, conformingType);
   llvm::Function *&entry = GlobalFuncs[entity];
@@ -2750,7 +3244,7 @@ IRGenModule::getAddrOfWitnessTableLazyAccessFunction(
     = llvm::FunctionType::get(WitnessTablePtrTy, false);
 
   LinkInfo link = LinkInfo::get(*this, entity, forDefinition);
-  entry = link.createFunction(*this, fnType, RuntimeCC, llvm::AttributeSet());
+  entry = link.createFunction(*this, fnType, DefaultCC, llvm::AttributeSet());
   return entry;
 }
 
@@ -2762,6 +3256,7 @@ IRGenModule::getAddrOfWitnessTableLazyCacheVariable(
                                               CanType conformingType,
                                               ForDefinition_t forDefinition) {
   assert(!conformingType->hasArchetype());
+  checkEligibleConf(conf);
   LinkEntity entity =
     LinkEntity::forProtocolWitnessTableLazyCacheVariable(conf, conformingType);
   return getAddrOfLLVMVariable(entity, getPointerAlignment(),
@@ -2778,6 +3273,7 @@ IRGenModule::getAddrOfWitnessTableLazyCacheVariable(
 llvm::Constant*
 IRGenModule::getAddrOfWitnessTable(const NormalProtocolConformance *conf,
                                    llvm::Type *storageTy) {
+  checkEligibleConf(conf);
   auto entity = LinkEntity::forDirectProtocolWitnessTable(conf);
   return getAddrOfLLVMVariable(entity, getPointerAlignment(), storageTy,
                                WitnessTableTy, DebugTypeInfo());
@@ -2787,6 +3283,7 @@ llvm::Function *
 IRGenModule::getAddrOfAssociatedTypeMetadataAccessFunction(
                                   const NormalProtocolConformance *conformance,
                                   AssociatedTypeDecl *associate) {
+  checkEligibleConf(conformance);
   auto forDefinition = ForDefinition;
 
   LinkEntity entity =
@@ -2799,22 +3296,22 @@ IRGenModule::getAddrOfAssociatedTypeMetadataAccessFunction(
 
   auto fnType = getAssociatedTypeMetadataAccessFunctionTy();
   LinkInfo link = LinkInfo::get(*this, entity, forDefinition);
-  entry = link.createFunction(*this, fnType, RuntimeCC, llvm::AttributeSet());
+  entry = link.createFunction(*this, fnType, DefaultCC, llvm::AttributeSet());
   return entry;
 }
 
 llvm::Function *
 IRGenModule::getAddrOfAssociatedTypeWitnessTableAccessFunction(
                                   const NormalProtocolConformance *conformance,
-                                  AssociatedTypeDecl *associate,
-                                  ProtocolDecl *associateProtocol) {
+                                  CanType associatedType,
+                                  ProtocolDecl *associatedProtocol) {
+  checkEligibleConf(conformance);
   auto forDefinition = ForDefinition;
 
-  assert(conformance->getProtocol() == associate->getProtocol());
   LinkEntity entity =
     LinkEntity::forAssociatedTypeWitnessTableAccessFunction(conformance,
-                                                            associate,
-                                                            associateProtocol);
+                                                            associatedType,
+                                                            associatedProtocol);
   llvm::Function *&entry = GlobalFuncs[entity];
   if (entry) {
     if (forDefinition) updateLinkageForDefinition(*this, entry, entity);
@@ -2823,7 +3320,7 @@ IRGenModule::getAddrOfAssociatedTypeWitnessTableAccessFunction(
 
   auto fnType = getAssociatedTypeWitnessTableAccessFunctionTy();
   LinkInfo link = LinkInfo::get(*this, entity, forDefinition);
-  entry = link.createFunction(*this, fnType, RuntimeCC, llvm::AttributeSet());
+  entry = link.createFunction(*this, fnType, DefaultCC, llvm::AttributeSet());
   return entry;
 }
 
@@ -2836,8 +3333,9 @@ static llvm::Function *shouldDefineHelper(IRGenModule &IGM,
 
   def->setLinkage(llvm::Function::LinkOnceODRLinkage);
   def->setVisibility(llvm::Function::HiddenVisibility);
+  def->setDLLStorageClass(llvm::GlobalVariable::DefaultStorageClass);
   def->setDoesNotThrow();
-  def->setCallingConv(IGM.RuntimeCC);
+  def->setCallingConv(IGM.DefaultCC);
   return def;
 }
 

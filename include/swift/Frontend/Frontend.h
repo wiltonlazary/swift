@@ -2,11 +2,11 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2016 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 //
@@ -47,6 +47,15 @@ namespace swift {
 
 class SerializedModuleLoader;
 
+/// The abstract configuration of the compiler, including:
+///   - options for all stages of translation,
+///   - information about the build environment,
+///   - information about the job being performed, and
+///   - lists of inputs.
+///
+/// A CompilerInvocation can be built from a frontend command line
+/// using parseArgs.  It can then be used to build a CompilerInstance,
+/// which manages the actual compiler execution.
 class CompilerInvocation {
   LangOptions LangOpts;
   FrontendOptions FrontendOpts;
@@ -124,11 +133,12 @@ public:
     return SearchPathOpts.ImportSearchPaths;
   }
 
-  void setFrameworkSearchPaths(const std::vector<std::string> &Paths) {
+  void setFrameworkSearchPaths(
+             const std::vector<SearchPathOptions::FrameworkSearchPath> &Paths) {
     SearchPathOpts.FrameworkSearchPaths = Paths;
   }
 
-  ArrayRef<std::string> getFrameworkSearchPaths() const {
+  ArrayRef<SearchPathOptions::FrameworkSearchPath> getFrameworkSearchPaths() const {
     return SearchPathOpts.FrameworkSearchPaths;
   }
 
@@ -254,6 +264,8 @@ public:
     assert(Buf);
     CodeCompletionBuffer = Buf;
     CodeCompletionOffset = Offset;
+    // We don't need typo-correction for code-completion.
+    LangOpts.DisableTypoCorrection = true;
   }
 
   std::pair<llvm::MemoryBuffer *, unsigned> getCodeCompletionPoint() const {
@@ -267,8 +279,6 @@ public:
 
   void setCodeCompletionFactory(CodeCompletionCallbacksFactory *Factory) {
     CodeCompletionFactory = Factory;
-    if (Factory)
-      LangOpts.EnableCodeCompletionDelayedEnumConformanceHack = true;
   }
 
   CodeCompletionCallbacksFactory *getCodeCompletionFactory() const {
@@ -284,6 +294,14 @@ public:
   }
 };
 
+/// A class which manages the state and execution of the compiler.
+/// This owns the primary compiler singletons, such as the ASTContext,
+/// as well as various build products such as the SILModule.
+///
+/// Before a CompilerInstance can be used, it must be configured by
+/// calling \a setup.  If successful, this will create an ASTContext
+/// and set up the basic compiler invariants.  Calling \a setup multiple
+/// times on a single CompilerInstance is not permitted.
 class CompilerInstance {
   CompilerInvocation Invocation;
   SourceManager SourceMgr;
@@ -294,7 +312,7 @@ class CompilerInstance {
   DependencyTracker *DepTracker = nullptr;
   ReferencedNameTracker *NameTracker = nullptr;
 
-  Module *MainModule = nullptr;
+  ModuleDecl *MainModule = nullptr;
   SerializedModuleLoader *SML = nullptr;
 
   /// Contains buffer IDs for input source code files.
@@ -370,7 +388,7 @@ public:
     return static_cast<bool>(TheSILModule);
   }
 
-  Module *getMainModule();
+  ModuleDecl *getMainModule();
 
   SerializedModuleLoader *getSerializedModuleLoader() const { return SML; }
 

@@ -2,16 +2,15 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2016 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 
 #include "swift/IDE/Utils.h"
-#include "swift/Basic/Fallthrough.h"
 #include "swift/Basic/SourceManager.h"
 #include "swift/ClangImporter/ClangModule.h"
 #include "swift/Frontend/Frontend.h"
@@ -22,8 +21,10 @@
 #include "clang/CodeGen/ObjectFilePCHContainerOperations.h"
 #include "clang/Frontend/CompilerInstance.h"
 #include "clang/Frontend/TextDiagnosticBuffer.h"
+#include "clang/Lex/PreprocessorOptions.h"
 #include "clang/Serialization/ASTReader.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/Support/Compiler.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/Path.h"
 
@@ -202,6 +203,14 @@ static std::string adjustClangTriple(StringRef TripleStr) {
     OS << "armv7s"; break;
   case llvm::Triple::SubArchType::ARMSubArch_v7k:
     OS << "armv7k"; break;
+  case llvm::Triple::SubArchType::ARMSubArch_v6:
+    OS << "armv6"; break;
+  case llvm::Triple::SubArchType::ARMSubArch_v6m:
+    OS << "armv6m"; break;
+  case llvm::Triple::SubArchType::ARMSubArch_v6k:
+    OS << "armv6k"; break;
+  case llvm::Triple::SubArchType::ARMSubArch_v6t2:
+    OS << "armv6t2"; break;
   default:
     // Adjust i386-macosx to x86_64 because there is no Swift stdlib for i386.
     if ((Triple.getOS() == llvm::Triple::MacOSX ||
@@ -230,10 +239,15 @@ bool ide::initInvocationByClangArguments(ArrayRef<const char *> ArgList,
                                                &DiagBuf,
                                                /*ShouldOwnClient=*/false);
 
+  // Clang expects this to be like an actual command line. So we need to pass in
+  // "clang" for argv[0].
+  std::vector<const char *> ClangArgList;
+  ClangArgList.push_back("clang");
+  ClangArgList.insert(ClangArgList.end(), ArgList.begin(), ArgList.end());
+
   // Create a new Clang compiler invocation.
-  llvm::IntrusiveRefCntPtr<clang::CompilerInvocation> ClangInvok{
-    clang::createInvocationFromCommandLine(ArgList, ClangDiags)
-  };
+  std::unique_ptr<clang::CompilerInvocation> ClangInvok =
+      clang::createInvocationFromCommandLine(ClangArgList, ClangDiags);
   if (!ClangInvok || ClangDiags->hasErrorOccurred()) {
     for (auto I = DiagBuf.err_begin(), E = DiagBuf.err_end(); I != E; ++I) {
       Error += I->second;
@@ -270,7 +284,7 @@ bool ide::initInvocationByClangArguments(ArrayRef<const char *> ArgList,
         break;
       case clang::frontend::IndexHeaderMap:
         CCArgs.push_back("-index-header-map");
-        SWIFT_FALLTHROUGH;
+        LLVM_FALLTHROUGH;
       case clang::frontend::Angled: {
         std::string Flag;
         if (Entry.IsFramework)
@@ -327,11 +341,12 @@ bool ide::initInvocationByClangArguments(ArrayRef<const char *> ArgList,
     CCArgs.push_back(Entry);
   }
 
-  if (!ClangInvok->getLangOpts()->ImplementationOfModule.empty()) {
+  if (!ClangInvok->getLangOpts()->isCompilingModule()) {
     CCArgs.push_back("-Xclang");
-    CCArgs.push_back("-fmodule-implementation-of");
-    CCArgs.push_back("-Xclang");
-    CCArgs.push_back(ClangInvok->getLangOpts()->ImplementationOfModule);
+    llvm::SmallString<64> Str;
+    Str += "-fmodule-name=";
+    Str += ClangInvok->getLangOpts()->CurrentModule;
+    CCArgs.push_back(Str.str());
   }
 
   if (PPOpts.DetailedRecord) {
@@ -764,3 +779,33 @@ void ide::collectModuleNames(StringRef SDKPath,
   }
 }
 
+DeclNameViewer::DeclNameViewer(StringRef Text) {
+  auto ArgStart = Text.find_first_of('(');
+  if (ArgStart == StringRef::npos) {
+    BaseName = Text;
+    return;
+  }
+  BaseName = Text.substr(0, ArgStart);
+  auto ArgEnd = Text.find_last_of(')');
+  assert(ArgEnd != StringRef::npos);
+  StringRef AllArgs = Text.substr(ArgStart + 1, ArgEnd - ArgStart - 1);
+  AllArgs.split(Labels, ":");
+  if (Labels.empty())
+    return;
+  assert(Labels.back().empty());
+  Labels.pop_back();
+}
+
+unsigned DeclNameViewer::commonPartsCount(DeclNameViewer &Other) const {
+  if (base() != Other.base())
+    return 0;
+  unsigned Result = 1;
+  unsigned Len = std::min(args().size(), Other.args().size());
+  for (unsigned I = 0; I < Len; ++ I) {
+    if (args()[I] == Other.args()[I])
+      Result ++;
+    else
+      return Result;
+  }
+  return Result;
+}

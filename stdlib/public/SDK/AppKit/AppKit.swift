@@ -2,105 +2,50 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2016 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 
 import Foundation
 @_exported import AppKit
 
-struct _NSCursorMirror : _MirrorType {
-  var _value: NSCursor
-
-  init(_ v: NSCursor) { _value = v }
-
-  var value: Any { return _value }
-
-  var valueType: Any.Type { return (_value as Any).dynamicType }
-
-  var objectIdentifier: ObjectIdentifier? { return .None }
-
-  var count: Int { return 0 }
-
-  subscript(_: Int) -> (String, _MirrorType) {
-    _preconditionFailure("_MirrorType access out of bounds")
-  }
-
-  var summary: String { return "" }
-
-  var quickLookObject: PlaygroundQuickLook? {
-    return .Some(.Image(_value.image))
-  }
-  
-  var disposition : _MirrorDisposition { return .Aggregate }
-}
-
-extension NSCursor : _Reflectable {
-  public func _getMirror() -> _MirrorType {
-    return _NSCursorMirror(self)
+extension NSCursor : _DefaultCustomPlaygroundQuickLookable {
+  public var _defaultCustomPlaygroundQuickLook: PlaygroundQuickLook {
+    return .image(image)
   }
 }
 
-struct _NSViewMirror : _MirrorType {
-  static var _views = Set<NSView>()
+internal struct _NSViewQuickLookState {
+  static var views = Set<NSView>()
+}
 
-  var _v : NSView
-  
-  init(_ v : NSView) { _v = v }
-  
-  var value: Any { return _v }
-  
-  var valueType: Any.Type { return (_v as Any).dynamicType }
-  
-  var objectIdentifier: ObjectIdentifier? { return .None }
-  
-  var count: Int { return 0 }
-  
-  subscript(_: Int) -> (String, _MirrorType) {
-    _preconditionFailure("_MirrorType access out of bounds")
-  }
-  
-  var summary: String { return "" }
-  
-  var quickLookObject: PlaygroundQuickLook? {
-    // adapted from the Xcode QuickLooks implementation
-    
-    var result: PlaygroundQuickLook? = nil
-    
+extension NSView : _DefaultCustomPlaygroundQuickLookable {
+  public var _defaultCustomPlaygroundQuickLook: PlaygroundQuickLook {
     // if you set NSView.needsDisplay, you can get yourself in a recursive scenario where the same view
     // could need to draw itself in order to get a QLObject for itself, which in turn if your code was
     // instrumented to log on-draw, would cause yourself to get back here and so on and so forth
     // until you run out of stack and crash
     // This code checks that we aren't trying to log the same view recursively - and if so just returns
-    // nil, which is probably a safer option than crashing
+    // an empty view, which is probably a safer option than crashing
     // FIXME: is there a way to say "cacheDisplayInRect butDoNotRedrawEvenIfISaidSo"?
-    if !_NSViewMirror._views.contains(_v) {
-      _NSViewMirror._views.insert(_v)
-      
-      let bounds = _v.bounds
-      if let b = _v.bitmapImageRepForCachingDisplayInRect(bounds) {
-        _v.cacheDisplayInRect(bounds, toBitmapImageRep: b)
-        result = .Some(.View(b))
+    if _NSViewQuickLookState.views.contains(self) {
+      return .view(NSImage())
+    } else {
+      _NSViewQuickLookState.views.insert(self)
+      let result: PlaygroundQuickLook
+      if let b = bitmapImageRepForCachingDisplay(in: bounds) {
+        cacheDisplay(in: bounds, to: b)
+        result = .view(b)
+      } else {
+        result = .view(NSImage())
       }
-      
-      _NSViewMirror._views.remove(_v)
+      _NSViewQuickLookState.views.remove(self)
+      return result
     }
-    
-    return result
-    
-  }
-  
-  var disposition : _MirrorDisposition { return .Aggregate }
-}
-
-extension NSView : _Reflectable {
-  /// Returns a mirror that reflects `self`.
-  public func _getMirror() -> _MirrorType {
-    return _NSViewMirror(self)
   }
 }
 
@@ -111,35 +56,91 @@ public extension NSGradient {
     self.init(
       colors: objects.map { $0.0 },
       atLocations: objects.map { $0.1 },
-      colorSpace: NSColorSpace.genericRGBColorSpace())
+      colorSpace: NSColorSpace.genericRGB)
   }
 }
 
 // Fix the ARGV type of NSApplicationMain, which nonsensically takes
 // argv as a const char**.
-@_silgen_name("NSApplicationMain")
 public func NSApplicationMain(
-  argc: Int32, _ argv: UnsafeMutablePointer<UnsafeMutablePointer<CChar>>
-) -> Int32
+  _ argc: Int32, _ argv: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>
+) -> Int32 {
+  return argv.withMemoryRebound(to: UnsafePointer<CChar>.self, capacity: Int(argc)) {
+    __NSApplicationMain(argc, $0)
+  }
+}
 
-extension NSColor : _ColorLiteralConvertible {
+extension NSColor : _ExpressibleByColorLiteral {
   public required convenience init(colorLiteralRed red: Float, green: Float,
                                    blue: Float, alpha: Float) {
-    self.init(SRGBRed: CGFloat(red), green: CGFloat(green),
+    self.init(srgbRed: CGFloat(red), green: CGFloat(green),
               blue: CGFloat(blue), alpha: CGFloat(alpha))
   }
 }
 
 public typealias _ColorLiteralType = NSColor
 
-extension NSImage : _ImageLiteralConvertible {
+extension NSImage : _ExpressibleByImageLiteral {
   private convenience init!(failableImageLiteral name: String) {
     self.init(named: name)
   }
 
-  public required convenience init(imageLiteral name: String) {
+  public required convenience init(imageLiteralResourceName name: String) {
     self.init(failableImageLiteral: name)
   }
 }
 
 public typealias _ImageLiteralType = NSImage
+
+// Renaming shims.
+extension NSObjectController {
+  @available(*, deprecated, renamed: "addObject(_:)")
+  @nonobjc func add(_ object: AnyObject) {
+    self.addObject(object)
+  }
+
+  @available(*, deprecated, renamed: "removeObject(_:)")
+  @nonobjc func remove(_ object: AnyObject) {
+    self.removeObject(object)
+  }
+}
+
+extension NSViewController {
+  @available(OSX 10.10, *)
+  @available(*, deprecated, renamed: "presentViewController(_:animator:)")
+  @nonobjc func present(_ viewController: NSViewController, animator: NSViewControllerPresentationAnimator) {
+    self.presentViewController(viewController, animator: animator)
+  }
+
+  @available(OSX 10.10, *)
+  @available(*, deprecated, renamed: "dismissViewController(_:)")
+  @nonobjc func dismiss(_ viewController: NSViewController) {
+    self.dismissViewController(viewController)
+  }
+
+  @available(OSX 10.10, *)
+  @available(*, deprecated, renamed: "presentViewControllerAsSheet(_:)")
+  @nonobjc func present(asSheet viewController: NSViewController) {
+    self.presentViewControllerAsSheet(viewController)
+  }
+
+  @available(OSX 10.10, *)
+  @available(*, deprecated, renamed: "presentViewControllerAsModalWindow(_:)")
+  @nonobjc func present(asModalWindow viewController: NSViewController) {
+    self.presentViewControllerAsModalWindow(viewController)
+  }
+
+  @available(OSX 10.10, *)
+  @available(*, deprecated, renamed: "presentViewController(_:asPopoverRelativeTo:of:preferredEdge:behavior:)")
+  @nonobjc func present(_ viewController: NSViewController, asPopoverRelativeTo positioningRect: NSRect, of positioningView: NSView, preferredEdge: NSRectEdge, behavior: NSPopoverBehavior) {
+    self.presentViewController(viewController, asPopoverRelativeTo: positioningRect, of: positioningView, preferredEdge: preferredEdge, behavior: behavior)
+  }
+}
+
+extension NSWindowController {
+  @available(OSX 10.10, *)
+  @available(*, deprecated, renamed: "dismissController(_:)")
+  @nonobjc func dismiss(_ sender: AnyObject?) {
+    self.dismissController(sender)
+  }
+}

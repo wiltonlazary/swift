@@ -2,11 +2,11 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2016 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 
@@ -27,7 +27,7 @@
 #include "swift/Subsystems.h"
 #include "swift/SILOptimizer/PassManager/Passes.h"
 // This is included only for createLazyResolver(). Move to different header ?
-#include "swift/Sema/CodeCompletionTypeChecking.h"
+#include "swift/Sema/IDETypeChecking.h"
 
 #include "llvm/ADT/FoldingSet.h"
 #include "llvm/Support/FileSystem.h"
@@ -57,7 +57,7 @@ public:
     OS << Text;
   }
 };
-} // anonymous namespace.
+} // end anonymous namespace
 
 void SwiftASTConsumer::failed(StringRef Error) { }
 
@@ -101,7 +101,7 @@ struct ASTKey {
   llvm::FoldingSetNodeID FSID;
 };
 
-} // anonymous namespace.
+} // end anonymous namespace
 
 struct SwiftInvocation::Implementation {
   InvocationOptions Opts;
@@ -209,6 +209,10 @@ namespace SourceKit {
   EditorDiagConsumer &ASTUnit::getEditorDiagConsumer() const {
     return Impl.CollectDiagConsumer;
   }
+
+  void ASTUnit::performAsync(std::function<void()> Fn) {
+    Impl.Queue.dispatch(std::move(Fn));
+  }
 }
 
 namespace {
@@ -274,7 +278,7 @@ private:
 
 typedef IntrusiveRefCntPtr<ASTProducer> ASTProducerRef;
 
-} // anonymous namespace.
+} // end anonymous namespace
 
 namespace swift {
 namespace sys {
@@ -297,7 +301,7 @@ struct CacheKeyHashInfo<ASTKey> {
 };
 
 } // namespace sys
-} // namespace swift.
+} // namespace swift
 
 struct SwiftASTManager::Implementation {
   explicit Implementation(SwiftLangSupport &LangSupport)
@@ -365,6 +369,9 @@ static void sanitizeCompilerArgs(ArrayRef<const char *> Args,
     if (Arg == "-Xfrontend")
       continue;
     if (Arg == "-embed-bitcode")
+      continue;
+    if (Arg == "-enable-bridging-pch" ||
+        Arg == "-disable-bridging-pch")
       continue;
     NewArgs.push_back(CArg);
   }
@@ -539,7 +546,7 @@ BufferStamp SwiftASTManager::Implementation::getBufferStamp(StringRef FilePath){
                   << " (" << Ret.message() << ')');
     return -1;
   }
-  return Status.getLastModificationTime().toEpochTime();
+  return Status.getLastModificationTime().time_since_epoch().count();
 }
 
 std::unique_ptr<llvm::MemoryBuffer>
@@ -663,19 +670,19 @@ bool ASTProducer::shouldRebuild(SwiftASTManager::Implementation &MgrImpl,
   return false;
 }
 
-static void collectModuleDependencies(Module *TopMod,
-    llvm::SmallPtrSetImpl<Module *> &Visited,
+static void collectModuleDependencies(ModuleDecl *TopMod,
+    llvm::SmallPtrSetImpl<ModuleDecl *> &Visited,
     SmallVectorImpl<std::string> &Filenames) {
 
   if (!TopMod)
     return;
 
   auto ClangModuleLoader = TopMod->getASTContext().getClangModuleLoader();
-  SmallVector<Module::ImportedModule, 8> Imports;
-  TopMod->getImportedModules(Imports, Module::ImportFilter::All);
+  SmallVector<ModuleDecl::ImportedModule, 8> Imports;
+  TopMod->getImportedModules(Imports, ModuleDecl::ImportFilter::All);
 
   for (auto Import : Imports) {
-    Module *Mod = Import.second;
+    ModuleDecl *Mod = Import.second;
     if (Mod->isSystemModule())
       continue;
     // FIXME: Setup dependencies on the included headers.
@@ -795,7 +802,7 @@ ASTUnitRef ASTProducer::createASTUnit(SwiftASTManager::Implementation &MgrImpl,
   Consumer.setInputBufferIDs(ASTRef->getCompilerInstance().getInputBufferIDs());
   CompIns.performSema();
 
-  llvm::SmallPtrSet<Module *, 16> Visited;
+  llvm::SmallPtrSet<ModuleDecl *, 16> Visited;
   SmallVector<std::string, 8> Filenames;
   collectModuleDependencies(CompIns.getMainModule(), Visited, Filenames);
   // FIXME: There exists a small window where the module file may have been
@@ -820,7 +827,7 @@ ASTUnitRef ASTProducer::createASTUnit(SwiftASTManager::Implementation &MgrImpl,
     // but still allow SILGen'ing the first function ?
     // Or try to keep track of SIL diagnostics emitted previously ?
 
-    // FIXME: We should run SIL diagnostis asynchronously after typechecking
+    // FIXME: We should run SIL diagnostics asynchronously after typechecking
     // so that they don't delay reporting of typechecking diagnostics and they
     // don't block any other AST processing for the same SwiftInvocation.
 

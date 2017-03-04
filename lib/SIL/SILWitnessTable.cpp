@@ -2,11 +2,11 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2016 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 //
@@ -21,6 +21,8 @@
 
 #include "swift/SIL/SILWitnessTable.h"
 #include "swift/AST/Mangle.h"
+#include "swift/AST/ASTMangler.h"
+#include "swift/AST/ProtocolConformance.h"
 #include "swift/SIL/SILModule.h"
 #include "llvm/ADT/SmallString.h"
 
@@ -34,8 +36,21 @@ static std::string mangleConstant(NormalProtocolConformance *C) {
   //   global ::= 'WP' protocol-conformance
   mangler.append("_TWP");
   mangler.mangleProtocolConformance(C);
-  return mangler.finalize();
+  std::string Old = mangler.finalize();
 
+  NewMangling::ASTMangler NewMangler;
+  std::string New = NewMangler.mangleWitnessTable(C);
+
+  return NewMangling::selectMangling(Old, New);
+}
+
+void SILWitnessTable::addWitnessTable() {
+  // Make sure we have not seen this witness table yet.
+  assert(Mod.WitnessTableMap.find(Conformance) ==
+         Mod.WitnessTableMap.end() && "Attempting to create duplicate "
+         "witness table.");
+  Mod.WitnessTableMap[Conformance] = this;
+  Mod.witnessTables.push_back(this);
 }
 
 SILWitnessTable *
@@ -53,12 +68,7 @@ SILWitnessTable::create(SILModule &M, SILLinkage Linkage, bool IsFragile,
   SILWitnessTable *wt = ::new (buf) SILWitnessTable(M, Linkage, IsFragile,
                                            Name.str(), Conformance, entries);
 
-  // Make sure we have not seen this witness table yet.
-  assert(M.WitnessTableLookupCache.find(Conformance) ==
-         M.WitnessTableLookupCache.end() && "Attempting to create duplicate "
-         "witness table.");
-  M.WitnessTableLookupCache[Conformance] = wt;
-  M.witnessTables.push_back(wt);
+  wt->addWitnessTable();
 
   // Return the resulting witness table.
   return wt;
@@ -79,12 +89,7 @@ SILWitnessTable::create(SILModule &M, SILLinkage Linkage,
   SILWitnessTable *wt = ::new (buf) SILWitnessTable(M, Linkage, Name.str(),
                                                     Conformance);
 
-  // Update the SILModule state in light of wT.
-  assert(M.WitnessTableLookupCache.find(Conformance) ==
-         M.WitnessTableLookupCache.end() && "Attempting to create duplicate "
-         "witness table.");
-  M.WitnessTableLookupCache[Conformance] = wt;
-  M.witnessTables.push_back(wt);
+  wt->addWitnessTable();
 
   // Return the resulting witness table.
   return wt;
@@ -133,9 +138,7 @@ void SILWitnessTable::convertToDefinition(ArrayRef<Entry> entries,
   IsDeclaration = false;
   IsFragile = isFragile;
 
-  void *buf = Mod.allocate(sizeof(Entry)*entries.size(), alignof(Entry));
-  memcpy(buf, entries.begin(), sizeof(Entry)*entries.size());
-  Entries = MutableArrayRef<Entry>(static_cast<Entry*>(buf), entries.size());
+  Entries = Mod.allocateCopy(entries);
 
   // Bump the reference count of witness functions referenced by this table.
   for (auto entry : getEntries()) {

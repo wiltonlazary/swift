@@ -2,11 +2,11 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2016 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 #define DEBUG_TYPE "array-count-propagation"
@@ -59,7 +59,7 @@ class ArrayAllocation {
 
   bool propagate();
   bool isInitializationWithKnownCount();
-  bool analyseArrayValueUses();
+  bool analyzeArrayValueUses();
   bool recursivelyCollectUses(ValueBase *Def);
   bool propagateCountToUsers();
 
@@ -69,7 +69,7 @@ public:
     return ArrayAllocation(Inst, DeadCalls).propagate();
   }
 };
-}
+} // end anonymous namespace
 
 /// Propagate the count of an array created to count method calls on the same
 /// array.
@@ -81,7 +81,7 @@ bool ArrayAllocation::propagate() {
     return false;
 
   // The array value was stored or has escaped.
-  if (!analyseArrayValueUses())
+  if (!analyzeArrayValueUses())
     return false;
 
   // No count users.
@@ -113,21 +113,8 @@ bool ArrayAllocation::isInitializationWithKnownCount() {
 
 /// Collect all getCount users and check that there are no escapes or uses that
 /// could change the array value.
-bool ArrayAllocation::analyseArrayValueUses() {
-  return recursivelyCollectUses(ArrayValue.getDef());
-}
-
-static bool doesNotChangeArrayCount(ArraySemanticsCall &C) {
-  switch (C.getKind()) {
-  default: return false;
-  case ArrayCallKind::kArrayPropsIsNativeTypeChecked:
-  case ArrayCallKind::kCheckSubscript:
-  case ArrayCallKind::kCheckIndex:
-  case ArrayCallKind::kGetCount:
-  case ArrayCallKind::kGetCapacity:
-  case ArrayCallKind::kGetElement:
-    return true;
-  }
+bool ArrayAllocation::analyzeArrayValueUses() {
+  return recursivelyCollectUses(ArrayValue);
 }
 
 /// Recursively look at all uses of this definition. Abort if the array value
@@ -148,7 +135,7 @@ bool ArrayAllocation::recursivelyCollectUses(ValueBase *Def) {
 
     // Check array semantic calls.
     ArraySemanticsCall ArrayOp(User);
-    if (ArrayOp && doesNotChangeArrayCount(ArrayOp)) {
+    if (ArrayOp && ArrayOp.doesNotChangeArray()) {
       if (ArrayOp.getKind() == ArrayCallKind::kGetCount)
         CountCalls.insert(ArrayOp);
       continue;
@@ -169,7 +156,7 @@ bool ArrayAllocation::propagateCountToUsers() {
 
     SmallVector<Operand *, 16> Uses;
     for (auto *Op : Count->getUses()) {
-      if (Op->get().getType() == ArrayCount.getType()) {
+      if (Op->get()->getType() == ArrayCount->getType()) {
         Uses.push_back(Op);
       }
     }
@@ -180,7 +167,7 @@ bool ArrayAllocation::propagateCountToUsers() {
       HasChanged = true;
     }
 
-    if (HasChanged && hasNoUsesExceptDebug(Count))
+    if (HasChanged && onlyHaveDebugUses(Count))
       DeadArrayCountCalls.push_back(Count);
   }
   return HasChanged;
@@ -222,7 +209,7 @@ public:
   }
 };
 
-} // anonymous namespace.
+} // end anonymous namespace
 
 SILTransform *swift::createArrayCountPropagation() {
   return new ArrayCountPropagation();

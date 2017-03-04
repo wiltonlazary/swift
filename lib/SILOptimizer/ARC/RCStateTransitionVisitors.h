@@ -2,11 +2,11 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2016 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 //
@@ -22,6 +22,7 @@
 #include "ARCBBState.h"
 #include "ARCRegionState.h"
 #include "RCStateTransition.h"
+#include "swift/Basic/ImmutablePointerSet.h"
 #include "swift/Basic/BlotMapVector.h"
 
 //===----------------------------------------------------------------------===//
@@ -35,6 +36,7 @@ namespace swift {
 template <typename ImplTy, typename ResultTy>
 class RCStateTransitionKindVisitor {
   ImplTy &asImpl() { return *reinterpret_cast<ImplTy *>(this); }
+
 public:
 #define KIND(K) ResultTy visit ## K(ValueBase *) { return ResultTy(); }
 #include "RCStateTransition.def"
@@ -112,18 +114,20 @@ class BottomUpDataflowRCStateVisitor
   using IncToDecStateMapTy =
       BlotMapVector<SILInstruction *, BottomUpRefCountState>;
 
+public:
   RCIdentityFunctionInfo *RCFI;
+  EpilogueARCFunctionInfo *EAFI;
   ARCState &DataflowState;
   bool FreezeOwnedArgEpilogueReleases;
-  ConsumedArgToEpilogueReleaseMatcher &EpilogueReleaseMatcher;
   BlotMapVector<SILInstruction *, BottomUpRefCountState> &IncToDecStateMap;
+  ImmutablePointerSetFactory<SILInstruction> &SetFactory;
 
 public:
-  BottomUpDataflowRCStateVisitor(RCIdentityFunctionInfo *RCFI,
-                                 ARCState &DataflowState,
-                                 bool FreezeOwnedArgEpilogueReleases,
-                                 ConsumedArgToEpilogueReleaseMatcher &ERM,
-                                 IncToDecStateMapTy &IncToDecStateMap);
+  BottomUpDataflowRCStateVisitor(
+      RCIdentityFunctionInfo *RCFI, EpilogueARCFunctionInfo *EAFI,
+      ARCState &DataflowState, bool FreezeOwnedArgEpilogueReleases,
+      IncToDecStateMapTy &IncToDecStateMap,
+      ImmutablePointerSetFactory<SILInstruction> &SetFactory);
   DataflowResult visitAutoreleasePoolCall(ValueBase *V);
   DataflowResult visitStrongDecrement(ValueBase *V);
   DataflowResult visitStrongIncrement(ValueBase *V);
@@ -152,11 +156,13 @@ class TopDownDataflowRCStateVisitor
   RCIdentityFunctionInfo *RCFI;
   ARCState &DataflowState;
   DecToIncStateMapTy &DecToIncStateMap;
+  ImmutablePointerSetFactory<SILInstruction> &SetFactory;
 
 public:
-  TopDownDataflowRCStateVisitor(RCIdentityFunctionInfo *RCFI,
-                                ARCState &State,
-                                DecToIncStateMapTy &DecToIncStateMap);
+  TopDownDataflowRCStateVisitor(
+      RCIdentityFunctionInfo *RCFI, ARCState &State,
+      DecToIncStateMapTy &DecToIncStateMap,
+      ImmutablePointerSetFactory<SILInstruction> &SetFactory);
   DataflowResult visitAutoreleasePoolCall(ValueBase *V);
   DataflowResult visitStrongDecrement(ValueBase *V);
   DataflowResult visitStrongIncrement(ValueBase *V);
@@ -164,7 +170,7 @@ public:
 
 private:
   DataflowResult visitStrongEntranceApply(ApplyInst *AI);
-  DataflowResult visitStrongEntranceArgument(SILArgument *Arg);
+  DataflowResult visitStrongEntranceArgument(SILFunctionArgument *Arg);
   DataflowResult visitStrongEntranceAllocRef(AllocRefInst *ARI);
   DataflowResult visitStrongEntranceAllocRefDynamic(AllocRefDynamicInst *ARI);
   DataflowResult visitStrongAllocBox(AllocBoxInst *ABI);

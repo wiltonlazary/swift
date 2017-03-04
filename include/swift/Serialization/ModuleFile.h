@@ -2,18 +2,17 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2016 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 
 #ifndef SWIFT_SERIALIZATION_MODULEFILE_H
 #define SWIFT_SERIALIZATION_MODULEFILE_H
 
-#include "swift/AST/Decl.h"
 #include "swift/AST/Identifier.h"
 #include "swift/AST/LazyResolver.h"
 #include "swift/AST/LinkLibrary.h"
@@ -25,7 +24,6 @@
 #include "swift/Basic/LLVM.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseMap.h"
-#include "llvm/ADT/Fixnum.h"
 #include "llvm/ADT/TinyPtrVector.h"
 #include "llvm/Bitcode/BitstreamReader.h"
 #include "llvm/Support/MemoryBuffer.h"
@@ -38,29 +36,27 @@ namespace llvm {
 }
 
 namespace swift {
+class Decl;
+class FileUnit;
+class ModuleDecl;
 class Pattern;
 class ProtocolConformance;
 
 /// A serialized module, along with the tools to access it.
 class ModuleFile : public LazyMemberLoader {
   friend class SerializedASTFile;
+  friend class SILDeserializer;
   using Status = serialization::Status;
 
   /// A reference back to the AST representation of the file.
   FileUnit *FileContext = nullptr;
 
   /// The module shadowed by this module, if any.
-  Module *ShadowedModule = nullptr;
+  ModuleDecl *ShadowedModule = nullptr;
 
   /// The module file data.
   std::unique_ptr<llvm::MemoryBuffer> ModuleInputBuffer;
   std::unique_ptr<llvm::MemoryBuffer> ModuleDocInputBuffer;
-
-  /// The reader attached to \c ModuleInputBuffer.
-  llvm::BitstreamReader ModuleInputReader;
-
-  /// The reader attached to \c ModuleDocInputBuffer.
-  llvm::BitstreamReader ModuleDocInputReader;
 
   /// The cursor used to lazily load things from the file.
   llvm::BitstreamCursor DeclTypeCursor;
@@ -70,6 +66,7 @@ class ModuleFile : public LazyMemberLoader {
 
   /// The name of the module.
   StringRef Name;
+  friend StringRef getNameOfModule(const ModuleFile *);
 
   /// The target the module was built for.
   StringRef TargetTriple;
@@ -77,11 +74,49 @@ class ModuleFile : public LazyMemberLoader {
   /// The data blob containing all of the module's identifiers.
   StringRef IdentifierData;
 
+  /// A callback to be invoked every time a type was deserialized.
+  std::function<void(Type)> DeserializedTypeCallback;
+
+  /// The number of entities that are currently being deserialized.
+  unsigned NumCurrentDeserializingEntities = 0;
+
+  /// Declaration contexts with delayed generic environments, which will be
+  /// completed as a pending action.
+  ///
+  /// FIXME: This is needed because completing a generic environment can
+  /// require the type checker, which might be gone if we delay generic
+  /// environments too far. It is a hack.
+  std::vector<DeclContext *> DelayedGenericEnvironments;
+
+  /// RAII class to be used when deserializing an entity.
+  class DeserializingEntityRAII {
+    ModuleFile &MF;
+
+  public:
+    DeserializingEntityRAII(ModuleFile &MF) : MF(MF) {
+      ++MF.NumCurrentDeserializingEntities;
+    }
+    ~DeserializingEntityRAII() {
+      assert(MF.NumCurrentDeserializingEntities > 0 &&
+             "Imbalanced currently-deserializing count?");
+      if (MF.NumCurrentDeserializingEntities == 1) {
+        MF.finishPendingActions();
+      }
+
+      --MF.NumCurrentDeserializingEntities;
+    }
+  };
+  friend class DeserializingEntityRAII;
+
+  /// Finish any pending actions that were waiting for the topmost entity to
+  /// be deserialized.
+  void finishPendingActions();
+
 public:
   /// Represents another module that has been imported as a dependency.
   class Dependency {
   public:
-    Module::ImportedModule Import = {};
+    ModuleDecl::ImportedModule Import = {};
     const StringRef RawPath;
 
   private:
@@ -118,11 +153,16 @@ private:
   /// All modules this module depends on.
   SmallVector<Dependency, 8> Dependencies;
 
+  struct SearchPath {
+    StringRef Path;
+    bool IsFramework;
+    bool IsSystem;
+  };
   /// Search paths this module may provide.
   ///
   /// This is not intended for use by frameworks, but may show up in debug
   /// modules.
-  std::vector<std::pair<StringRef, bool>> SearchPaths;
+  std::vector<SearchPath> SearchPaths;
 
   /// Info for the (lone) imported header for this module.
   struct {
@@ -138,7 +178,7 @@ public:
   template <typename T>
   class Serialized {
   private:
-    using RawBitOffset = decltype(DeclTypeCursor.GetCurrentBitNo());
+    using RawBitOffset = uint64_t;
 
     using ImplTy = PointerUnion<T, serialization::BitOffset>;
     ImplTy Value;
@@ -199,7 +239,9 @@ public:
       : Value(), Offset(offset), IsFullyDeserialized(0) {}
 
     /*implicit*/ PartiallySerialized(RawBitOffset offset)
-      : Value(), Offset(offset), IsFullyDeserialized(0) {}
+      : Value(), Offset(static_cast<unsigned>(offset)), IsFullyDeserialized(0) {
+      assert(Offset == offset && "offset is too large");
+    }
 
     bool isDeserialized() const {
       return Value != T();
@@ -244,8 +286,14 @@ private:
   /// Normal protocol conformances referenced by this module.
   std::vector<Serialized<NormalProtocolConformance *>> NormalConformances;
 
+  /// SILLayouts referenced by this module.
+  std::vector<Serialized<SILLayout *>> SILLayouts;
+
   /// Types referenced by this module.
   std::vector<Serialized<Type>> Types;
+
+  /// Generic environments referenced by this module.
+  std::vector<Serialized<GenericEnvironment *>> GenericEnvironments;
 
   /// Represents an identifier that may or may not have been deserialized yet.
   ///
@@ -257,7 +305,9 @@ private:
 
     template <typename IntTy>
     /*implicit*/ SerializedIdentifier(IntTy rawOffset)
-      : Offset(rawOffset) {}
+      : Offset(static_cast<unsigned>(rawOffset)) {
+      assert(Offset == rawOffset && "not enough bits");
+    }
   };
 
   /// Identifiers referenced by this module.
@@ -267,16 +317,26 @@ private:
   using SerializedDeclTable =
       llvm::OnDiskIterableChainedHashTable<DeclTableInfo>;
 
+  class ExtensionTableInfo;
+  using SerializedExtensionTable =
+      llvm::OnDiskIterableChainedHashTable<ExtensionTableInfo>;
+
   class LocalDeclTableInfo;
   using SerializedLocalDeclTable =
       llvm::OnDiskIterableChainedHashTable<LocalDeclTableInfo>;
 
+  class NestedTypeDeclsTableInfo;
+  using SerializedNestedTypeDeclsTable =
+      llvm::OnDiskIterableChainedHashTable<NestedTypeDeclsTableInfo>;
+
   std::unique_ptr<SerializedDeclTable> TopLevelDecls;
   std::unique_ptr<SerializedDeclTable> OperatorDecls;
-  std::unique_ptr<SerializedDeclTable> ExtensionDecls;
+  std::unique_ptr<SerializedDeclTable> PrecedenceGroupDecls;
   std::unique_ptr<SerializedDeclTable> ClassMembersByName;
   std::unique_ptr<SerializedDeclTable> OperatorMethodDecls;
+  std::unique_ptr<SerializedExtensionTable> ExtensionDecls;
   std::unique_ptr<SerializedLocalDeclTable> LocalTypeDecls;
+  std::unique_ptr<SerializedNestedTypeDeclsTable> NestedTypeDecls;
 
   class ObjCMethodTableInfo;
   using SerializedObjCMethodTable =
@@ -296,9 +356,12 @@ private:
   using SerializedDeclCommentTable =
       llvm::OnDiskIterableChainedHashTable<DeclCommentTableInfo>;
 
+  using GroupNameTable = llvm::DenseMap<unsigned, StringRef>;
+
+  std::unique_ptr<GroupNameTable> GroupNamesMap;
   std::unique_ptr<SerializedDeclCommentTable> DeclCommentTable;
 
-  struct {
+  struct ModuleBits {
     /// The decl ID of the main class in this module file, if it has one.
     unsigned EntryPointDeclID : 31;
 
@@ -324,7 +387,7 @@ private:
     // Explicitly pad out to the next word boundary.
     unsigned : 0;
   } Bits = {};
-  static_assert(sizeof(Bits) <= 8, "The bit set should be small");
+  static_assert(sizeof(ModuleBits) <= 8, "The bit set should be small");
 
   void setStatus(Status status) {
     Bits.Status = static_cast<unsigned>(status);
@@ -344,15 +407,19 @@ private:
   /// Constructs a new module and validates it.
   ModuleFile(std::unique_ptr<llvm::MemoryBuffer> moduleInputBuffer,
              std::unique_ptr<llvm::MemoryBuffer> moduleDocInputBuffer,
-             bool isFramework, serialization::ExtendedValidationInfo *extInfo);
+             bool isFramework, serialization::ValidationInfo &info,
+             serialization::ExtendedValidationInfo *extInfo);
 
 public:
   /// Change the status of the current module. Default argument marks the module
   /// as being malformed.
   Status error(Status issue = Status::Malformed) {
     assert(issue != Status::Valid);
-    assert((!FileContext || issue != Status::Malformed) &&
-           "error deserializing an individual record");
+    // This would normally be an assertion but it's more useful to print the
+    // PrettyStackTrace here even in no-asserts builds. Malformed modules are
+    // generally unrecoverable.
+    if (FileContext && issue == Status::Malformed)
+      abort();
     setStatus(issue);
     return getStatus();
   }
@@ -362,7 +429,7 @@ public:
     return FileContext->getParentModule()->getASTContext();
   }
 
-  Module *getAssociatedModule() const {
+  ModuleDecl *getAssociatedModule() const {
     assert(FileContext && "no associated context yet");
     return FileContext->getParentModule();
   }
@@ -388,6 +455,16 @@ private:
   std::unique_ptr<ModuleFile::SerializedObjCMethodTable>
   readObjCMethodTable(ArrayRef<uint64_t> fields, StringRef blobData);
 
+  /// Read an on-disk local decl hash table stored in
+  /// index_block::ExtensionTableLayout format.
+  std::unique_ptr<SerializedExtensionTable>
+  readExtensionTable(ArrayRef<uint64_t> fields, StringRef blobData);
+
+  /// Read an on-disk local decl hash table stored in
+  /// index_block::NestedTypeDeclsLayout format.
+  std::unique_ptr<SerializedNestedTypeDeclsTable>
+  readNestedTypeDeclsTable(ArrayRef<uint64_t> fields, StringRef blobData);
+
   /// Reads the index block, which contains global tables.
   ///
   /// Returns false if there was an error.
@@ -398,6 +475,9 @@ private:
   std::unique_ptr<SerializedDeclCommentTable>
   readDeclCommentTable(ArrayRef<uint64_t> fields, StringRef blobData);
 
+  std::unique_ptr<GroupNameTable>
+  readGroupTable(ArrayRef<uint64_t> fields, StringRef blobData);
+
   /// Reads the comment block, which contains USR to comment mappings.
   ///
   /// Returns false if there was an error.
@@ -406,16 +486,29 @@ private:
   /// Recursively reads a pattern from \c DeclTypeCursor.
   ///
   /// If the record at the cursor is not a pattern, returns null.
-  Pattern *maybeReadPattern();
+  Pattern *maybeReadPattern(DeclContext *owningDC);
 
   ParameterList *readParameterList();
   
   GenericParamList *maybeGetOrReadGenericParams(serialization::DeclID contextID,
-                                                DeclContext *DC,
-                                                llvm::BitstreamCursor &Cursor);
+                                                DeclContext *DC);
+
+  /// Reads a generic param list from \c DeclTypeCursor.
+  ///
+  /// If the record at the cursor is not a generic param list, returns null
+  /// without moving the cursor.
+  GenericParamList *maybeReadGenericParams(DeclContext *DC,
+                                     GenericParamList *outerParams = nullptr);
 
   /// Reads a set of requirements from \c DeclTypeCursor.
-  void readGenericRequirements(SmallVectorImpl<Requirement> &requirements);
+  void readGenericRequirements(SmallVectorImpl<Requirement> &requirements,
+                               llvm::BitstreamCursor &Cursor);
+
+  /// Set up a (potentially lazy) generic environment for the given type,
+  /// function or extension.
+  void configureGenericEnvironment(
+                   GenericContext *genericDecl,
+                   serialization::GenericEnvironmentID envID);
 
   /// Populates the vector with members of a DeclContext from \c DeclTypeCursor.
   ///
@@ -426,13 +519,22 @@ private:
   /// after reading. Nothing should ever follow a MEMBERS record.
   bool readMembers(SmallVectorImpl<Decl *> &Members);
 
+  /// Populates the protocol's default witness table.
+  ///
+  /// Returns true if there is an error.
+  ///
+  /// Note: this destroys the cursor's position in the stream. Furthermore,
+  /// because it reads from the cursor, it is not possible to reset the cursor
+  /// after reading. Nothing should ever follow a DEFAULT_WITNESS_TABLE record.
+  bool readDefaultWitnessTable(ProtocolDecl *proto);
+
   /// Resolves a cross-reference, starting from the given module.
   ///
   /// Note: this destroys the cursor's position in the stream. Furthermore,
   /// because it reads from the cursor, it is not possible to reset the cursor
   /// after reading. Nothing should ever follow an XREF record except
   /// XREF_PATH_PIECE records.
-  Decl *resolveCrossReference(Module *M, uint32_t pathLen);
+  Decl *resolveCrossReference(ModuleDecl *M, uint32_t pathLen);
 
   /// Populates TopLevelIDs for name lookup.
   void buildTopLevelDeclMap();
@@ -461,15 +563,16 @@ public:
   /// \param[out] extInfo Optionally, extra info serialized about the module.
   /// \returns Whether the module was successfully loaded, or what went wrong
   ///          if it was not.
-  static Status
+  static serialization::ValidationInfo
   load(std::unique_ptr<llvm::MemoryBuffer> moduleInputBuffer,
        std::unique_ptr<llvm::MemoryBuffer> moduleDocInputBuffer,
        bool isFramework, std::unique_ptr<ModuleFile> &theModule,
        serialization::ExtendedValidationInfo *extInfo = nullptr) {
+    serialization::ValidationInfo info;
     theModule.reset(new ModuleFile(std::move(moduleInputBuffer),
                                    std::move(moduleDocInputBuffer),
-                                   isFramework, extInfo));
-    return theModule->getStatus();
+                                   isFramework, info, extInfo));
+    return info;
   }
 
   // Out of line to avoid instantiation OnDiskChainedHashTable here.
@@ -492,7 +595,7 @@ public:
   }
 
   /// The module shadowed by this module, if any.
-  Module *getShadowedModule() const { return ShadowedModule; }
+  ModuleDecl *getShadowedModule() const { return ShadowedModule; }
 
   /// Searches the module's top-level decls for the given identifier.
   void lookupValue(DeclName name, SmallVectorImpl<ValueDecl*> &results);
@@ -500,19 +603,29 @@ public:
   /// Searches the module's local type decls for the given mangled name.
   TypeDecl *lookupLocalType(StringRef MangledName);
 
+  /// Searches the module's nested type decls table for the given member of
+  /// the given type.
+  TypeDecl *lookupNestedType(Identifier name, const ValueDecl *parent);
+
   /// Searches the module's operators for one with the given name and fixity.
   ///
   /// If none is found, returns null.
   OperatorDecl *lookupOperator(Identifier name, DeclKind fixity);
 
+  /// Searches the module's precedence groups for one with the given
+  /// name and fixity.
+  ///
+  /// If none is found, returns null.
+  PrecedenceGroupDecl *lookupPrecedenceGroup(Identifier name);
+
   /// Adds any imported modules to the given vector.
-  void getImportedModules(SmallVectorImpl<Module::ImportedModule> &results,
-                          Module::ImportFilter filter);
+  void getImportedModules(SmallVectorImpl<ModuleDecl::ImportedModule> &results,
+                          ModuleDecl::ImportFilter filter);
 
   void getImportDecls(SmallVectorImpl<Decl *> &Results);
 
   /// Reports all visible top-level members in this module.
-  void lookupVisibleDecls(Module::AccessPathTy accessPath,
+  void lookupVisibleDecls(ModuleDecl::AccessPathTy accessPath,
                           VisibleDeclConsumer &consumer,
                           NLKind lookupKind);
 
@@ -543,18 +656,23 @@ public:
   /// Reports all class members in the module to the given consumer.
   ///
   /// This is intended for use with id-style lookup and code completion.
-  void lookupClassMembers(Module::AccessPathTy accessPath,
+  void lookupClassMembers(ModuleDecl::AccessPathTy accessPath,
                           VisibleDeclConsumer &consumer);
 
   /// Adds class members in the module with the given name to the given vector.
   ///
   /// This is intended for use with id-style lookup.
-  void lookupClassMember(Module::AccessPathTy accessPath,
+  void lookupClassMember(ModuleDecl::AccessPathTy accessPath,
                          DeclName name,
                          SmallVectorImpl<ValueDecl*> &results);
 
+  /// Find all Objective-C methods with the given selector.
+  void lookupObjCMethods(
+         ObjCSelector selector,
+         SmallVectorImpl<AbstractFunctionDecl *> &results);
+
   /// Reports all link-time dependencies.
-  void collectLinkLibraries(Module::LinkLibraryCallback callback) const;
+  void collectLinkLibraries(ModuleDecl::LinkLibraryCallback callback) const;
 
   /// Adds all top-level decls to the given vector.
   void getTopLevelDecls(SmallVectorImpl<Decl*> &Results);
@@ -572,17 +690,6 @@ public:
   StringRef getModuleFilename() const {
     // FIXME: This seems fragile, maybe store the filename separately ?
     return ModuleInputBuffer->getBufferIdentifier();
-  }
-
-  /// Returns the module name as stored in the serialized data.
-  StringRef getModuleName() const {
-    return Name;
-  }
-
-  /// Returns the target triple the module was compiled for,
-  /// as stored in the serialized data.
-  StringRef getTargetTriple() const {
-    return TargetTriple;
   }
 
   /// AST-verify imported decls.
@@ -603,8 +710,18 @@ public:
   virtual void finishNormalConformance(NormalProtocolConformance *conformance,
                                        uint64_t contextData) override;
 
-  Optional<BriefAndRawComment> getCommentForDecl(const Decl *D);
-  Optional<BriefAndRawComment> getCommentForDeclByUSR(StringRef USR);
+  GenericEnvironment *loadGenericEnvironment(const DeclContext *decl,
+                                             uint64_t contextData) override;
+
+  Optional<StringRef> getGroupNameById(unsigned Id) const;
+  Optional<StringRef> getSourceFileNameById(unsigned Id) const;
+  Optional<StringRef> getGroupNameForDecl(const Decl *D) const;
+  Optional<StringRef> getSourceFileNameForDecl(const Decl *D) const;
+  Optional<unsigned> getSourceOrderForDecl(const Decl *D) const;
+  void collectAllGroups(std::vector<StringRef> &Names) const;
+  Optional<CommentInfo> getCommentForDecl(const Decl *D) const;
+  Optional<CommentInfo> getCommentForDeclByUSR(StringRef USR) const;
+  Optional<StringRef> getGroupNameByUSR(StringRef USR) const;
 
   Identifier getDiscriminatorForPrivateValue(const ValueDecl *D);
 
@@ -639,33 +756,47 @@ public:
   DeclContext *getLocalDeclContext(serialization::DeclContextID DID);
 
   /// Returns the appropriate module for the given ID.
-  Module *getModule(serialization::ModuleID MID);
+  ModuleDecl *getModule(serialization::ModuleID MID);
 
   /// Returns the appropriate module for the given name.
   ///
   /// If the name matches the name of the current module, a shadowed module
   /// is loaded instead.
-  Module *getModule(ArrayRef<Identifier> name);
+  ModuleDecl *getModule(ArrayRef<Identifier> name);
+
+  /// Returns the generic signature or environment for the given ID,
+  /// deserializing it if needed.
+  ///
+  /// \param wantEnvironment If true, always return the full generic
+  /// environment. Otherwise, only return the generic environment if it's
+  /// already been constructed, and the signature in other cases.
+  llvm::PointerUnion<GenericSignature *, GenericEnvironment *>
+  getGenericSignatureOrEnvironment(serialization::GenericEnvironmentID ID,
+                                   bool wantEnvironment = false);
+
+  /// Returns the generic environment for the given ID, deserializing it if
+  /// needed.
+  GenericEnvironment *getGenericEnvironment(
+                                        serialization::GenericEnvironmentID ID);
 
   /// Reads a substitution record from \c DeclTypeCursor.
   ///
   /// If the record at the cursor is not a substitution, returns None.
-  Optional<Substitution> maybeReadSubstitution(llvm::BitstreamCursor &Cursor);
+  Optional<Substitution> maybeReadSubstitution(llvm::BitstreamCursor &Cursor,
+                                               GenericEnvironment *genericEnv =
+                                                nullptr);
 
   /// Recursively reads a protocol conformance from the given cursor.
-  ProtocolConformanceRef readConformance(llvm::BitstreamCursor &Cursor);
+  ProtocolConformanceRef readConformance(llvm::BitstreamCursor &Cursor,
+                                         GenericEnvironment *genericEnv =
+                                           nullptr);
+  
+  /// Read a SILLayout from the given cursor.
+  SILLayout *readSILLayout(llvm::BitstreamCursor &Cursor);
 
   /// Read the given normal conformance from the current module file.
   NormalProtocolConformance *
   readNormalConformance(serialization::NormalConformanceID id);
-
-  /// Reads a generic param list from \c DeclTypeCursor.
-  ///
-  /// If the record at the cursor is not a generic param list, returns null
-  /// without moving the cursor.
-  GenericParamList *maybeReadGenericParams(DeclContext *DC,
-                                     llvm::BitstreamCursor &Cursor,
-                                     GenericParamList *outerParams = nullptr);
 
   /// Reads a foreign error conformance from \c DeclTypeCursor, if present.
   Optional<ForeignErrorConvention> maybeReadForeignErrorConvention();

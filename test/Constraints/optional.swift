@@ -1,20 +1,20 @@
-// RUN: %target-parse-verify-swift
+// RUN: %target-typecheck-verify-swift
 
 // REQUIRES: objc_interop
 
-func markUsed<T>(t: T) {}
+func markUsed<T>(_ t: T) {}
 
 class A {
   @objc func do_a() {}
 
-  @objc(do_b_2:) func do_b(x: Int) {}
-  @objc func do_b(x: Float) {}
+  @objc(do_b_2:) func do_b(_ x: Int) {}
+  @objc func do_b(_ x: Float) {}
 
-  @objc func do_c(x x: Int) {}
-  @objc func do_c(y y: Int) {}
+  @objc func do_c(x: Int) {}
+  @objc func do_c(y: Int) {}
 }
 
-func test0(a: AnyObject) {
+func test0(_ a: AnyObject) {
   a.do_a?()
 
   a.do_b?(1)
@@ -24,7 +24,7 @@ func test0(a: AnyObject) {
   a.do_c?(x: 1)
 }
 
-func test1(a: A) {
+func test1(_ a: A) {
   a?.do_a() // expected-error {{cannot use optional chaining on non-optional value of type 'A'}} {{4-5=}}
   a!.do_a() // expected-error {{cannot force unwrap value of non-optional type 'A'}} {{4-5=}}
   // Produce a specialized diagnostic here?
@@ -33,12 +33,12 @@ func test1(a: A) {
 
 // <rdar://problem/15508756>
 extension Optional {
-  func bind<U>(f: Wrapped -> U?) -> U? {
+  func bind<U>(_ f: (Wrapped) -> U?) -> U? {
     switch self {
-    case .Some(let x):
+    case .some(let x):
       return f(x)
-    case .None:
-      return .None
+    case .none:
+      return .none
     }
   }
 }
@@ -48,43 +48,43 @@ var c: String? = Optional<Int>(1)
 
 func test4() {
   func foo() -> Int { return 0 }
-  func takes_optfn(f : () -> Int?) -> Int? { return f() }
+  func takes_optfn(_ f : () -> Int?) -> Int? { return f() }
 
-  takes_optfn(foo)
+  _ = takes_optfn(foo)
 
-  func takes_objoptfn(f : () -> AnyObject?) -> AnyObject? { return f() }
+  func takes_objoptfn(_ f : () -> AnyObject?) -> AnyObject? { return f() }
   func objFoo() -> AnyObject { return A() }
-  takes_objoptfn(objFoo) // okay
+  _ = takes_objoptfn(objFoo) // okay
   func objBar() -> A { return A() }
-  takes_objoptfn(objBar) // okay
+  _ = takes_objoptfn(objBar) // okay
 }
 
 func test5() -> Int? {
   return nil
 }
 
-func test6<T>(x : T) {
+func test6<T>(_ x : T) {
   // FIXME: this code should work; T could be Int? or Int??
   // or something like that at runtime.  rdar://16374053
-  let y = x as? Int? // expected-error {{cannot downcast from 'T' to a more optional type 'Int?'}}
+  _ = x as? Int? // expected-error {{cannot downcast from 'T' to a more optional type 'Int?'}}
 }
 
 class B : A { }
 
-func test7(x : A) {
-  let y = x as? B? // expected-error{{cannot downcast from 'A' to a more optional type 'B?'}}
+func test7(_ x : A) {
+  _ = x as? B? // expected-error{{cannot downcast from 'A' to a more optional type 'B?'}}
 }
 
-func test8(x : AnyObject?) {
+func test8(_ x : AnyObject?) {
   let _ : A = x as! A
 }
 
 
 // Partial ordering with optionals
-func test9_helper<T>(x: T) -> Int { }
-func test9_helper<T>(x: T?) -> Double { }
+func test9_helper<T>(_ x: T) -> Int { }
+func test9_helper<T>(_ x: T?) -> Double { }
 
-func test9(i: Int, io: Int?) {
+func test9(_ i: Int, io: Int?) {
   let result = test9_helper(i)
   var _: Int = result
   let result2 = test9_helper(io)
@@ -93,12 +93,12 @@ func test9(i: Int, io: Int?) {
 
 protocol P { }
 
-func test10_helper<T : P>(x: T) -> Int { }
-func test10_helper<T : P>(x: T?) -> Double { }
+func test10_helper<T : P>(_ x: T) -> Int { }
+func test10_helper<T : P>(_ x: T?) -> Double { }
 
 extension Int : P { }
 
-func test10(i: Int, io: Int?) {
+func test10(_ i: Int, io: Int?) {
   let result = test10_helper(i)
   var _: Int = result
 
@@ -111,11 +111,88 @@ z = z ?? 3
 
 var fo: Float? = 3.14159
 
-func voidOptional(handler: () -> ()?) {}
+func voidOptional(_ handler: () -> ()?) {}
 func testVoidOptional() {
   let noop: () -> Void = {}
   voidOptional(noop)
 
-  let optNoop: ()? -> ()? = { return $0 }
+  let optNoop: (()?) -> ()? = { return $0 }
   voidOptional(optNoop)
+}
+
+func testTernaryWithNil(b: Bool, s: String, i: Int) {
+  let t1 = b ? s : nil
+  let _: Double = t1 // expected-error{{value of type 'String?'}}
+  let t2 = b ? nil : i
+  let _: Double = t2 // expected-error{{value of type 'Int?'}}
+  let t3 = b ? "hello" : nil
+  let _: Double = t3 // expected-error{{value of type 'String?'}}
+  let t4 = b ? nil : 1
+  let _: Double = t4 // expected-error{{value of type 'Int?'}}
+}
+
+// inference with IUOs
+infix operator ++++
+
+protocol PPPP {
+  static func ++++(x: Self, y: Self) -> Bool
+}
+
+func compare<T: PPPP>(v: T, u: T!) -> Bool {
+  return v ++++ u
+}
+
+func sr2752(x: String?, y: String?) {
+  _ = x.map { xx in
+    y.map { _ in "" } ?? "\(xx)"
+  }
+}
+
+// SR-3248 - Invalid diagnostic calling implicitly unwrapped closure
+var sr3248 : ((Int) -> ())!
+sr3248?(a: 2) // expected-error {{extraneous argument label 'a:' in call}}
+sr3248!(a: 2) // expected-error {{extraneous argument label 'a:' in call}}
+sr3248(a: 2)  // expected-error {{extraneous argument label 'a:' in call}}
+
+struct SR_3248 {
+    var callback: (([AnyObject]) -> Void)!
+}
+
+SR_3248().callback?("test") // expected-error {{cannot convert value of type 'String' to expected argument type '[AnyObject]'}}
+SR_3248().callback!("test") // expected-error {{cannot convert value of type 'String' to expected argument type '[AnyObject]'}}
+SR_3248().callback("test")  // expected-error {{cannot convert value of type 'String' to expected argument type '[AnyObject]'}}
+
+_? = nil  // expected-error {{'nil' requires a contextual type}}
+_?? = nil // expected-error {{'nil' requires a contextual type}}
+
+
+// rdar://problem/29993596
+func takeAnyObjects(_ lhs: AnyObject?, _ rhs: AnyObject?) { }
+
+infix operator !====
+
+func !====(_ lhs: AnyObject?, _ rhs: AnyObject?) -> Bool { return false }
+
+func testAnyObjectImplicitForce(lhs: AnyObject?!, rhs: AnyObject?) {
+  if lhs !==== rhs { }
+
+  takeAnyObjects(lhs, rhs)
+}
+
+// SR-4056
+protocol P1 { }
+
+class C1: P1 { }
+
+protocol P2 {
+    var prop: C1? { get }
+}
+
+class C2 {
+    var p1: P1?
+    var p2: P2?
+
+    var computed: P1? {
+        return p1 ?? p2?.prop
+    }
 }

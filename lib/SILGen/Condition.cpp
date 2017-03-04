@@ -2,11 +2,11 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2016 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 
@@ -134,7 +134,7 @@ SILBasicBlock *Condition::complete(SILGenFunction &SGF) {
   // Kill the continuation block if it's not being used.  Case-exits
   // only leave themselves post-terminator if they use the
   // continuation block, so we're in an acceptable insertion state.
-  if (ContBB->pred_empty() && ContBB->bbarg_empty()) {
+  if (ContBB->pred_empty() && ContBB->args_empty()) {
     SGF.eraseBasicBlock(ContBB);
     return SGF.B.hasValidInsertionPoint() ? SGF.B.getInsertionBB() : nullptr;
   }
@@ -155,7 +155,8 @@ ConditionalValue::ConditionalValue(SILGenFunction &gen, SGFContext C,
   } else {
     // Otherwise, add a BB arg to the continuation block to receive loadable
     // result.
-    result = new (gen.F.getModule()) SILArgument(contBB, tl.getLoweredType());
+    result = contBB->createPHIArgument(tl.getLoweredType(),
+                                       ValueOwnershipKind::Owned);
   }
 }
 
@@ -173,7 +174,7 @@ SGFContext ConditionalValue::enterBranch(SILBasicBlock *bb) {
   // conditionals.
   if (tl.isAddressOnly()) {
     assert(!currentInitialization && "already have an initialization?!");
-    currentInitialization = gen.useBufferAsTemporary(loc, result, tl);
+    currentInitialization = gen.useBufferAsTemporary(result, tl);
     return SGFContext(currentInitialization.get());
   }
 
@@ -188,8 +189,8 @@ void ConditionalValue::exitBranch(RValue &&condResult) {
     // Transfer the result into our buffer if it wasn't emitted in-place
     // already.
     assert(currentInitialization && "no current initialization?!");
-    std::move(condResult).forwardInto(gen, currentInitialization.release(),
-                                      loc);
+    std::move(condResult).forwardInto(gen, loc,
+                                      currentInitialization.release());
     scope.reset();
     gen.B.createBranch(loc, contBB);
   } else {

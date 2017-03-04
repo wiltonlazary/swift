@@ -1,12 +1,12 @@
-//===--- RedundantOverflowCheckRemoval.cpp ----------------------*- C++ -*-===//
+//===--- RedundantOverflowCheckRemoval.cpp --------------------------------===//
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2016 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 // Remove overflow checks that are guarded by control flow or other
@@ -28,7 +28,7 @@
 
 using namespace swift;
 
-STATISTIC(NumCondFailRemoved,   "Number of cond_fail instructions removed");
+STATISTIC(NumCondFailRemoved, "Number of cond_fail instructions removed");
 
 namespace {
 
@@ -138,7 +138,7 @@ public:
         if (auto *CBI = dyn_cast<CondBranchInst>(Inst))
           registerBranchFormula(CBI);
 
-          // Handle cond_fail instructions.
+        // Handle cond_fail instructions.
         if (auto *CFI = dyn_cast<CondFailInst>(Inst)) {
           if (tryToRemoveCondFail(CFI)) {
             ToRemove.push_back(CFI);
@@ -232,7 +232,7 @@ public:
   static bool isKnownPositive(SILValue N) {
     if (IntegerLiteralInst *NI = dyn_cast<IntegerLiteralInst>(N))
       return NI->getValue().isStrictlyPositive();
-    return  false;
+    return false;
   }
 
   /// Return true if the absolute value of \p A is smaller than the
@@ -255,7 +255,7 @@ public:
     // L and R are the righthand and lefthand sides of the constraint.
     SILValue L = F.Left;
     SILValue R = F.Right;
-    assert(L.getType() == R.getType() && "Invalid constraint type");
+    assert(L->getType() == R->getType() && "Invalid constraint type");
 
     // Make sure that the types of the constraints match the types of the
     // arithmetic operation.
@@ -267,7 +267,7 @@ public:
       case BuiltinValueKind::UMulOver:
       case BuiltinValueKind::USubOver:
       case BuiltinValueKind::SSubOver:
-        if (L.getType() != BI->getOperand(0).getType())
+        if (L->getType() != BI->getOperand(0)->getType())
           return false;
     }
 
@@ -278,7 +278,7 @@ public:
         if (F.Relationship == ValueRelation::SAdd) {
           // L + R already known to not trap at this point in the program.
           // And the following applies:
-          // L >= A and R >= B  or (commutatively) R >= A and L >= B.
+          // L >= A and R >= B or (commutatively) R >= A and L >= B.
           SILValue A = BI->getOperand(0);
           SILValue B = BI->getOperand(1);
           if (knownRelation(A, L,  ValueRelation::SLE) &&
@@ -307,7 +307,7 @@ public:
         if (F.Relationship == ValueRelation::UAdd) {
           // L + R already known to not trap at this point in the program.
           // And the following applies:
-          // L >= A and R >= B  or (commutatively) R >= A and L >= B.
+          // L >= A and R >= B or (commutatively) R >= A and L >= B.
           SILValue A = BI->getOperand(0);
           SILValue B = BI->getOperand(1);
           if (knownRelation(A, L,  ValueRelation::ULE) &&
@@ -368,7 +368,7 @@ public:
         if (F.Relationship == ValueRelation::UMul) {
           // L * R already known to not trap at this point in the program.
           // And the following applies:
-          // L >= A and R >= B  or (commutatively) R >= A and L >= B.
+          // L >= A and R >= B or (commutatively) R >= A and L >= B.
           SILValue A = BI->getOperand(0);
           SILValue B = BI->getOperand(1);
           if (knownRelation(A, L,  ValueRelation::ULE) &&
@@ -526,7 +526,7 @@ public:
     ValueRelation Rel;
     switch (BI->getBuiltinInfo().ID) {
       default: return;
-      case  BuiltinValueKind::SAddOver:
+      case BuiltinValueKind::SAddOver:
         Rel = ValueRelation::SAdd;
         break;
       case BuiltinValueKind::UAddOver:
@@ -578,8 +578,10 @@ public:
     //         \   |
     //          \  v
     //         [use(x)]
-    if (!TrueBB->getSinglePredecessor()) TrueBB = nullptr;
-    if (!FalseBB->getSinglePredecessor()) FalseBB = nullptr;
+    if (!TrueBB->getSinglePredecessorBlock())
+      TrueBB = nullptr;
+    if (!FalseBB->getSinglePredecessorBlock())
+      FalseBB = nullptr;
 
     // The relationship expressed in the builtin.
     ValueRelation Rel;
@@ -649,7 +651,7 @@ public:
     return "Removes overflow checks that are proven to be redundant";
   }
 };
-}
+} // end anonymous namespace
 
 SILTransform *swift::createRedundantOverflowCheckRemoval() {
   return new RedundantOverflowCheckRemovalPass();

@@ -2,11 +2,11 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2016 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 //
@@ -19,8 +19,15 @@
 #include "llvm/ADT/Hashing.h"
 #include "llvm/ADT/PointerUnion.h"
 #include "swift/AST/TypeAlignments.h"
+#include "swift/AST/Type.h"
+
+namespace llvm {
+  class raw_ostream;
+}
 
 namespace swift {
+
+class ProtocolConformance;
 
 /// A ProtocolConformanceRef is a handle to a protocol conformance which
 /// may be either concrete or abstract.
@@ -36,7 +43,12 @@ namespace swift {
 /// ProtocolConformanceRef allows the efficient recovery of the protocol
 /// even when the conformance is abstract.
 class ProtocolConformanceRef {
-  llvm::PointerUnion<ProtocolDecl*, ProtocolConformance*> Union;
+  using UnionType = llvm::PointerUnion<ProtocolDecl*, ProtocolConformance*>;
+  UnionType Union;
+
+  explicit ProtocolConformanceRef(UnionType value) : Union(value) {
+    assert(value && "cannot construct ProtocolConformanceRef with null");
+  }
 public:
   /// Create an abstract protocol conformance reference.
   explicit ProtocolConformanceRef(ProtocolDecl *proto) : Union(proto) {
@@ -65,10 +77,22 @@ public:
     return Union.get<ProtocolDecl*>();
   }
 
+  using OpaqueValue = void*;
+  OpaqueValue getOpaqueValue() const { return Union.getOpaqueValue(); }
+  static ProtocolConformanceRef getFromOpaqueValue(OpaqueValue value) {
+    return ProtocolConformanceRef(UnionType::getFromOpaqueValue(value));
+  }
+
   /// Return the protocol requirement.
   ProtocolDecl *getRequirement() const;
+  
+  /// Get the inherited conformance corresponding to the given protocol.
+  /// Returns `this` if `parent` is already the same as the protocol this
+  /// conformance represents.
+  ProtocolConformanceRef getInherited(ProtocolDecl *parent) const;
 
   void dump() const;
+  void dump(llvm::raw_ostream &out, unsigned indent = 0) const;
 
   bool operator==(ProtocolConformanceRef other) const {
     return Union == other.Union;
@@ -80,6 +104,12 @@ public:
   friend llvm::hash_code hash_value(ProtocolConformanceRef conformance) {
     return llvm::hash_value(conformance.Union.getOpaqueValue());
   }
+
+  static Type
+  getTypeWitnessByName(Type type,
+                       ProtocolConformanceRef conformance,
+                       Identifier name,
+                       LazyResolver *resolver);
 };
 
 } // end namespace swift

@@ -18,13 +18,13 @@ final class DerivedClass : BaseClass {
   }
 }
 
-func something(x: Int) {}
+func something(_ x: Int) {}
 
-func something(inout x: Int) {}
+func something(_ x: inout Int) {}
 
-func something(x: AnyObject) {}
+func something(_ x: AnyObject) {}
 
-func something(x: Any.Type) {}
+func something(_ x: Any.Type) {}
 
 // <rdar://problem/22946400> DI needs to diagnose self usages in error block
 //
@@ -91,7 +91,7 @@ class ErrantClass : ErrantBaseClass {
       something(self) // expected-error {{'self' used inside 'catch' block reachable from self.init call}}
 
       // FIXME: not diagnosed
-      something(self.dynamicType)
+      something(type(of: self))
 
       throw e
     }

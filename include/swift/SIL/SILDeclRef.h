@@ -2,11 +2,11 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2016 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 //
@@ -57,7 +57,7 @@ enum class MethodDispatch {
 MethodDispatch getMethodDispatch(AbstractFunctionDecl *method);
 
 /// True if calling the given method or property should use ObjC dispatch.
-bool requiresObjCDispatch(ValueDecl *vd);
+bool requiresForeignEntryPoint(ValueDecl *vd);
 
 /// True if the entry point is natively foreign.
 bool requiresForeignToNativeThunk(ValueDecl *vd);
@@ -116,6 +116,10 @@ struct SILDeclRef {
 
     /// References the generator for a default argument of a function.
     DefaultArgGenerator,
+
+    /// References the initializer expression for a stored property
+    /// of a nominal type.
+    StoredPropertyInitializer,
 
     /// References the ivar initializer for the ClassDecl in loc.
     ///
@@ -230,11 +234,14 @@ struct SILDeclRef {
   
   SILLocation getAsRegularLocation() const;
 
+  enum class ManglingKind {
+    Default,
+    VTableMethod,
+    DynamicThunk,
+  };
+
   /// Produce a mangled form of this constant.
-  ///
-  /// If 'prefix' is non-empty, it will be used in place of the standard '_T'
-  /// prefix.
-  std::string mangle(StringRef prefix = {}) const;
+  std::string mangle(ManglingKind MKind = ManglingKind::Default) const;
 
   /// True if the SILDeclRef references a function.
   bool isFunc() const {
@@ -261,9 +268,16 @@ struct SILDeclRef {
   bool isDefaultArgGenerator() const {
     return kind == Kind::DefaultArgGenerator;
   }
+  /// True if the SILDeclRef references the initializer for a stored property
+  /// of a nominal type.
+  bool isStoredPropertyInitializer() const {
+    return kind == Kind::StoredPropertyInitializer;
+  }
   
   /// \brief True if the function should be treated as transparent.
   bool isTransparent() const;
+  /// \brief True if the function should have its body serialized.
+  bool isFragile() const;
   /// \brief True if the function has noinline attribute.
   bool isNoinline() const;
   /// \brief True if the function has __always inline attribute.
@@ -373,6 +387,7 @@ struct SILDeclRef {
   /// True if the referenced entity is emitted by Clang on behalf of the Clang
   /// importer.
   bool isClangGenerated() const;
+  static bool isClangGenerated(ClangNode node);
 
   bool isImplicit() const {
     if (hasDecl())

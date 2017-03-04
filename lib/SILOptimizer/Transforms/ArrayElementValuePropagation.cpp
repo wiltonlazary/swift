@@ -2,11 +2,11 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2016 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 #define DEBUG_TYPE "array-element-propagation"
@@ -67,7 +67,7 @@ class ArrayAllocation {
   bool findValueReplacements();
   bool isInitializationWithKnownElements();
   bool mapInitializationStores();
-  bool analyseArrayValueUses();
+  bool analyzeArrayValueUses();
   bool recursivelyCollectUses(ValueBase *Def);
   bool collectForwardableValues();
 
@@ -84,7 +84,7 @@ public:
     return ArrayAllocation(Inst, Replacements).findValueReplacements();
   }
 };
-}
+} // end anonymous namespace
 
 
 /// Map the indices of array element initialization stores to their values.
@@ -94,7 +94,7 @@ bool ArrayAllocation::mapInitializationStores() {
 
   // Match initialization stores.
   // %83 = struct_extract %element_buffer : $UnsafeMutablePointer<Int>
-  // %84 = pointer_to_address %83 : $Builtin.RawPointer to $*Int
+  // %84 = pointer_to_address %83 : $Builtin.RawPointer to strict $*Int
   // store %85 to %84 : $*Int
   // %87 = integer_literal $Builtin.Word, 1
   // %88 = index_addr %84 : $*Int, %87 : $Builtin.Word
@@ -105,7 +105,7 @@ bool ArrayAllocation::mapInitializationStores() {
   if (!UnsafeMutablePointerExtract)
     return false;
   auto *PointerToAddress = dyn_cast_or_null<PointerToAddressInst>(
-      getSingleNonDebugUser(*UnsafeMutablePointerExtract));
+      getSingleNonDebugUser(UnsafeMutablePointerExtract));
   if (!PointerToAddress)
     return false;
 
@@ -116,7 +116,7 @@ bool ArrayAllocation::mapInitializationStores() {
 
     // Store to the base.
     auto *SI = dyn_cast<StoreInst>(Inst);
-    if (SI && SI->getDest() == SILValue(PointerToAddress, 0)) {
+    if (SI && SI->getDest() == PointerToAddress) {
       // We have already seen an entry for this index bail.
       if (ElementValueMap.count(0))
         return false;
@@ -129,8 +129,8 @@ bool ArrayAllocation::mapInitializationStores() {
     auto *IndexAddr = dyn_cast<IndexAddrInst>(Inst);
     if (!IndexAddr)
       return false;
-    SI = dyn_cast_or_null<StoreInst>(getSingleNonDebugUser(*IndexAddr));
-    if (!SI || SI->getDest().getDef() != IndexAddr)
+    SI = dyn_cast_or_null<StoreInst>(getSingleNonDebugUser(IndexAddr));
+    if (!SI || SI->getDest() != IndexAddr)
       return false;
     auto *Index = dyn_cast<IntegerLiteralInst>(IndexAddr->getIndex());
     if (!Index)
@@ -172,7 +172,7 @@ bool ArrayAllocation::findValueReplacements() {
     return false;
 
   // The array value was stored or has escaped.
-  if (!analyseArrayValueUses())
+  if (!analyzeArrayValueUses())
     return false;
 
   // No count users.
@@ -184,21 +184,8 @@ bool ArrayAllocation::findValueReplacements() {
 
 /// Collect all get_element users and check that there are no escapes or uses
 /// that could change the array value.
-bool ArrayAllocation::analyseArrayValueUses() {
-  return recursivelyCollectUses(ArrayValue.getDef());
-}
-
-static bool doesNotChangeArray(ArraySemanticsCall &C) {
-  switch (C.getKind()) {
-  default: return false;
-  case ArrayCallKind::kArrayPropsIsNativeTypeChecked:
-  case ArrayCallKind::kCheckSubscript:
-  case ArrayCallKind::kCheckIndex:
-  case ArrayCallKind::kGetCount:
-  case ArrayCallKind::kGetCapacity:
-  case ArrayCallKind::kGetElement:
-    return true;
-  }
+bool ArrayAllocation::analyzeArrayValueUses() {
+  return recursivelyCollectUses(ArrayValue);
 }
 
 /// Recursively look at all uses of this definition. Abort if the array value
@@ -219,7 +206,7 @@ bool ArrayAllocation::recursivelyCollectUses(ValueBase *Def) {
 
     // Check array semantic calls.
     ArraySemanticsCall ArrayOp(User);
-    if (ArrayOp && doesNotChangeArray(ArrayOp)) {
+    if (ArrayOp && ArrayOp.doesNotChangeArray()) {
       if (ArrayOp.getKind() == ArrayCallKind::kGetElement)
         GetElementCalls.insert(ArrayOp);
       continue;
@@ -299,7 +286,7 @@ public:
     }
   }
 };
-} // End anonymous namespace.
+} // end anonymous namespace
 
 SILTransform *swift::createArrayElementPropagation() {
   return new ArrayElementPropagation();

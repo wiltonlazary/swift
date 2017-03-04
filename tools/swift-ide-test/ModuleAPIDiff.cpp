@@ -2,11 +2,11 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2016 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 
@@ -192,7 +192,6 @@ decl-attributes ::=
         IsFinal: <bool>
         IsLazy: <bool>
         IsMutating: <bool>
-        IsNoreturn: <bool>
         IsObjC: <bool>
         IsOptional: <bool>
         IsRequired: <bool>
@@ -258,7 +257,6 @@ using llvm::Optional;
   MACRO(IsFinal) \
   MACRO(IsLazy) \
   MACRO(IsMutating) \
-  MACRO(IsNoreturn) \
   MACRO(IsObjC) \
   MACRO(IsOptional) \
   MACRO(IsRequired) \
@@ -754,7 +752,9 @@ public:
     }
     for (auto &Req : GS->getRequirements()) {
       switch (Req.getKind()) {
+      case RequirementKind::Superclass:
       case RequirementKind::Conformance:
+      case RequirementKind::Layout:
         ResultGS.ConformanceRequirements.emplace_back(
             sma::ConformanceRequirement{
                 convertToTypeName(Req.getFirstType()),
@@ -764,9 +764,6 @@ public:
         ResultGS.SameTypeRequirements.emplace_back(
             sma::SameTypeRequirement{convertToTypeName(Req.getFirstType()),
                                      convertToTypeName(Req.getSecondType())});
-        break;
-      case RequirementKind::WitnessMarker:
-        // This RequirementKind is a hack; skip it.
         break;
       }
     }
@@ -836,7 +833,7 @@ public:
   void visitTypeAliasDecl(TypeAliasDecl *TAD) {
     auto ResultTD = std::make_shared<sma::TypealiasDecl>();
     ResultTD->Name = convertToIdentifier(TAD->getName());
-    ResultTD->Type = convertToTypeName(TAD->getUnderlyingType());
+    ResultTD->Type = convertToTypeName(TAD->getUnderlyingTypeLoc().getType());
     // FIXME
     // ResultTD->Attributes = ?;
     Result.Typealiases.emplace_back(std::move(ResultTD));
@@ -878,7 +875,7 @@ public:
   }
 };
 
-std::shared_ptr<sma::Module> createSMAModel(Module *M) {
+std::shared_ptr<sma::Module> createSMAModel(ModuleDecl *M) {
   SmallVector<Decl *, 1> Decls;
   M->getDisplayDecls(Decls);
 
@@ -924,13 +921,13 @@ int swift::doGenerateModuleAPIDescription(StringRef MainExecutablePath,
 
   CompilerInstance CI;
   CI.addDiagnosticConsumer(&PDC);
-  if (CI.setup(*Invocation.get()))
+  if (CI.setup(*Invocation))
     return 1;
   CI.performSema();
 
   PrintOptions Options = PrintOptions::printEverything();
 
-  Module *M = CI.getMainModule();
+  ModuleDecl *M = CI.getMainModule();
   M->getMainSourceFile(Invocation->getSourceFileKind()).print(llvm::outs(),
                                                         Options);
 

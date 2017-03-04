@@ -2,11 +2,11 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2016 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 //
@@ -42,8 +42,11 @@ irgen::emitTypeLayoutVerifier(IRGenFunction &IGF,
                                               verifierArgTys,
                                               /*var arg*/ false);
   auto verifierFn = IGF.IGM.Module.getOrInsertFunction(
-                                       "_swift_debug_verifyTypeLayoutAttribute",
-                                       verifierFnTy);
+      "_swift_debug_verifyTypeLayoutAttribute", verifierFnTy);
+  if (IGF.IGM.useDllStorage()) 
+    if (auto *F = dyn_cast<llvm::Function>(verifierFn))
+      F->setDLLStorageClass(llvm::GlobalValue::DLLImportStorageClass);
+
   struct VerifierArgumentBuffers {
     Address runtimeBuf, staticBuf;
   };
@@ -149,8 +152,8 @@ irgen::emitTypeLayoutVerifier(IRGenFunction &IGF,
       
       // Verify that the extra inhabitant representations are consistent.
       
-      /* TODO: Update for EnumPayload implementation changes.
-      
+      // TODO: Update for EnumPayload implementation changes.
+#if 0
       auto xiBuf = IGF.createAlloca(fixedTI->getStorageType(),
                                     fixedTI->getFixedAlignment(),
                                     "extra-inhabitant");
@@ -212,7 +215,7 @@ irgen::emitTypeLayoutVerifier(IRGenFunction &IGF,
                llvm::Twine("extra inhabitant index calculation ")
                  + numberBuf.str());
       }
-       */
+#endif
     }
 
     // TODO: Verify interesting layout properties specific to the kind of type,

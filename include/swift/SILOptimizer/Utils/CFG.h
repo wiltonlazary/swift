@@ -2,11 +2,11 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2016 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 
@@ -115,6 +115,9 @@ SILBasicBlock *splitBasicBlockAndBranch(SILBuilder &B,
                                         SILInstruction *SplitBeforeInst,
                                         DominanceInfo *DT, SILLoopInfo *LI);
 
+/// \brief Return true if the function has a critical edge, false otherwise.
+bool hasCriticalEdges(SILFunction &F, bool OnlyNonCondBr);
+
 /// \brief Split all critical edges in the function updating the dominator tree
 /// and loop information (if they are not set to null). If \p OnlyNonCondBr is
 /// true this will not split cond_br edges (Only edges which can't carry
@@ -128,5 +131,5 @@ bool splitAllCriticalEdges(SILFunction &F, bool OnlyNonCondBr,
 bool mergeBasicBlockWithSuccessor(SILBasicBlock *BB, DominanceInfo *DT,
                                   SILLoopInfo *LI);
 
-} // End namespace swift.
+} // end namespace swift
 #endif

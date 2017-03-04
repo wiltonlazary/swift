@@ -2,11 +2,11 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2016 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 //
@@ -19,6 +19,7 @@
 
 #include "swift/SIL/SILFunction.h"
 #include "swift/SIL/SILInstruction.h"
+#include "swift/SILOptimizer/Analysis/BasicCalleeAnalysis.h"
 #include "swift/SILOptimizer/Utils/Generics.h"
 #include "swift/SILOptimizer/Utils/Local.h"
 #include "swift/SILOptimizer/PassManager/Transforms.h"
@@ -38,6 +39,9 @@ class GenericSpecializer : public SILFunctionTransform {
     DEBUG(llvm::dbgs() << "***** GenericSpecializer on function:" << F.getName()
                        << " *****\n");
 
+    // Lock BCA so it's not invalidated along with the rest of the call graph.
+    AnalysisPreserver BCAP(PM->getAnalysis<BasicCalleeAnalysis>());
+
     if (specializeAppliesInFunction(F))
       invalidateAnalysis(SILAnalysis::InvalidationKind::Everything);
   }
@@ -48,64 +52,69 @@ class GenericSpecializer : public SILFunctionTransform {
 } // end anonymous namespace
 
 bool GenericSpecializer::specializeAppliesInFunction(SILFunction &F) {
-  bool Changed = false;
-  llvm::SmallVector<SILInstruction *, 8> DeadApplies;
+  DeadInstructionSet DeadApplies;
+  llvm::SmallSetVector<SILInstruction *, 8> Applies;
 
+  bool Changed = false;
   for (auto &BB : F) {
-    for (auto It = BB.begin(), End = BB.end(); It != End;) {
-      auto &I = *It++;
+    // Collect the applies for this block in reverse order so that we
+    // can pop them off the end of our vector and process them in
+    // forward order.
+    for (auto It = BB.rbegin(), End = BB.rend(); It != End; ++It) {
+      auto *I = &*It;
 
       // Skip non-apply instructions, apply instructions with no
       // substitutions, apply instructions where we do not statically
       // know the called function, and apply instructions where we do
       // not have the body of the called function.
-
-      ApplySite Apply = ApplySite::isa(&I);
+      ApplySite Apply = ApplySite::isa(I);
       if (!Apply || !Apply.hasSubstitutions())
         continue;
 
-      auto *Callee = Apply.getCalleeFunction();
+      auto *Callee = Apply.getReferencedFunction();
       if (!Callee || !Callee->isDefinition())
         continue;
 
+      Applies.insert(Apply.getInstruction());
+    }
+
+    // Attempt to specialize each apply we collected, deleting any
+    // that we do specialize (along with other instructions we clone
+    // in the process of doing so). We pop from the end of the list to
+    // avoid tricky iterator invalidation issues.
+    while (!Applies.empty()) {
+      auto *I = Applies.pop_back_val();
+      auto Apply = ApplySite::isa(I);
+      assert(Apply && "Expected an apply!");
+      SILFunction *Callee = Apply.getReferencedFunction();
+      assert(Callee && "Expected to have a known callee");
+
       // We have a call that can potentially be specialized, so
       // attempt to do so.
+      llvm::SmallVector<SILFunction *, 2> NewFunctions;
+      trySpecializeApplyOfGeneric(Apply, DeadApplies, NewFunctions);
 
-      // The specializer helper function currently expects a collector
-      // argument, but we aren't going to make use of the results so
-      // we'll have our filter always return false;
-      auto Filter = [](SILInstruction *I) -> bool { return false; };
-      CloneCollector Collector(Filter);
+      // Remove all the now-dead applies. We must do this immediately
+      // rather than defer it in order to avoid problems with cloning
+      // dead instructions when doing recursive specialization.
+      while (!DeadApplies.empty()) {
+        auto *AI = DeadApplies.pop_back_val();
 
-      SILFunction *SpecializedFunction;
+        // Remove any applies we are deleting so that we don't attempt
+        // to specialize them.
+        Applies.remove(AI);
 
-      auto Specialized =
-          trySpecializeApplyOfGeneric(Apply, SpecializedFunction, Collector);
-
-      if (Specialized) {
+        recursivelyDeleteTriviallyDeadInstructions(AI, true);
         Changed = true;
+      }
 
-        // If calling the specialization utility resulted in a new
-        // function (as opposed to returning a previous
-        // specialization), we need to notify the pass manager so that
-        // the new function gets optimized.
-        if (SpecializedFunction)
-          notifyPassManagerOfFunction(SpecializedFunction);
-
-        auto *AI = Apply.getInstruction();
-
-        if (!isa<TryApplyInst>(AI))
-          AI->replaceAllUsesWith(Specialized.getInstruction());
-
-        DeadApplies.push_back(AI);
+      // If calling the specialization utility resulted in new functions
+      // (as opposed to returning a previous specialization), we need to notify
+      // the pass manager so that the new functions get optimized.
+      for (SILFunction *NewF : reverse(NewFunctions)) {
+        notifyPassManagerOfFunction(NewF, Callee);
       }
     }
-  }
-
-  // Remove all the now-dead applies.
-  while (!DeadApplies.empty()) {
-    auto *AI = DeadApplies.pop_back_val();
-    recursivelyDeleteTriviallyDeadInstructions(AI, true);
   }
 
   return Changed;

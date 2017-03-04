@@ -2,50 +2,54 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2016 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
-//
-// Promotes captures from 'inout' (i.e. by-reference) to by-value
-// ==============================================================
-//
-// Swift's closure model is that all local variables are capture by reference.
-// This produces a very simple programming model which is great to use, but
-// relies on the optimizer to promote by-ref captures to by-value (i.e. by-copy)
-// captures for decent performance. Consider this simple example:
-//
-//   func foo(a : () -> ()) {} // assume this has an unknown body
-//
-//   func bar() {
-//     var x = 42
-//
-//     foo({ print(x) })
-//   }
-//
-// Since x is captured by-ref by the closure, x must live on the heap. By
-// looking at bar without any knowledge of foo, we can know that it is safe to
-// promote this to a by-value capture, allowing x to live on the stack under the
-// following conditions:
-//
-// 1. If x is not modified in the closure body and is only loaded.
-// 2. If we can prove that all mutations to x occur before the closure is
-//    formed.
-//
-// Under these conditions if x is loadable then we can even load the given value
-// and pass it as a scalar instead of an address.
-//
+///
+/// \file
+///
+/// Promotes captures from 'inout' (i.e. by-reference) to by-value
+/// ==============================================================
+///
+/// Swift's closure model is that all local variables are capture by reference.
+/// This produces a very simple programming model which is great to use, but
+/// relies on the optimizer to promote by-ref captures to by-value (i.e. by-copy)
+/// captures for decent performance. Consider this simple example:
+///
+///   func foo(a : () -> ()) {} // assume this has an unknown body
+///
+///   func bar() {
+///     var x = 42
+///
+///     foo({ print(x) })
+///   }
+///
+/// Since x is captured by-ref by the closure, x must live on the heap. By
+/// looking at bar without any knowledge of foo, we can know that it is safe to
+/// promote this to a by-value capture, allowing x to live on the stack under the
+/// following conditions:
+///
+/// 1. If x is not modified in the closure body and is only loaded.
+/// 2. If we can prove that all mutations to x occur before the closure is
+///    formed.
+///
+/// Under these conditions if x is loadable then we can even load the given value
+/// and pass it as a scalar instead of an address.
+///
 //===----------------------------------------------------------------------===//
 
 #define DEBUG_TYPE "sil-capture-promotion"
 #include "swift/SILOptimizer/PassManager/Passes.h"
+#include "swift/SILOptimizer/Utils/SpecializationMangler.h"
 #include "swift/SIL/Mangle.h"
 #include "swift/SIL/SILCloner.h"
 #include "swift/SIL/TypeSubstCloner.h"
 #include "swift/SILOptimizer/PassManager/Transforms.h"
+#include "swift/AST/GenericEnvironment.h"
 #include "llvm/ADT/BitVector.h"
 #include "llvm/ADT/SmallSet.h"
 #include "llvm/ADT/Statistic.h"
@@ -79,7 +83,7 @@ public:
     uint64_t *Bits;
     unsigned NumBitWords; // Words per row.
 
-    ReachingBlockMatrix(): Bits(0), NumBitWords(0) {}
+    ReachingBlockMatrix() : Bits(nullptr), NumBitWords(0) {}
 
     bool empty() const { return !Bits; }
   };
@@ -93,7 +97,7 @@ public:
   }
   static void deallocateMatrix(ReachingBlockMatrix &M) {
     delete [] M.Bits;
-    M.Bits = 0;
+    M.Bits = nullptr;
     M.NumBitWords = 0;
   }
   static ReachingBlockSet allocateSet(unsigned NumBlocks) {
@@ -104,7 +108,7 @@ public:
   }
   static void deallocateSet(ReachingBlockSet &S) {
     delete [] S.Bits;
-    S.Bits = 0;
+    S.Bits = nullptr;
     S.NumBitWords = 0;
   }
 
@@ -113,7 +117,7 @@ private:
   unsigned NumBitWords;
 
 public:
-  ReachingBlockSet(): Bits(0), NumBitWords(0) {}
+  ReachingBlockSet() : Bits(nullptr), NumBitWords(0) {}
 
   ReachingBlockSet(unsigned BlockID, ReachingBlockMatrix &M)
     : Bits(&M.Bits[BlockID * M.NumBitWords]),
@@ -121,12 +125,16 @@ public:
 
   bool test(unsigned ID) const {
     assert(ID / BITWORD_SIZE < NumBitWords && "block ID out-of-bounds");
-    return Bits[ID / BITWORD_SIZE] & (1L << (ID % BITWORD_SIZE));
+    unsigned int modulus = ID % BITWORD_SIZE;
+    long shifted = 1L << modulus;
+    return Bits[ID / BITWORD_SIZE] & shifted;
   }
 
   void set(unsigned ID) {
+    unsigned int modulus = ID % BITWORD_SIZE;
+    long shifted = 1L << modulus;
     assert(ID / BITWORD_SIZE < NumBitWords && "block ID out-of-bounds");
-    Bits[ID / BITWORD_SIZE] |= 1L << (ID % BITWORD_SIZE);
+    Bits[ID / BITWORD_SIZE] |= shifted;
   }
 
   ReachingBlockSet &operator|=(const ReachingBlockSet &RHS) {
@@ -178,41 +186,28 @@ private:
   void compute();
 };
 
-} // end anonymous namespace.
+} // end anonymous namespace
 
 
 namespace {
 /// \brief A SILCloner subclass which clones a closure function while converting
 /// one or more captures from 'inout' (by-reference) to by-value.
-class ClosureCloner : public TypeSubstCloner<ClosureCloner> {
+class ClosureCloner : public SILClonerWithScopes<ClosureCloner> {
 public:
   friend class SILVisitor<ClosureCloner>;
   friend class SILCloner<ClosureCloner>;
 
-  ClosureCloner(SILFunction *Orig, StringRef ClonedName,
-                TypeSubstitutionMap &InterfaceSubs,
-                TypeSubstitutionMap &ContextSubs,
-                ArrayRef<Substitution> ApplySubs,
+  ClosureCloner(SILFunction *Orig, IsFragile_t Fragile,
+                StringRef ClonedName,
                 IndicesSet &PromotableIndices);
 
   void populateCloned();
 
   SILFunction *getCloned() { return &getBuilder().getFunction(); }
 
-protected:
-  // FIXME: We intentionally call SILClonerWithScopes here to ensure
-  //        the debug scopes are set correctly for cloned
-  //        functions. TypeSubstCloner, SILClonerWithScopes, and
-  //        SILCloner desperately need refactoring and/or combining so
-  //        that the obviously right things are happening for cloning
-  //        vs. inlining.
-  void postProcess(SILInstruction *Orig, SILInstruction *Cloned) {
-    SILClonerWithScopes<ClosureCloner>::postProcess(Orig, Cloned);
-  }
-
 private:
-  static SILFunction *initCloned(SILFunction *Orig, StringRef ClonedName,
-                                 TypeSubstitutionMap &InterfaceSubs,
+  static SILFunction *initCloned(SILFunction *Orig, IsFragile_t Fragile,
+                                 StringRef ClonedName,
                                  IndicesSet &PromotableIndices);
 
   void visitDebugValueAddrInst(DebugValueAddrInst *Inst);
@@ -226,7 +221,7 @@ private:
   llvm::DenseMap<SILArgument*, SILValue> BoxArgumentMap;
   llvm::DenseMap<ProjectBoxInst*, SILValue> ProjectBoxArgumentMap;
 };
-} // end anonymous namespace.
+} // end anonymous namespace
 
 /// \brief Compute ReachabilityInfo so that it can answer queries about
 /// whether a given basic block in a function is reachable from another basic
@@ -305,17 +300,13 @@ ReachabilityInfo::isReachable(SILBasicBlock *From, SILBasicBlock *To) {
   return FromSet.test(FI->second);
 }
 
-ClosureCloner::ClosureCloner(SILFunction *Orig, StringRef ClonedName,
-                             TypeSubstitutionMap &InterfaceSubs,
-                             TypeSubstitutionMap &ContextSubs,
-                             ArrayRef<Substitution> ApplySubs,
+ClosureCloner::ClosureCloner(SILFunction *Orig, IsFragile_t Fragile,
+                             StringRef ClonedName,
                              IndicesSet &PromotableIndices)
-  : TypeSubstCloner<ClosureCloner>(
-                           *initCloned(Orig, ClonedName, InterfaceSubs,
-                                       PromotableIndices),
-                           *Orig, ContextSubs, ApplySubs),
+  : SILClonerWithScopes<ClosureCloner>(
+                           *initCloned(Orig, Fragile, ClonedName, PromotableIndices)),
     Orig(Orig), PromotableIndices(PromotableIndices) {
-  assert(Orig->getDebugScope()->SILFn != getCloned()->getDebugScope()->SILFn);
+  assert(Orig->getDebugScope()->Parent != getCloned()->getDebugScope()->Parent);
 }
 
 /// Compute the SILParameterInfo list for the new cloned closure.
@@ -329,7 +320,8 @@ static void
 computeNewArgInterfaceTypes(SILFunction *F,
                             IndicesSet &PromotableIndices,
                             SmallVectorImpl<SILParameterInfo> &OutTys) {
-  auto Parameters = F->getLoweredFunctionType()->getParameters();
+  auto fnConv = F->getConventions();
+  auto Parameters = fnConv.funcTy->getParameters();
 
   DEBUG(llvm::dbgs() << "Preparing New Args!\n");
 
@@ -337,23 +329,32 @@ computeNewArgInterfaceTypes(SILFunction *F,
   for (unsigned Index : indices(Parameters)) {
     auto &param = Parameters[Index];
 
+    // The PromotableIndices index is expressed as the argument index (num
+    // indirect result + param index). Add back the num indirect results to get
+    // the arg index when working with PromotableIndices.
+    unsigned ArgIndex = Index + fnConv.getSILArgIndexOfFirstParam();
+
     DEBUG(llvm::dbgs() << "Index: " << Index << "; PromotableIndices: "
-          << (PromotableIndices.count(Index)?"yes":"no")
+          << (PromotableIndices.count(ArgIndex)?"yes":"no")
           << " Param: "; param.dump());
 
-    if (!PromotableIndices.count(Index)) {
+    if (!PromotableIndices.count(ArgIndex)) {
       OutTys.push_back(param);
       continue;
     }
     
     // Perform the proper conversions and then add it to the new parameter list
     // for the type.
-    assert(!isIndirectParameter(param.getConvention()));
-    auto paramBoxedTy = param.getSILType().castTo<SILBoxType>()
-      ->getBoxedAddressType();
+    assert(!param.isFormalIndirect());
+    auto paramTy = param.getSILStorageType();
+    auto paramBoxTy = paramTy.castTo<SILBoxType>();
+    assert(paramBoxTy->getLayout()->getFields().size() == 1
+           && "promoting compound box not implemented yet");
+    auto paramBoxedTy = paramBoxTy->getFieldType(F->getModule(), 0);
     auto &paramTL = F->getModule().Types.getTypeLowering(paramBoxedTy);
+
     ParameterConvention convention;
-    if (paramTL.isPassedIndirectly()) {
+    if (paramTL.isFormallyPassedIndirectly()) {
       convention = ParameterConvention::Indirect_In;
     } else if (paramTL.isTrivial()) {
       convention = ParameterConvention::Direct_Unowned;
@@ -366,22 +367,26 @@ computeNewArgInterfaceTypes(SILFunction *F,
 }
 
 static std::string getSpecializedName(SILFunction *F,
+                                      IsFragile_t Fragile,
                                       IndicesSet &PromotableIndices) {
   Mangle::Mangler M;
-  auto P = SpecializationPass::CapturePromotion;
-  FunctionSignatureSpecializationMangler FSSM(P, M, F);
-  CanSILFunctionType FTy = F->getLoweredFunctionType();
+  auto P = Demangle::SpecializationPass::CapturePromotion;
+  FunctionSignatureSpecializationMangler OldFSSM(P, M, Fragile, F);
+  NewMangling::FunctionSignatureSpecializationMangler NewFSSM(P, Fragile, F);
+  auto fnConv = F->getConventions();
 
-  ArrayRef<SILParameterInfo> Parameters = FTy->getParameters();
-  for (unsigned Index : indices(Parameters)) {
-    if (!PromotableIndices.count(Index))
+  for (unsigned argIdx = 0, endIdx = fnConv.getNumSILArguments();
+       argIdx < endIdx; ++argIdx) {
+    if (!PromotableIndices.count(argIdx))
       continue;
-    FSSM.setArgumentBoxToValue(Index);
+    OldFSSM.setArgumentBoxToValue(argIdx);
+    NewFSSM.setArgumentBoxToValue(argIdx);
   }
 
-  FSSM.mangle();
-
-  return M.finalize();
+  OldFSSM.mangle();
+  std::string Old = M.finalize();
+  std::string New = NewFSSM.mangle();
+  return NewMangling::selectMangling(Old, New);
 }
 
 /// \brief Create the function corresponding to the clone of the original
@@ -394,8 +399,8 @@ static std::string getSpecializedName(SILFunction *F,
 /// *NOTE* PromotableIndices only contains the container value of the box, not
 /// the address value.
 SILFunction*
-ClosureCloner::initCloned(SILFunction *Orig, StringRef ClonedName,
-                          TypeSubstitutionMap &InterfaceSubs,
+ClosureCloner::initCloned(SILFunction *Orig, IsFragile_t Fragile,
+                          StringRef ClonedName,
                           IndicesSet &PromotableIndices) {
   SILModule &M = Orig->getModule();
 
@@ -403,36 +408,31 @@ ClosureCloner::initCloned(SILFunction *Orig, StringRef ClonedName,
   SmallVector<SILParameterInfo, 4> ClonedInterfaceArgTys;
   computeNewArgInterfaceTypes(Orig, PromotableIndices, ClonedInterfaceArgTys);
 
-  Module *SM = M.getSwiftModule();
   SILFunctionType *OrigFTI = Orig->getLoweredFunctionType();
 
   // Create the thin function type for the cloned closure.
-  auto ClonedTy =
-    SILFunctionType::get(OrigFTI->getGenericSignature(),
-                         OrigFTI->getExtInfo(),
-                         OrigFTI->getCalleeConvention(),
-                         ClonedInterfaceArgTys,
-                         OrigFTI->getResult(),
-                         OrigFTI->getOptionalErrorResult(),
-                         M.getASTContext());
+  auto ClonedTy = SILFunctionType::get(
+      OrigFTI->getGenericSignature(), OrigFTI->getExtInfo(),
+      OrigFTI->getCalleeConvention(), ClonedInterfaceArgTys,
+      OrigFTI->getResults(), OrigFTI->getOptionalErrorResult(),
+      M.getASTContext());
 
-  auto SubstTy = SILType::substFuncType(M, SM, InterfaceSubs, ClonedTy,
-                                        /* dropGenerics = */ false);
-  
   assert((Orig->isTransparent() || Orig->isBare() || Orig->getLocation())
          && "SILFunction missing location");
   assert((Orig->isTransparent() || Orig->isBare() || Orig->getDebugScope())
          && "SILFunction missing DebugScope");
   assert(!Orig->isGlobalInit() && "Global initializer cannot be cloned");
 
-  auto *Fn = M.getOrCreateFunction(
-      Orig->getLinkage(), ClonedName, SubstTy, Orig->getContextGenericParams(),
-      Orig->getLocation(), Orig->isBare(), IsNotTransparent, Orig->isFragile(),
+  auto *Fn = M.createFunction(
+      Orig->getLinkage(), ClonedName, ClonedTy, Orig->getGenericEnvironment(),
+      Orig->getLocation(), Orig->isBare(), IsNotTransparent, Fragile,
       Orig->isThunk(), Orig->getClassVisibility(), Orig->getInlineStrategy(),
       Orig->getEffectsKind(), Orig, Orig->getDebugScope());
   for (auto &Attr : Orig->getSemanticsAttrs())
     Fn->addSemanticsAttr(Attr);
-  Fn->setDeclCtx(Orig->getDeclContext());
+  if (Orig->hasUnqualifiedOwnership()) {
+    Fn->setUnqualifiedOwnership();
+  }
   return Fn;
 }
 
@@ -441,20 +441,21 @@ ClosureCloner::initCloned(SILFunction *Orig, StringRef ClonedName,
 void
 ClosureCloner::populateCloned() {
   SILFunction *Cloned = getCloned();
-  SILModule &M = Cloned->getModule();
 
   // Create arguments for the entry block
   SILBasicBlock *OrigEntryBB = &*Orig->begin();
-  SILBasicBlock *ClonedEntryBB = new (M) SILBasicBlock(Cloned);
+  SILBasicBlock *ClonedEntryBB = Cloned->createBasicBlock();
   unsigned ArgNo = 0;
-  auto I = OrigEntryBB->bbarg_begin(), E = OrigEntryBB->bbarg_end();
+  auto I = OrigEntryBB->args_begin(), E = OrigEntryBB->args_end();
   while (I != E) {
     if (PromotableIndices.count(ArgNo)) {
       // Handle the case of a promoted capture argument.
-      auto BoxedTy = (*I)->getType().castTo<SILBoxType>()->getBoxedAddressType()
-        .getObjectType();
+      auto BoxTy = (*I)->getType().castTo<SILBoxType>();
+      assert(BoxTy->getLayout()->getFields().size() == 1
+             && "promoting compound box not implemented");
+      auto BoxedTy = BoxTy->getFieldType(Cloned->getModule(),0).getObjectType();
       SILValue MappedValue =
-        new (M) SILArgument(ClonedEntryBB, BoxedTy, (*I)->getDecl());
+          ClonedEntryBB->createFunctionArgument(BoxedTy, (*I)->getDecl());
       BoxArgumentMap.insert(std::make_pair(*I, MappedValue));
       
       // Track the projections of the box.
@@ -465,8 +466,8 @@ ClosureCloner::populateCloned() {
       }
     } else {
       // Otherwise, create a new argument which copies the original argument
-      SILValue MappedValue =
-        new (M) SILArgument(ClonedEntryBB, (*I)->getType(), (*I)->getDecl());
+      SILValue MappedValue = ClonedEntryBB->createFunctionArgument(
+          (*I)->getType(), (*I)->getDecl());
       ValueMap.insert(std::make_pair(*I, MappedValue));
     }
     ++ArgNo;
@@ -492,7 +493,6 @@ ClosureCloner::populateCloned() {
 void ClosureCloner::visitDebugValueAddrInst(DebugValueAddrInst *Inst) {
   SILValue Operand = Inst->getOperand();
   if (auto *A = dyn_cast<ProjectBoxInst>(Operand)) {
-    assert(Operand.getResultNumber() == 0);
     auto I = ProjectBoxArgumentMap.find(A);
     if (I != ProjectBoxArgumentMap.end()) {
       getBuilder().setCurrentDebugScope(getOpScope(Inst->getDebugScope()));
@@ -513,15 +513,14 @@ void
 ClosureCloner::visitStrongReleaseInst(StrongReleaseInst *Inst) {
   SILValue Operand = Inst->getOperand();
   if (SILArgument *A = dyn_cast<SILArgument>(Operand)) {
-    assert(Operand.getResultNumber() == 0);
     auto I = BoxArgumentMap.find(A);
     if (I != BoxArgumentMap.end()) {
       // Releases of the box arguments get replaced with ReleaseValue of the new
       // object type argument.
       SILFunction &F = getBuilder().getFunction();
-      auto &typeLowering = F.getModule().getTypeLowering(I->second.getType());
+      auto &typeLowering = F.getModule().getTypeLowering(I->second->getType());
       SILBuilderWithPostProcess<ClosureCloner, 1> B(this, Inst);
-      typeLowering.emitReleaseValue(B, Inst->getLoc(), I->second);
+      typeLowering.emitDestroyValue(B, Inst->getLoc(), I->second);
       return;
     }
   }
@@ -536,7 +535,6 @@ void
 ClosureCloner::visitStructElementAddrInst(StructElementAddrInst *Inst) {
   SILValue Operand = Inst->getOperand();
   if (auto *A = dyn_cast<ProjectBoxInst>(Operand)) {
-    assert(Operand.getResultNumber() == 0);
     auto I = ProjectBoxArgumentMap.find(A);
     if (I != ProjectBoxArgumentMap.end())
       return;
@@ -562,7 +560,6 @@ void
 ClosureCloner::visitLoadInst(LoadInst *Inst) {
   SILValue Operand = Inst->getOperand();
   if (auto *A = dyn_cast<ProjectBoxInst>(Operand)) {
-    assert(Operand.getResultNumber() == 0);
     auto I = ProjectBoxArgumentMap.find(A);
     if (I != ProjectBoxArgumentMap.end()) {
       // Loads of the address argument get eliminated completely; the uses of
@@ -571,9 +568,7 @@ ClosureCloner::visitLoadInst(LoadInst *Inst) {
       return;
     }
   } else if (auto *SEAI = dyn_cast<StructElementAddrInst>(Operand)) {
-    assert(Operand.getResultNumber() == 0);
     if (auto *A = dyn_cast<ProjectBoxInst>(SEAI->getOperand())) {
-      assert(SEAI->getOperand().getResultNumber() == 0);
       auto I = ProjectBoxArgumentMap.find(A);
       if (I != ProjectBoxArgumentMap.end()) {
         // Loads of a struct_element_addr of an argument get replaced with
@@ -594,7 +589,7 @@ ClosureCloner::visitLoadInst(LoadInst *Inst) {
 static SILArgument *getBoxFromIndex(SILFunction *F, unsigned Index) {
   assert(F->isDefinition() && "Expected definition not external declaration!");
   auto &Entry = F->front();
-  return Entry.getBBArg(Index);
+  return Entry.getArgument(Index);
 }
 
 /// \brief Given a partial_apply instruction and the argument index into its
@@ -651,6 +646,8 @@ isNonmutatingCapture(SILArgument *BoxArg) {
 static bool
 isNonescapingUse(Operand *O, SmallVectorImpl<SILInstruction*> &Mutations) {
   auto *U = O->getUser();
+  if (U->isTypeDependentOperand(*O))
+    return true;
   // Marking the boxed value as escaping is OK. It's just a DI annotation.
   if (isa<MarkFunctionEscapeInst>(U))
     return true;
@@ -686,8 +683,10 @@ isNonescapingUse(Operand *O, SmallVectorImpl<SILInstruction*> &Mutations) {
   // An apply is ok if the argument is used as an inout parameter or an
   // indirect return, but counts as a possible mutation in both cases.
   if (auto *AI = dyn_cast<ApplyInst>(U)) {
-    if (AI->getSubstCalleeType()
-          ->getParameters()[O->getOperandNumber()-1].isIndirect()) {
+    auto argIndex = O->getOperandNumber()-1;
+    SILFunctionConventions substConv(AI->getSubstCalleeType(), AI->getModule());
+    auto convention = substConv.getSILArgumentConvention(argIndex);
+    if (convention.isIndirectConvention()) {
       Mutations.push_back(AI);
       return true;
     }
@@ -705,17 +704,6 @@ isNonescapingUse(Operand *O, SmallVectorImpl<SILInstruction*> &Mutations) {
   return false;
 }
 
-static bool signatureHasDependentTypes(SILFunctionType &CalleeTy) {
-  if (CalleeTy.getSemanticResultSILType().hasTypeParameter())
-    return true;
-
-  for (auto ParamTy : CalleeTy.getParameterSILTypesWithoutIndirectResult())
-    if (ParamTy.hasTypeParameter())
-      return true;
-
-  return false;
-}
-
 /// \brief Examine an alloc_box instruction, returning true if at least one
 /// capture of the boxed variable is promotable.  If so, then the pair of the
 /// partial_apply instruction and the index of the box argument in the closure's
@@ -726,9 +714,7 @@ examineAllocBoxInst(AllocBoxInst *ABI, ReachabilityInfo &RI,
   SmallVector<SILInstruction*, 32> Mutations;
   
   // Scan the box for interesting uses.
-  SILValue Box = ABI->getContainerResult();
-  
-  for (Operand *O : Box.getUses()) {
+  for (Operand *O : ABI->getUses()) {
     if (auto *PAI = dyn_cast<PartialApplyInst>(O->getUser())) {
       unsigned OpNo = O->getOperandNumber();
       assert(OpNo != 0 && "Alloc box used as callee of partial apply?");
@@ -739,22 +725,16 @@ examineAllocBoxInst(AllocBoxInst *ABI, ReachabilityInfo &RI,
       if (IM.count(PAI))
         return false;
 
-      auto Callee = PAI->getCallee();
-      auto CalleeTy = Callee.getType().castTo<SILFunctionType>();
-
-      // Bail if the signature has any dependent types as we do not
-      // currently support these.
-      if (signatureHasDependentTypes(*CalleeTy))
-        return false;
-
+      SILModule &M = PAI->getModule();
       auto closureType = PAI->getType().castTo<SILFunctionType>();
+      SILFunctionConventions closureConv(closureType, M);
 
       // Calculate the index into the closure's argument list of the captured
       // box pointer (the captured address is always the immediately following
       // index so is not stored separately);
-      unsigned Index = OpNo - 1 + closureType->getParameters().size();
+      unsigned Index = OpNo - 1 + closureConv.getNumSILArguments();
 
-      auto *Fn = PAI->getCalleeFunction();
+      auto *Fn = PAI->getReferencedFunction();
       if (!Fn || !Fn->isDefinition())
         return false;
 
@@ -763,9 +743,10 @@ examineAllocBoxInst(AllocBoxInst *ABI, ReachabilityInfo &RI,
       // For now, return false is the address argument is an address-only type,
       // since we currently handle loadable types only.
       // TODO: handle address-only types
-      SILModule &M = PAI->getModule();
-      if (BoxArg->getType().castTo<SILBoxType>()->getBoxedAddressType()
-            .isAddressOnly(M))
+      auto BoxTy = BoxArg->getType().castTo<SILBoxType>();
+      assert(BoxTy->getLayout()->getFields().size() == 1
+             && "promoting compound box not implemented yet");
+      if (BoxTy->getFieldType(M, 0).isAddressOnly(M))
         return false;
 
       // Verify that this closure is known not to mutate the captured value; if
@@ -778,22 +759,25 @@ examineAllocBoxInst(AllocBoxInst *ABI, ReachabilityInfo &RI,
       IM.insert(std::make_pair(PAI, Index));
       continue;
     }
+    if (auto *PBI = dyn_cast<ProjectBoxInst>(O->getUser())) {
+      // Check for mutations of the address component.
+      SILValue Addr = PBI;
+      // If the AllocBox is used by a mark_uninitialized, scan the MUI for
+      // interesting uses.
+      if (Addr->hasOneUse()) {
+        SILInstruction *SingleAddrUser = Addr->use_begin()->getUser();
+        if (isa<MarkUninitializedInst>(SingleAddrUser))
+          Addr = SILValue(SingleAddrUser);
+      }
 
+      for (Operand *AddrOp : Addr->getUses()) {
+        if (!isNonescapingUse(AddrOp, Mutations))
+          return false;
+      }
+      continue;
+    }
     // Verify that this use does not otherwise allow the alloc_box to
     // escape.
-    if (!isNonescapingUse(O, Mutations))
-      return false;
-  }
-  
-  // Check for mutations of the address component.
-  // If the AllocBox is used by a mark_uninitialized, scan the MUI for
-  // interesting uses.
-  SILValue Addr = ABI->getAddressResult();
-  if (Addr.hasOneUse())
-    if (auto MUI = dyn_cast<MarkUninitializedInst>(Addr.use_begin()->getUser()))
-      Addr = SILValue(MUI);
-
-  for (Operand *O : Addr.getUses()) {
     if (!isNonescapingUse(O, Mutations))
       return false;
   }
@@ -801,10 +785,12 @@ examineAllocBoxInst(AllocBoxInst *ABI, ReachabilityInfo &RI,
   // Helper lambda function to determine if instruction b is strictly after
   // instruction a, assuming both are in the same basic block.
   auto isAfter = [](SILInstruction *a, SILInstruction *b) {
-    SILInstruction *f = &*b->getParent()->begin();
-    while (b != f) {
-      b = b->getPrevNode();
-      if (a == b)
+    auto fIter = b->getParent()->begin();
+    auto bIter = b->getIterator();
+    auto aIter = a->getIterator();
+    while (bIter != fIter) {
+      --bIter;
+      if (aIter == bIter)
         return true;
     }
     return false;
@@ -839,34 +825,23 @@ constructClonedFunction(PartialApplyInst *PAI, FunctionRefInst *FRI,
                         IndicesSet &PromotableIndices) {
   SILFunction *F = PAI->getFunction();
 
-  // Create the substitution maps.
-  TypeSubstitutionMap InterfaceSubs;
-  TypeSubstitutionMap ContextSubs;
-
-  ArrayRef<Substitution> ApplySubs = PAI->getSubstitutions();
-  auto genericSig = F->getLoweredFunctionType()->getGenericSignature();
-  auto *genericParams = F->getContextGenericParams();
-
-  if (ApplySubs.size()) {
-    InterfaceSubs = genericSig->getSubstitutionMap(ApplySubs);
-    ContextSubs = genericParams->getSubstitutionMap(ApplySubs);
-  } else {
-    assert(!genericSig && "Function type has Unexpected generic signature!");
-    assert(!genericParams &&
-           "Function definition has unexpected generic params!");
-  }
-
   // Create the Cloned Name for the function.
   SILFunction *Orig = FRI->getReferencedFunction();
-  auto ClonedName = getSpecializedName(Orig, PromotableIndices);
+
+  IsFragile_t Fragile = IsNotFragile;
+  if (F->isFragile() && Orig->isFragile())
+    Fragile = IsFragile;
+
+  auto ClonedName = getSpecializedName(Orig, Fragile, PromotableIndices);
 
   // If we already have such a cloned function in the module then just use it.
-  if (auto *PrevF = F->getModule().lookUpFunction(ClonedName))
+  if (auto *PrevF = F->getModule().lookUpFunction(ClonedName)) {
+    assert(PrevF->isFragile() == Fragile);
     return PrevF;
+  }
 
   // Otherwise, create a new clone.
-  ClosureCloner cloner(Orig, ClonedName, InterfaceSubs,
-                       ContextSubs, ApplySubs, PromotableIndices);
+  ClosureCloner cloner(Orig, Fragile, ClonedName, PromotableIndices);
   cloner.populateCloned();
   return cloner.getCloned();
 }
@@ -882,7 +857,6 @@ processPartialApplyInst(PartialApplyInst *PAI, IndicesSet &PromotableIndices,
   SILModule &M = PAI->getModule();
 
   auto *FRI = dyn_cast<FunctionRefInst>(PAI->getCallee());
-  assert(FRI && PAI->getCallee().getResultNumber() == 0);
 
   // Clone the closure with the given promoted captures.
   SILFunction *ClonedFn = constructClonedFunction(PAI, FRI, PromotableIndices);
@@ -892,41 +866,52 @@ processPartialApplyInst(PartialApplyInst *PAI, IndicesSet &PromotableIndices,
   // closure.
   SILBuilderWithScope B(PAI);
   SILValue FnVal = B.createFunctionRef(PAI->getLoc(), ClonedFn);
-  SILType FnTy = FnVal.getType();
+  SILType FnTy = FnVal->getType();
 
   // Populate the argument list for a new partial_apply instruction, taking into
   // consideration any captures.
-  auto CalleePInfo =
-      PAI->getCallee().getType().castTo<SILFunctionType>()->getParameters();
-  auto PInfo = PAI->getType().castTo<SILFunctionType>()->getParameters();
-  unsigned FirstIndex = PInfo.size();
+  auto CalleeFunctionTy = PAI->getCallee()->getType().castTo<SILFunctionType>();
+  SILFunctionConventions calleeConv(CalleeFunctionTy, M);
+  auto CalleePInfo = CalleeFunctionTy->getParameters();
+  SILFunctionConventions paConv(PAI->getType().castTo<SILFunctionType>(), M);
+  unsigned FirstIndex = paConv.getNumSILArguments();
   unsigned OpNo = 1, OpCount = PAI->getNumOperands();
   SmallVector<SILValue, 16> Args;
+  auto NumIndirectResults = calleeConv.getNumIndirectSILResults();
   while (OpNo != OpCount) {
     unsigned Index = OpNo - 1 + FirstIndex;
     if (PromotableIndices.count(Index)) {
       SILValue BoxValue = PAI->getOperand(OpNo);
-      assert(isa<AllocBoxInst>(BoxValue) &&
-             BoxValue.getResultNumber() == 0);
+      AllocBoxInst *ABI = cast<AllocBoxInst>(BoxValue);
 
-      SILParameterInfo CPInfo = CalleePInfo[Index];
-      assert(CPInfo.getSILType() == BoxValue.getType() &&
-             "SILType of parameter info does not match type of parameter");
+      SILParameterInfo CPInfo = CalleePInfo[Index - NumIndirectResults];
+      assert(calleeConv.getSILType(CPInfo) == BoxValue->getType()
+             && "SILType of parameter info does not match type of parameter");
       // Cleanup the captured argument.
       releasePartialApplyCapturedArg(B, PAI->getLoc(), BoxValue,
                                      CPInfo);
 
       // Load and copy from the address value, passing the result as an argument
       // to the new closure.
-      SILValue Addr = cast<AllocBoxInst>(BoxValue)->getAddressResult();
-      // If the address is marked uninitialized, load through the mark, so that
-      // DI can reason about it.
-      if (Addr.hasOneUse())
-        if (auto MUI = dyn_cast<MarkUninitializedInst>(
-                                                   Addr.use_begin()->getUser()))
-          Addr = SILValue(MUI);
+      SILValue Addr;
+      for (Operand *BoxUse : ABI->getUses()) {
+        auto *PBI = dyn_cast<ProjectBoxInst>(BoxUse->getUser());
+          // If the address is marked uninitialized, load through the mark, so
+          // that DI can reason about it.
+        if (PBI && PBI->hasOneUse()) {
+          SILInstruction *PBIUser = PBI->use_begin()->getUser();
+          if (isa<MarkUninitializedInst>(PBIUser))
+            Addr = PBIUser;
+          break;
+        }
+      }
+      // We only reuse an existing project_box if it directly follows the
+      // alloc_box. This makes sure that the project_box dominates the
+      // partial_apply.
+      if (!Addr)
+        Addr = getOrCreateProjectBox(ABI, 0);
 
-      auto &typeLowering = M.getTypeLowering(Addr.getType());
+      auto &typeLowering = M.getTypeLowering(Addr->getType());
       Args.push_back(
         typeLowering.emitLoadOfCopy(B, PAI->getLoc(), Addr, IsNotTake));
       ++NumCapturesPromoted;
@@ -942,7 +927,7 @@ processPartialApplyInst(PartialApplyInst *PAI, IndicesSet &PromotableIndices,
   auto *NewPAI = B.createPartialApply(PAI->getLoc(), FnVal, SubstFnTy,
                                       PAI->getSubstitutions(), Args,
                                       PAI->getType());
-  SILValue(PAI, 0).replaceAllUsesWith(NewPAI);
+  PAI->replaceAllUsesWith(NewPAI);
   PAI->eraseFromParent();
   if (FRI->use_empty()) {
     FRI->eraseFromParent();

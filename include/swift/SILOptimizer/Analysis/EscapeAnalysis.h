@@ -2,11 +2,11 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2016 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 
@@ -15,6 +15,7 @@
 
 #include "swift/SIL/SILInstruction.h"
 #include "swift/SIL/SILFunction.h"
+#include "swift/SILOptimizer/Analysis/BasicCalleeAnalysis.h"
 #include "swift/SILOptimizer/Analysis/BottomUpIPAnalysis.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SetVector.h"
@@ -104,14 +105,16 @@ class EscapeAnalysis : public BottomUpIPAnalysis {
     Global
   };
 
-  class CGNode;
-  class CGNodeMap;
 public:
+  class CGNode;
   class ConnectionGraph;
 private:
+  class CGNodeMap;
 
   /// The int-part is an EdgeType and specifies which kind of predecessor it is.
   typedef llvm::PointerIntPair<CGNode *, 1> Predecessor;
+
+public:
 
   /// A node in the connection graph.
   /// A node basically represents a "pointer" or the "memory content" where a
@@ -296,8 +299,17 @@ private:
         case EscapeState::Global:
           return true;
       }
+
+      llvm_unreachable("Unhandled EscapeState in switch.");
+    }
+
+    /// Returns the content node if of this node if it exists in the graph.
+    CGNode *getContentNodeOrNull() const {
+      return pointsTo;
     }
   };
+
+private:
 
   /// Mapping from nodes in a callee-graph to nodes in a caller-graph.
   class CGNodeMap {
@@ -371,8 +383,12 @@ public:
     /// The allocator for nodes.
     llvm::SpecificBumpPtrAllocator<CGNode> NodeAllocator;
 
+    /// True if this is a summary graph.
+    bool isSummaryGraph;
+    
     /// Constructs a connection graph for a function.
-    ConnectionGraph(SILFunction *F) : F(F) {
+    ConnectionGraph(SILFunction *F, bool isSummaryGraph) :
+      F(F), isSummaryGraph(isSummaryGraph) {
     }
 
     /// Returns true if the connection graph is empty.
@@ -433,11 +449,6 @@ public:
     /// Returns null, if V is not a "pointer".
     CGNode *getNode(ValueBase *V, EscapeAnalysis *EA, bool createIfNeeded = true);
 
-    /// Gets or creates a node for a SILValue (same as above).
-   CGNode *getNode(SILValue V, EscapeAnalysis *EA) {
-      return getNode(V.getDef(), EA, true);
-    }
-
     /// Gets or creates a content node to which \a AddrNode points to.
     CGNode *getContentNode(CGNode *AddrNode);
 
@@ -445,7 +456,8 @@ public:
     CGNode *getReturnNode() {
       if (!ReturnNode) {
         ReturnNode = allocNode(nullptr, NodeType::Return);
-        ReturnNode->mergeEscapeState(EscapeState::Return);
+        if (!isSummaryGraph)
+          ReturnNode->mergeEscapeState(EscapeState::Return);
       }
       return ReturnNode;
     }
@@ -496,11 +508,25 @@ public:
     }
 
     /// Creates a defer-edge between \p From and \p To.
-    /// This may invalidate the graph invariance 4). See addDeferEdge.
-    bool defer(CGNode *From, CGNode *To) {
-      bool EdgeAdded = addDeferEdge(From, To);
+    /// This may trigger node merges to keep the graph invariance 4).
+    /// Returns the \p From node or its merge-target in case \p From was merged
+    /// during adding the edge.
+    /// The \p EdgeAdded is set to true if there was no defer-edge between
+    /// \p From and \p To, yet.
+    CGNode *defer(CGNode *From, CGNode *To, bool &EdgeAdded) {
+      if (addDeferEdge(From, To))
+        EdgeAdded = true;
       mergeAllScheduledNodes();
-      return EdgeAdded;
+      return From->getMergeTarget();
+    }
+
+    /// Creates a defer-edge between \p From and \p To.
+    /// This may trigger node merges to keep the graph invariance 4).
+    /// Returns the \p From node or its merge-target in case \p From was merged
+    /// during adding the edge.
+    CGNode *defer(CGNode *From, CGNode *To) {
+      bool UnusedEdgeAddedFlag = false;
+      return defer(From, To, UnusedEdgeAddedFlag);
     }
 
     /// Merges the \p SourceGraph into this graph. The \p Mapping contains the
@@ -527,11 +553,6 @@ public:
     /// Returns null, if V is not a "pointer".
     CGNode *getNodeOrNull(ValueBase *V, EscapeAnalysis *EA) {
       return getNode(V, EA, false);
-    }
-
-    /// Gets or creates a node for a SILValue (same as above).
-    CGNode *getNodeOrNull(SILValue V, EscapeAnalysis *EA) {
-      return getNode(V.getDef(), EA, false);
     }
 
     /// Returns the number of use-points of a node.
@@ -561,7 +582,7 @@ public:
     /// program, displaying the connection graph. This depends on there being a
     /// dot graph viewer program, like 'graphviz', in your path.
     ///
-    /// Defer-edges are grey, points-to edges are black.
+    /// Defer-edges are gray, points-to edges are black.
     /// Content nodes are rounded rectangles, argument/return nodes are bold.
     /// Global escaping nodes are red, argument escaping nodes are blue.
     void viewCG() const;
@@ -581,7 +602,7 @@ private:
 
   /// All the information we keep for a function.
   struct FunctionInfo : public FunctionInfoBase<FunctionInfo> {
-    FunctionInfo(SILFunction *F) : Graph(F), SummaryGraph(F) { }
+    FunctionInfo(SILFunction *F) : Graph(F, false), SummaryGraph(F, true) { }
 
     /// The connection graph for the function. This is what clients of the
     /// analysis will see.
@@ -655,26 +676,41 @@ private:
     return FInfo;
   }
 
+  /// Build a connection graph for reach callee from the callee list.
+  bool buildConnectionGraphForCallees(SILInstruction *Caller,
+                                      CalleeList Callees,
+                                      FunctionInfo *FInfo,
+                                      FunctionOrder &BottomUpOrder,
+                                      int RecursionDepth);
+
+  /// Build a connection graph for the destructor invoked for a provided
+  /// SILValue.
+  bool buildConnectionGraphForDestructor(SILValue V,
+                                         SILInstruction *Caller,
+                                         FunctionInfo *FInfo,
+                                         FunctionOrder &BottomUpOrder,
+                                         int RecursionDepth);
+
   /// Builds the connection graph for a function, including called functions.
   /// Visited callees are added to \p BottomUpOrder until \p RecursionDepth
   /// reaches MaxRecursionDepth.
   void buildConnectionGraph(FunctionInfo *FInfo, FunctionOrder &BottomUpOrder,
                             int RecursionDepth);
 
-  /// Updates the graph by analysing instruction \p I.
+  /// Updates the graph by analyzing instruction \p I.
   /// Visited callees are added to \p BottomUpOrder until \p RecursionDepth
   /// reaches MaxRecursionDepth.
   void analyzeInstruction(SILInstruction *I, FunctionInfo *FInfo,
                           FunctionOrder &BottomUpOrder,
                           int RecursionDepth);
 
-  /// Updates the graph by analysing instruction \p SI, which may be a
+  /// Updates the graph by analyzing instruction \p SI, which may be a
   /// select_enum, select_enum_addr or select_value.
   template<class SelectInst>
   void analyzeSelectInst(SelectInst *SI, ConnectionGraph *ConGraph);
 
-  /// Returns true if \p V is an Array or the storage reference of an array.
-  bool isArrayOrArrayStorage(SILValue V);
+  /// Returns true if a release of \p V is known to not capture its content.
+  bool deinitIsKnownToNotCapture(SILValue V);
 
   /// Sets all operands and results of \p I as global escaping.
   void setAllEscaping(SILInstruction *I, ConnectionGraph *ConGraph);
@@ -685,7 +721,7 @@ private:
 
   /// Merges the graph of a callee function into the graph of
   /// a caller function, whereas \p FAS is the call-site.
-  bool mergeCalleeGraph(FullApplySite FAS,
+  bool mergeCalleeGraph(SILInstruction *FAS,
                         ConnectionGraph *CallerGraph,
                         ConnectionGraph *CalleeGraph);
 
@@ -739,6 +775,14 @@ public:
   /// This means that either \p To is the same as \p V or contains a reference
   /// to \p V.
   bool canEscapeToValue(SILValue V, SILValue To);
+
+  /// Returns true if the parameter with index \p ParamIdx can escape in the
+  /// called function of apply site \p FAS.
+  /// If it is an indirect parameter and \p checkContentOfIndirectParam is true
+  /// then the escape status is not checked for the address itself but for the
+  /// referenced pointer (if the referenced type is a pointer).
+  bool canParameterEscape(FullApplySite FAS, int ParamIdx,
+                          bool checkContentOfIndirectParam);
 
   /// Returns true if the pointers \p V1 and \p V2 can possibly point to the
   /// same memory.

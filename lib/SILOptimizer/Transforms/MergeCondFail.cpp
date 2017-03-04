@@ -1,12 +1,12 @@
-//===--- MergeCondFail.cpp -  Merge cond_fail instructions ------*- C++ -*-===//
+//===--- MergeCondFail.cpp -  Merge cond_fail instructions ----------------===//
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2016 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 
@@ -106,8 +106,8 @@ public:
       auto CurCond = CondFailToMerge[I]->getOperand();
       if (MergedCond) {
         CurCond = Builder.createBuiltinBinaryFunction(Loc, "or",
-                                                      CurCond.getType(),
-                                                      CurCond.getType(),
+                                                      CurCond->getType(),
+                                                      CurCond->getType(),
                                                       {MergedCond, CurCond});
       }
 
@@ -120,7 +120,7 @@ public:
     return true;
   }
 };
-}
+} // end anonymous namespace
 
 SILTransform *swift::createMergeCondFails() {
   return new MergeCondFailInsts();

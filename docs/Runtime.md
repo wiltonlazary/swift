@@ -23,7 +23,7 @@ information that only pertains to ObjC interop, are marked **ObjC-only**.
 Entry points in this section are intended to be removed or internalized before
 ABI stabilization.
 
-### Exported C++ symbols 
+### Exported C++ symbols
 
 **ABI TODO**: Any exported C++ symbols are implementation details that are not
 intended to be part of the stable runtime interface.
@@ -73,8 +73,6 @@ Rename with a non-`stdlib` naming scheme.
 000000000001cb30 T _swift_allocBox
 000000000001c990 T _swift_allocObject
 000000000001ca60 T _swift_bufferAllocate
-000000000001ca70 T _swift_bufferAllocateOnStack
-000000000001ca80 T _swift_bufferDeallocateFromStack
 000000000001ca90 T _swift_bufferHeaderSize
 000000000001cd30 T _swift_deallocBox
 000000000001d490 T _swift_deallocClassInstance
@@ -88,6 +86,14 @@ Rename with a non-`stdlib` naming scheme.
 ```
 
 ## Reference counting
+
+### swift\_retainCount
+
+```
+@convention(c) (@unowned NativeObject) -> UInt
+```
+
+Returns a random number. Only used by allocation profiling tools.
 
 ### TODO
 
@@ -152,6 +158,7 @@ Rename with a non-`stdlib` naming scheme.
 000000000002b290 T _swift_isUniquelyReferencedOrPinned_nonNull_native
 000000000002af00 T _swift_isUniquelyReferenced_native
 000000000002aea0 T _swift_isUniquelyReferenced_nonNull_native
+00000000000????? T _swift_setDeallocating
 000000000001d280 T _swift_isDeallocating
 ```
 
@@ -242,7 +249,6 @@ process start and the function returns.
 should be implementable in the standard library now.
 
 ```
-0000000000003b60 T _swift_bridgeNonVerbatimFromObjectiveC
 0000000000003c80 T _swift_bridgeNonVerbatimFromObjectiveCConditional
 00000000000037e0 T _swift_bridgeNonVerbatimToObjectiveC
 00000000000039c0 T _swift_getBridgedNonVerbatimObjectiveCType
@@ -282,10 +288,6 @@ detail used to implement resilient per-type metadata accessor functions.
 000000000001f1f0 T _swift_getFunctionTypeMetadata2
 000000000001f250 T _swift_getFunctionTypeMetadata3
 000000000001e940 T _swift_getGenericMetadata
-000000000001e9c0 T _swift_getGenericMetadata1
-000000000001ea60 T _swift_getGenericMetadata2
-000000000001eb00 T _swift_getGenericMetadata3
-000000000001eba0 T _swift_getGenericMetadata4
 0000000000022fd0 T _swift_getMetatypeMetadata
 000000000001ec50 T _swift_getObjCClassMetadata
 000000000001e6b0 T _swift_getResilientMetadata

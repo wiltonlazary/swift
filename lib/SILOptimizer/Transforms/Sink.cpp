@@ -1,12 +1,12 @@
-//===--- Sink.cpp ----- Code Sinking ----------------------------*- C++ -*-===//
+//===--- Sink.cpp ----- Code Sinking --------------------------------------===//
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2016 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 ///
@@ -36,7 +36,7 @@
 
 using namespace swift;
 
-STATISTIC(NumInstrSunk,   "Number of instructions sunk");
+STATISTIC(NumInstrSunk, "Number of instructions sunk");
 
 namespace {
 
@@ -73,7 +73,7 @@ public:
 
     // TODO: We may want to delete debug instructions to allow us to sink more
     // instructions.
-    for (auto *Operand : II->getUses())  {
+    for (auto *Operand : II->getUses()) {
       SILInstruction *User = Operand->getUser();
 
       // Check if the instruction is already in the user's block.
@@ -162,7 +162,7 @@ public:
     return "Sinks instructions closer to their users";
   }
 };
-}
+} // end anonymous namespace
 
 SILTransform *swift::createCodeSinking() {
   return new CodeSinkingPass();

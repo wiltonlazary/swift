@@ -1,4 +1,4 @@
-// RUN: %target-parse-verify-swift
+// RUN: %target-typecheck-verify-swift
 
 protocol P1 {
   func foo() // expected-note {{protocol requires function 'foo()'}}
@@ -29,7 +29,7 @@ protocol P3 {
   func foo() // expected-note {{protocol requires function 'foo()'}}
   func bar() // okay
   func baz() -> Baz
-  typealias Baz
+  associatedtype Baz
 }
 
 extension P3 {
@@ -45,7 +45,7 @@ protocol P4 {
   func foo() // expected-note {{protocol requires function 'foo()'}}
   func bar() // expected-note {{protocol requires function 'bar()'}}
   func baz() -> Baz // okay
-  typealias Baz
+  associatedtype Baz
 }
 protocol P4Helper {}
 
@@ -59,7 +59,7 @@ struct P4Conformer : P4 { // expected-error {{does not conform}}
 
 
 protocol P5 {
-  typealias Foo
+  associatedtype Foo
   func foo() -> Foo // expected-note {{protocol requires function 'foo()'}}
   func bar() -> Foo // okay
   func baz() -> Foo // okay
@@ -75,17 +75,17 @@ struct P5Conformer : P5 { // expected-error {{does not conform}}
 
 
 protocol P6Base {
-  typealias Foo
+  associatedtype Foo // expected-note {{protocol requires nested type 'Foo'; do you want to add it?}}
   func foo()
-  func bar() -> Foo // expected-note{{protocol requires function 'bar()' }}
+  func bar() -> Foo
 }
 extension P6Base {
 }
 protocol P6 : P6Base {
-  typealias Bar // expected-note {{protocol requires nested type 'Bar'}}
+  associatedtype Bar // expected-note {{protocol requires nested type 'Bar'}}
 }
 extension P6 {
-  func bar() -> Bar? { return nil } // expected-note{{candidate has non-matching type}}
+  func bar() -> Bar? { return nil }
 }
 
 struct P6Conformer : P6 { // expected-error 2 {{does not conform}}
@@ -93,9 +93,22 @@ struct P6Conformer : P6 { // expected-error 2 {{does not conform}}
 }
 
 // rdar://problem/23033862
-// expected-error@+2{{type 'A' does not conform to protocol 'OptionSetType'}}
+// expected-error@+2{{type 'A' does not conform to protocol 'OptionSet'}}
 // expected-error@+1{{type 'A' does not conform to protocol 'RawRepresentable'}}
-struct A: OptionSetType {
-    let rawValue = 0
-    init() { } // expected-note 2{{candidate has non-matching type '()'}}
+struct A: OptionSet {
+  let rawValue = 0
+  init() { } // expected-note 2{{candidate has non-matching type '()'}}
+}
+
+// FIXME: Crappy diagnostic
+protocol PA {
+  associatedtype A // expected-note 2 {{protocol requires nested type 'A'; do you want to add it?}}
+}
+
+struct BadCase1 : PA { // expected-error {{type 'BadCase1' does not conform to protocol 'PA'}}
+  struct A<T> {}
+}
+
+struct BadCase2 : PA { // expected-error {{type 'BadCase2' does not conform to protocol 'PA'}}
+  typealias A<T> = T
 }

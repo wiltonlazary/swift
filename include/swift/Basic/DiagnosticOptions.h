@@ -2,11 +2,11 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2016 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 
@@ -24,7 +24,15 @@ public:
   /// Indicates whether the diagnostics produced during compilation should be
   /// checked against expected diagnostics, indicated by markers in the
   /// input source file.
-  bool VerifyDiagnostics = false;
+  enum {
+    NoVerify,
+    Verify,
+    VerifyAndApplyFixes
+  } VerifyMode = NoVerify;
+
+  /// Indicates whether to allow diagnostics for \c <unknown> locations if
+  /// \c VerifyMode is not \c NoVerify.
+  bool VerifyIgnoreUnknown = false;
 
   /// Indicates whether diagnostic passes should be skipped.
   bool SkipDiagnosticPasses = false;
@@ -35,8 +43,14 @@ public:
   /// When emitting fixits as code edits, apply all fixits from diagnostics
   /// without any filtering.
   bool FixitCodeForAllDiagnostics = false;
+
+  /// Suppress all warnings
+  bool SuppressWarnings = false;
+
+  /// Treat all warnings as errors
+  bool WarningsAsErrors = false;
 };
 
-}
+} // end namespace swift
 
-#endif
+#endif // SWIFT_BASIC_DIAGNOSTICOPTIONS_H

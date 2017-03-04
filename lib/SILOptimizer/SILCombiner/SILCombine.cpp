@@ -2,11 +2,11 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2016 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 //
@@ -51,9 +51,9 @@ STATISTIC(NumDeadInst, "Number of dead insts eliminated");
 /// worklist (this significantly speeds up SILCombine on code where many
 /// instructions are dead or constant).
 void SILCombiner::addReachableCodeToWorklist(SILBasicBlock *BB) {
-  llvm::SmallVector<SILBasicBlock*, 256> Worklist;
-  llvm::SmallVector<SILInstruction*, 128> InstrsForSILCombineWorklist;
-  llvm::SmallPtrSet<SILBasicBlock*, 64> Visited;
+  llvm::SmallVector<SILBasicBlock *, 256> Worklist;
+  llvm::SmallVector<SILInstruction *, 128> InstrsForSILCombineWorklist;
+  llvm::SmallPtrSet<SILBasicBlock *, 32> Visited;
 
   Worklist.push_back(BB);
   do {
@@ -130,7 +130,7 @@ bool SILCombiner::doOneIteration(SILFunction &F, unsigned Iteration) {
     // instead of shifting all members of the worklist towards the front. This
     // check makes sure that if we run into any such residual null pointers, we
     // skip them.
-    if (I == 0)
+    if (I == nullptr)
       continue;
 
     // Check to see if we can DCE the instruction.
@@ -147,13 +147,13 @@ bool SILCombiner::doOneIteration(SILFunction &F, unsigned Iteration) {
       ++NumSimplified;
 
       DEBUG(llvm::dbgs() << "SC: Simplify Old = " << *I << '\n'
-                         << "    New = " << *Result.getDef() << '\n');
+                         << "    New = " << *Result << '\n');
 
       // Everything uses the new instruction now.
-      replaceInstUsesWith(*I, Result.getDef(), 0, Result.getResultNumber());
+      replaceInstUsesWith(*I, Result);
 
       // Push the new instruction and any users onto the worklist.
-      Worklist.addUsersToWorklist(Result.getDef());
+      Worklist.addUsersToWorklist(Result);
 
       eraseInstFromFunction(*I);
       MadeChange = true;
@@ -225,7 +225,7 @@ bool SILCombiner::doOneIteration(SILFunction &F, unsigned Iteration) {
 void SILCombineWorklist::addInitialGroup(ArrayRef<SILInstruction *> List) {
   assert(Worklist.empty() && "Worklist must be empty to add initial group");
   Worklist.reserve(List.size()+16);
-  WorklistMap.resize(List.size());
+  WorklistMap.reserve(List.size());
   DEBUG(llvm::dbgs() << "SC: ADDING: " << List.size()
         << " instrs to worklist\n");
   while (!List.empty()) {
@@ -254,7 +254,7 @@ bool SILCombiner::runOnFunction(SILFunction &F) {
 // New to the worklist.
 SILInstruction *SILCombiner::insertNewInstBefore(SILInstruction *New,
                                                  SILInstruction &Old) {
-  assert(New && New->getParent() == 0 &&
+  assert(New && New->getParent() == nullptr &&
          "New instruction already inserted into a basic block!");
   SILBasicBlock *BB = Old.getParent();
   BB->insert(&Old, New);  // Insert inst
@@ -278,28 +278,6 @@ SILInstruction *SILCombiner::replaceInstUsesWith(SILInstruction &I,
   return &I;
 }
 
-/// This is meant to be used when one is attempting to replace only one of the
-/// results of I with a result of V.
-SILInstruction *
-SILCombiner::
-replaceInstUsesWith(SILInstruction &I, ValueBase *V, unsigned IIndex,
-                    unsigned VIndex) {
-  assert(IIndex < I.getNumTypes() && "Cannot have more results than "
-         "types.");
-  assert(VIndex < V->getNumTypes() && "Cannot have more results than "
-         "types.");
-
-  // Add all modified instrs to worklist.
-  Worklist.addUsersToWorklist(&I, IIndex);
-
-  DEBUG(llvm::dbgs() << "SC: Replacing " << I << "\n"
-        "    with " << *V << '\n');
-
-  SILValue(&I, IIndex).replaceAllUsesWith(SILValue(V, VIndex));
-
-  return &I;
-}
-
 // Some instructions can never be "trivially dead" due to side effects or
 // producing a void value. In those cases, since we cannot rely on
 // SILCombines trivially dead instruction DCE in order to delete the
@@ -311,7 +289,7 @@ SILInstruction *SILCombiner::eraseInstFromFunction(SILInstruction &I,
                                             bool AddOperandsToWorklist) {
   DEBUG(llvm::dbgs() << "SC: ERASE " << I << '\n');
 
-  assert(hasNoUsesExceptDebug(&I) && "Cannot erase instruction that is used!");
+  assert(onlyHaveDebugUses(&I) && "Cannot erase instruction that is used!");
   // Make sure that we reprocess all operands now that we reduced their
   // use counts.
   if (I.getNumOperands() < 8 && AddOperandsToWorklist) {
@@ -324,7 +302,7 @@ SILInstruction *SILCombiner::eraseInstFromFunction(SILInstruction &I,
     }
   }
 
-  for (Operand *DU : getDebugUses(I))
+  for (Operand *DU : getDebugUses(&I))
     Worklist.remove(DU->getUser());
 
   Worklist.remove(&I);
@@ -361,7 +339,7 @@ class SILCombine : public SILFunctionTransform {
     }
   }
   
-  virtual void handleDeleteNotification(ValueBase *I) override {
+  void handleDeleteNotification(ValueBase *I) override {
     // Linear searching the tracking list doesn't hurt because usually it only
     // contains a few elements.
     auto Iter = std::find(TrackingList.begin(), TrackingList.end(), I);
@@ -369,7 +347,7 @@ class SILCombine : public SILFunctionTransform {
       TrackingList.erase(Iter);      
   }
   
-  virtual bool needsNotifications() override { return true; }
+  bool needsNotifications() override { return true; }
 
   StringRef getName() override { return "SIL Combine"; }
 };

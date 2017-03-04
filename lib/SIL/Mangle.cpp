@@ -2,11 +2,11 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2016 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 //
@@ -17,11 +17,11 @@
 #include "swift/SIL/Mangle.h"
 #include "swift/AST/ASTContext.h"
 #include "swift/AST/ASTVisitor.h"
-#include "swift/AST/Attr.h"
 #include "swift/AST/Initializer.h"
 #include "swift/AST/Mangle.h"
 #include "swift/AST/Module.h"
 #include "swift/AST/ProtocolConformance.h"
+#include "swift/AST/SubstitutionMap.h"
 #include "swift/Basic/Punycode.h"
 #include "swift/SIL/SILArgument.h"
 #include "swift/SIL/SILType.h"
@@ -45,22 +45,40 @@ using namespace Mangle;
 //                           Generic Specialization
 //===----------------------------------------------------------------------===//
 
-static void mangleSubstitution(Mangler &M, Substitution Sub) {
-  M.mangleType(Sub.getReplacement()->getCanonicalType(), 0);
-  for (auto C : Sub.getConformances()) {
-    if (C.isAbstract())
-      return;
-    M.mangleProtocolConformance(C.getConcrete());
+void GenericSpecializationMangler::mangleSpecialization() {
+  Mangler &M = getMangler();
+  // This is a full specialization.
+  SILFunctionType *FTy = Function->getLoweredFunctionType();
+  CanGenericSignature Sig = FTy->getGenericSignature();
+  auto SubMap = Sig->getSubstitutionMap(Subs);
+  for (Type DepType : Sig->getSubstitutableParams()) {
+    M.mangleType(DepType.subst(SubMap)->getCanonicalType(), 0);
+    for (auto C : SubMap.getConformances(DepType->getCanonicalType())) {
+      if (C.isAbstract())
+        return;
+      M.mangleProtocolConformance(C.getConcrete());
+    }
+    M.append('_');
   }
 }
 
-void GenericSpecializationMangler::mangleSpecialization() {
+void PartialSpecializationMangler::mangleSpecialization() {
   Mangler &M = getMangler();
+  // If the only change to the generic signature during specialization is
+  // addition of new same-type requirements, which happens in case of a
+  // full specialization, it would be enough to mangle only the substitutions.
+  //
+  // If the types of function arguments have not changed, but some new
+  // conformances were added to the generic parameters, e.g. in case of
+  // a pre-specialization, then it would be enough to mangle only the new
+  // generic signature.
+  //
+  // If the types of function arguments have changed as a result of a partial
+  // specialization, we need to mangle the entire new function type.
 
-  for (auto &Sub : Subs) {
-    mangleSubstitution(M, Sub);
-    M.append('_');
-  }
+  // This is a partial specialization.
+  M.mangleType(SpecializedFnTy, 0);
+  M.append("_");
 }
 
 //===----------------------------------------------------------------------===//
@@ -69,18 +87,20 @@ void GenericSpecializationMangler::mangleSpecialization() {
 
 FunctionSignatureSpecializationMangler::
 FunctionSignatureSpecializationMangler(SpecializationPass P, Mangler &M,
-                                       SILFunction *F)
-  : SpecializationMangler(SpecializationKind::FunctionSignature, P, M, F) {
-  for (unsigned i : indices(F->getLoweredFunctionType()->getParameters())) {
+                                       IsFragile_t Fragile, SILFunction *F)
+  : SpecializationMangler(SpecializationKind::FunctionSignature, P, M, Fragile, F) {
+  for (unsigned i = 0, e = F->getConventions().getNumSILArguments(); i != e;
+       ++i) {
     (void)i;
     Args.push_back({ArgumentModifierIntBase(ArgumentModifier::Unmodified), nullptr});
   }
+  ReturnValue = ReturnValueModifierIntBase(ReturnValueModifier::Unmodified);
 }
 
 void
 FunctionSignatureSpecializationMangler::
 setArgumentDead(unsigned ArgNo) {
-  Args[ArgNo].first = ArgumentModifierIntBase(ArgumentModifier::Dead);
+  Args[ArgNo].first |= ArgumentModifierIntBase(ArgumentModifier::Dead);
 }
 
 void
@@ -129,6 +149,12 @@ void
 FunctionSignatureSpecializationMangler::
 setArgumentBoxToStack(unsigned ArgNo) {
   Args[ArgNo].first = ArgumentModifierIntBase(ArgumentModifier::BoxToStack);
+}
+
+void
+FunctionSignatureSpecializationMangler::
+setReturnValueOwnedToUnowned() {
+  ReturnValue |= ReturnValueModifierIntBase(ReturnValueModifier::OwnedToUnowned);
 }
 
 void
@@ -200,7 +226,7 @@ mangleClosureProp(PartialApplyInst *PAI) {
   // Then we mangle the types of the arguments that the partial apply is
   // specializing.
   for (auto &Op : PAI->getArgumentOperands()) {
-    SILType Ty = Op.get().getType();
+    SILType Ty = Op.get()->getType();
     M.mangleType(Ty.getSwiftRValueType(), 0);
   }
 }
@@ -269,6 +295,21 @@ void FunctionSignatureSpecializationMangler::mangleArgument(
   assert(hasSomeMod && "Unknown modifier");
 }
 
+void FunctionSignatureSpecializationMangler::
+mangleReturnValue(ReturnValueModifierIntBase RetMod) {
+  if (RetMod == ReturnValueModifierIntBase(ReturnValueModifier::Unmodified)) {
+    return;
+  }
+
+  if (RetMod & ReturnValueModifierIntBase(ReturnValueModifier::Dead)) {
+    M.append("d");
+  }
+
+  if (RetMod & ReturnValueModifierIntBase(ReturnValueModifier::OwnedToUnowned)) {
+    M.append("g");
+  }
+}
+
 void FunctionSignatureSpecializationMangler::mangleSpecialization() {
 
   for (unsigned i : indices(Args)) {
@@ -278,4 +319,6 @@ void FunctionSignatureSpecializationMangler::mangleSpecialization() {
     mangleArgument(ArgMod, Inst);
     M.append("_");
   }
+
+  mangleReturnValue(ReturnValue);
 }

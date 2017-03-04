@@ -2,11 +2,11 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2016 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 //
@@ -32,7 +32,6 @@
 
 namespace swift {
 
-class ClassDecl;
 class SILFunction;
 class SILModule;
 class NormalProtocolConformance;
@@ -63,8 +62,9 @@ public:
   /// A witness table entry describing the witness for an associated type's
   /// protocol requirement.
   struct AssociatedTypeProtocolWitness {
-    /// The associated type required.
-    AssociatedTypeDecl *Requirement;
+    /// The associated type required.  A dependent type in the protocol's
+    /// context.
+    CanType Requirement;
     /// The protocol requirement on the type.
     ProtocolDecl *Protocol;
     /// The ProtocolConformance satisfying the requirement. Null if the
@@ -204,6 +204,8 @@ private:
   SILWitnessTable(SILModule &M, SILLinkage Linkage, StringRef Name,
                   NormalProtocolConformance *Conformance);
 
+  void addWitnessTable();
+
 public:
   /// Create a new SILWitnessTable definition with the given entries.
   static SILWitnessTable *create(SILModule &M, SILLinkage Linkage,
@@ -246,7 +248,7 @@ public:
     for (Entry &entry : Entries) {
       if (entry.getKind() == WitnessKind::Method) {
         const MethodWitness &MW = entry.getMethodWitness();
-        if (predicate(MW)) {
+        if (MW.Witness && predicate(MW)) {
           entry.removeWitnessMethod();
         }
       }
@@ -285,18 +287,7 @@ struct ilist_traits<::swift::SILWitnessTable> :
 public ilist_default_traits<::swift::SILWitnessTable> {
   typedef ::swift::SILWitnessTable SILWitnessTable;
 
-private:
-  mutable ilist_half_node<SILWitnessTable> Sentinel;
-
 public:
-  SILWitnessTable *createSentinel() const {
-    return static_cast<SILWitnessTable*>(&Sentinel);
-  }
-  void destroySentinel(SILWitnessTable *) const {}
-
-  SILWitnessTable *provideInitialHead() const { return createSentinel(); }
-  SILWitnessTable *ensureHead(SILWitnessTable*) const { return createSentinel(); }
-  static void noteHead(SILWitnessTable*, SILWitnessTable*) {}
   static void deleteNode(SILWitnessTable *WT) { WT->~SILWitnessTable(); }
   
 private:

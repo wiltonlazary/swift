@@ -2,18 +2,17 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2016 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 
 #define DEBUG_TYPE "arc-sequence-opts"
 
 #include "RCStateTransition.h"
-#include "swift/Basic/Fallthrough.h"
 #include "swift/SIL/SILInstruction.h"
 #include "llvm/ADT/StringSwitch.h"
 #include "llvm/Support/Debug.h"
@@ -29,7 +28,7 @@ static bool isAutoreleasePoolCall(SILInstruction *I) {
   if (!AI)
     return false;
 
-  auto *Fn = AI->getCalleeFunction();
+  auto *Fn = AI->getReferencedFunction();
   if (!Fn)
     return false;
 
@@ -53,10 +52,9 @@ RCStateTransitionKind swift::getRCStateTransitionKind(ValueBase *V) {
   case ValueKind::ReleaseValueInst:
     return RCStateTransitionKind::StrongDecrement;
 
-  case ValueKind::SILArgument: {
-    auto *Arg = cast<SILArgument>(V);
-    if (Arg->isFunctionArg() &&
-        Arg->hasConvention(ParameterConvention::Direct_Owned))
+  case ValueKind::SILFunctionArgument: {
+    auto *Arg = cast<SILFunctionArgument>(V);
+    if (Arg->hasConvention(SILArgumentConvention::Direct_Owned))
       return RCStateTransitionKind::StrongEntrance;
     return RCStateTransitionKind::Unknown;
   }
@@ -72,8 +70,10 @@ RCStateTransitionKind swift::getRCStateTransitionKind(ValueBase *V) {
     // TODO: When we support pairing retains with @owned parameters, we will
     // need to be able to handle the potential of multiple state transition
     // kinds.
-    if (AI->hasResultConvention(ResultConvention::Owned))
-      return RCStateTransitionKind::StrongEntrance;
+    for (auto result : AI->getSubstCalleeConv().getDirectSILResults()) {
+      if (result.getConvention() == ResultConvention::Owned)
+        return RCStateTransitionKind::StrongEntrance;
+    }
 
     return RCStateTransitionKind::Unknown;
   }
@@ -121,18 +121,6 @@ raw_ostream &llvm::operator<<(raw_ostream &os, RCStateTransitionKind Kind) {
   }
 #include "RCStateTransition.def"
 
-RCStateTransition::RCStateTransition(const RCStateTransition &R) {
-  Kind = R.Kind;
-  if (R.isEndPoint()) {
-    EndPoint = R.EndPoint;
-    return;
-  }
-
-  if (!R.isMutator())
-    return;
-  Mutators = R.Mutators;
-}
-
 bool RCStateTransition::matchingInst(SILInstruction *Inst) const {
   // We only pair mutators for now.
   if (!isMutator())
@@ -160,7 +148,7 @@ bool RCStateTransition::merge(const RCStateTransition &Other) {
   if (!isMutator())
     return true;
 
-  Mutators.insert(Other.Mutators.begin(), Other.Mutators.end());
+  Mutators = Mutators->merge(Other.Mutators);
 
   return true;
 }

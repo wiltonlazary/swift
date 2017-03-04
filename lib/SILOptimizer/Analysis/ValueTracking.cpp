@@ -1,12 +1,12 @@
-//===--- ValueTracking.cpp - SIL Value Tracking Analysis --------*- C++ -*-===//
+//===--- ValueTracking.cpp - SIL Value Tracking Analysis ------------------===//
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2016 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 
@@ -16,64 +16,105 @@
 #include "swift/SIL/SILArgument.h"
 #include "swift/SIL/SILInstruction.h"
 #include "swift/SIL/SILValue.h"
+#include "swift/SIL/InstructionUtils.h"
 #include "swift/SILOptimizer/Utils/Local.h"
 #include "swift/SIL/PatternMatch.h"
 #include "llvm/Support/Debug.h"
 using namespace swift;
 using namespace swift::PatternMatch;
 
-/// Strip off casts/indexing insts/address projections from V until there is
-/// nothing left to strip.
-/// FIXME: Maybe put this on SILValue?
-/// FIXME: Why don't we strip projections after stripping indexes?
-SILValue swift::getUnderlyingObject(SILValue V) {
-  while (true) {
-    SILValue V2 = V.stripCasts().stripAddressProjections().stripIndexingInsts();
-    if (V2 == V)
-      return V2;
-    V = V2;
-  }
-}
-
 bool swift::isNotAliasingArgument(SILValue V,
                                   InoutAliasingAssumption isInoutAliasing) {
-  auto *Arg = dyn_cast<SILArgument>(V);
-  if (!Arg || !Arg->isFunctionArg())
+  auto *Arg = dyn_cast<SILFunctionArgument>(V);
+  if (!Arg)
     return false;
 
-  return isNotAliasedIndirectParameter(Arg->getParameterInfo().getConvention(),
-                                       isInoutAliasing);
+  SILArgumentConvention Conv = Arg->getArgumentConvention();
+  return Conv.isNotAliasedIndirectParameter(isInoutAliasing);
+}
+
+/// Check if the parameter \V is based on a local object, e.g. it is an
+/// allocation instruction or a struct/tuple constructed from the local objects.
+/// Returns a found local object. If a local object was not found, returns an
+/// empty SILValue.
+static bool isLocalObject(SILValue Obj) {
+  // Set of values to be checked for their locality.
+  SmallVector<SILValue, 8> WorkList;
+  // Set of processed values.
+  llvm::SmallPtrSet<SILValue, 8> Processed;
+  WorkList.push_back(Obj);
+
+  while (!WorkList.empty()) {
+    auto V = WorkList.pop_back_val();
+    if (!V)
+      return false;
+    if (Processed.count(V))
+      continue;
+    Processed.insert(V);
+    // It should be a local object.
+    V = getUnderlyingObject(V);
+    if (auto I = dyn_cast<SILInstruction>(V)) {
+      if (isa<AllocationInst>(V))
+        continue;
+      if (isa<StrongPinInst>(I)) {
+        WorkList.push_back(I->getOperand(0));
+        continue;
+      }
+      if (isa<StructInst>(I) || isa<TupleInst>(I) || isa<EnumInst>(I)) {
+        // A compound value is local, if all of its components are local.
+        for (auto &Op : I->getAllOperands()) {
+          WorkList.push_back(Op.get());
+        }
+        continue;
+      }
+    }
+
+    if (auto *Arg = dyn_cast<SILPHIArgument>(V)) {
+      // A BB argument is local if all of its
+      // incoming values are local.
+      SmallVector<SILValue, 4> IncomingValues;
+      if (Arg->getIncomingValues(IncomingValues)) {
+        for (auto InValue : IncomingValues) {
+          WorkList.push_back(InValue);
+        }
+        continue;
+      }
+    }
+
+    // Everything else is considered to be non-local.
+    return false;
+  }
+  return true;
 }
 
 bool swift::pointsToLocalObject(SILValue V,
                                 InoutAliasingAssumption isInoutAliasing) {
   V = getUnderlyingObject(V);
-  return isa<AllocationInst>(V) ||
-        isNotAliasingArgument(V, isInoutAliasing);
+  return isLocalObject(V) || isNotAliasingArgument(V, isInoutAliasing);
 }
 
 /// Check if the value \p Value is known to be zero, non-zero or unknown.
 IsZeroKind swift::isZeroValue(SILValue Value) {
   // Inspect integer literals.
-  if (auto *L = dyn_cast<IntegerLiteralInst>(Value.getDef())) {
+  if (auto *L = dyn_cast<IntegerLiteralInst>(Value)) {
     if (!L->getValue())
       return IsZeroKind::Zero;
     return IsZeroKind::NotZero;
   }
 
   // Inspect Structs.
-  switch (Value.getDef()->getKind()) {
+  switch (Value->getKind()) {
     // Bitcast of zero is zero.
     case ValueKind::UncheckedTrivialBitCastInst:
     // Extracting from a zero class returns a zero.
     case ValueKind::StructExtractInst:
-      return isZeroValue(cast<SILInstruction>(Value.getDef())->getOperand(0));
+      return isZeroValue(cast<SILInstruction>(Value)->getOperand(0));
     default:
       break;
   }
 
   // Inspect casts.
-  if (auto *BI = dyn_cast<BuiltinInst>(Value.getDef())) {
+  if (auto *BI = dyn_cast<BuiltinInst>(Value)) {
     switch (BI->getBuiltinInfo().ID) {
       case BuiltinValueKind::IntToPtr:
       case BuiltinValueKind::PtrToInt:
@@ -101,7 +142,7 @@ IsZeroKind swift::isZeroValue(SILValue Value) {
   }
 
   // Handle results of XXX_with_overflow arithmetic.
-  if (auto *T = dyn_cast<TupleExtractInst>(Value.getDef())) {
+  if (auto *T = dyn_cast<TupleExtractInst>(Value)) {
     // Make sure we are extracting the number value and not
     // the overflow flag.
     if (T->getFieldNo() != 0)
@@ -115,9 +156,9 @@ IsZeroKind swift::isZeroValue(SILValue Value) {
   }
 
   //Inspect allocations and pointer literals.
-  if (isa<StringLiteralInst>(Value.getDef()) ||
-      isa<AllocationInst>(Value.getDef()) ||
-      isa<GlobalAddrInst>(Value.getDef()))
+  if (isa<StringLiteralInst>(Value) ||
+      isa<AllocationInst>(Value) ||
+      isa<GlobalAddrInst>(Value))
     return IsZeroKind::NotZero;
 
   return IsZeroKind::Unknown;
@@ -128,7 +169,7 @@ IsZeroKind swift::isZeroValue(SILValue Value) {
 Optional<bool> swift::computeSignBit(SILValue V) {
   SILValue Value = V;
   while (true) {
-    auto *Def = Value.getDef();
+    ValueBase *Def = Value;
     // Inspect integer literals.
     if (auto *L = dyn_cast<IntegerLiteralInst>(Def)) {
       if (L->getValue().isNonNegative())
@@ -152,9 +193,6 @@ Optional<bool> swift::computeSignBit(SILValue V) {
         return false;
       // Strideof always returns non-negative results.
       case BuiltinValueKind::Strideof:
-        return false;
-      // StrideofNonZero always returns positive results.
-      case BuiltinValueKind::StrideofNonZero:
         return false;
       // Alignof always returns non-negative results.
       case BuiltinValueKind::Alignof:

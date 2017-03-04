@@ -2,11 +2,11 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2016 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 //
@@ -18,6 +18,7 @@
 #define SWIFT_IRGEN_GENCLASS_H
 
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/ArrayRef.h"
 
 namespace llvm {
   class Constant;
@@ -38,7 +39,9 @@ namespace irgen {
   class HeapLayout;
   class IRGenFunction;
   class IRGenModule;
+  class MemberAccessStrategy;
   class OwnedAddress;
+  class Address;
   class Size;
   
   enum class ReferenceCounting : unsigned char;
@@ -50,6 +53,14 @@ namespace irgen {
                                                  SILType baseType,
                                                  SILType fieldType,
                                                  VarDecl *field);
+
+  /// Return a strategy for accessing the given stored class property.
+  ///
+  /// This API is used by RemoteAST.
+  MemberAccessStrategy
+  getPhysicalClassMemberAccessStrategy(IRGenModule &IGM,
+                                       SILType baseType, VarDecl *field);
+
 
   std::tuple<llvm::Constant * /*classData*/,
              llvm::Constant * /*metaclassData*/,
@@ -67,6 +78,19 @@ namespace irgen {
   llvm::Constant *emitCategoryData(IRGenModule &IGM, ExtensionDecl *ext);
   llvm::Constant *emitObjCProtocolData(IRGenModule &IGM, ProtocolDecl *ext);
 
+  /// Emit a projection from a class instance to the first tail allocated
+  /// element.
+  Address emitTailProjection(IRGenFunction &IGF, llvm::Value *Base,
+                                  SILType ClassType, SILType TailType);
+
+  typedef llvm::ArrayRef<std::pair<SILType, llvm::Value *>> TailArraysRef;
+
+  /// Adds the size for tail allocated arrays to \p size and returns the new
+  /// size value.
+  llvm::Value *appendSizeForTailAllocatedArrays(IRGenFunction &IGF,
+                                                llvm::Value *size,
+                                                TailArraysRef TailArrays);
+
   /// Emit an allocation of a class.
   /// The \p StackAllocSize is an in- and out-parameter. The passed value
   /// specifies the maximum object size for stack allocation. A negative value
@@ -74,13 +98,13 @@ namespace irgen {
   /// The returned \p StackAllocSize value is the actual size if the object is
   /// allocated on the stack or -1, if the object is allocated on the heap.
   llvm::Value *emitClassAllocation(IRGenFunction &IGF, SILType selfType,
-                                   bool objc, int &StackAllocSize);
+                  bool objc, int &StackAllocSize, TailArraysRef TailArrays);
 
   /// Emit an allocation of a class using a metadata value.
   llvm::Value *emitClassAllocationDynamic(IRGenFunction &IGF, 
                                           llvm::Value *metadata,
                                           SILType selfType,
-                                          bool objc);
+                                          bool objc, TailArraysRef TailArrays);
 
   /// Emit class deallocation.
   void emitClassDeallocation(IRGenFunction &IGF, SILType selfType,
@@ -112,7 +136,11 @@ namespace irgen {
   
   ClassDecl *getRootClassForMetaclass(IRGenModule &IGM, ClassDecl *theClass);
 
-  bool getClassHasMetadataPattern(IRGenModule &IGM, ClassDecl *theClass);
+  /// Does the class metadata for the given class require dynamic
+  /// initialization beyond what can be achieved automatically by
+  /// the runtime?
+  bool doesClassMetadataRequireDynamicInitialization(IRGenModule &IGM,
+                                                     ClassDecl *theClass);
 } // end namespace irgen
 } // end namespace swift
 

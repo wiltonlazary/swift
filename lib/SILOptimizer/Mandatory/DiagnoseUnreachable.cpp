@@ -2,11 +2,11 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2016 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 
@@ -109,7 +109,7 @@ static void propagateBasicBlockArgs(SILBasicBlock &BB) {
   //     use(%2 : $Builtin.Int1)
 
   // If there are no predecessors or no arguments, there is nothing to do.
-  if (BB.pred_empty() || BB.bbarg_empty())
+  if (BB.pred_empty() || BB.args_empty())
     return;
 
   // Check if all the predecessors supply the same arguments to the BB.
@@ -163,22 +163,19 @@ static void propagateBasicBlockArgs(SILBasicBlock &BB) {
   // Drop the parameters from basic blocks and replace all uses with the passed
   // in arguments.
   unsigned Idx = 0;
-  for (SILBasicBlock::bbarg_iterator AI = BB.bbarg_begin(),
-                                     AE = BB.bbarg_end();
-                                     AI != AE; ++AI, ++Idx) {
+  for (SILBasicBlock::arg_iterator AI = BB.args_begin(), AE = BB.args_end();
+       AI != AE; ++AI, ++Idx) {
     // FIXME: These could be further propagatable now, we might want to move
     // this to CCP and trigger another round of copy propagation.
     SILArgument *Arg = *AI;
 
     // We were able to fold, so all users should use the new folded value.
-    assert(Arg->getTypes().size() == 1 &&
-           "Currently, we only support single result instructions.");
-    SILValue(Arg).replaceAllUsesWith(Args[Idx]);
+    Arg->replaceAllUsesWith(Args[Idx]);
     NumBasicBlockArgsPropagated++;
   }
 
   // Remove args from the block.
-  BB.dropAllBBArgs();
+  BB.dropAllArguments();
 
   // The old branch instructions are no longer used, erase them.
   recursivelyDeleteTriviallyDeadInstructions(ToBeDeleted, true);
@@ -220,8 +217,15 @@ static bool constantFoldTerminator(SILBasicBlock &BB,
       // contains user code (only if we are not within an inlined function or a
       // template instantiation).
       // FIXME: Do not report if we are within a template instantiation.
+      // FIXME: Checking for LabeledConditionalStmt is a hack; it's meant to
+      // catch cases where we have a #available or similar non-expression
+      // condition that was trivially true or false. In these cases we expect
+      // the unreachable block to be reachable on another platform and shouldn't
+      // emit any warnings about it; if this is not the case it's Sema's
+      // responsibility to warn about it.
       if (Loc.is<RegularLocation>() && State &&
-          !State->PossiblyUnreachableBlocks.count(UnreachableBlock)) {
+          !State->PossiblyUnreachableBlocks.count(UnreachableBlock) &&
+          !Loc.isASTNode<LabeledConditionalStmt>()) {
         // If this is the first time we see this unreachable block, store it
         // along with the folded branch info.
         State->PossiblyUnreachableBlocks.insert(UnreachableBlock);
@@ -277,7 +281,7 @@ static bool constantFoldTerminator(SILBasicBlock &BB,
       // Replace the switch with a branch to the TheSuccessorBlock.
       SILBuilderWithScope B(&BB, TI);
       SILLocation Loc = TI->getLoc();
-      if (!TheSuccessorBlock->bbarg_empty()) {
+      if (!TheSuccessorBlock->args_empty()) {
         assert(TheEnum->hasOperand());
         B.createBranch(Loc, TheSuccessorBlock, TheEnum->getOperand());
       } else
@@ -330,7 +334,7 @@ static bool constantFoldTerminator(SILBasicBlock &BB,
   if (SwitchValueInst *SUI = dyn_cast<SwitchValueInst>(TI)) {
     if (IntegerLiteralInst *SwitchVal =
           dyn_cast<IntegerLiteralInst>(SUI->getOperand())) {
-      SILBasicBlock *TheSuccessorBlock = 0;
+      SILBasicBlock *TheSuccessorBlock = nullptr;
       for (unsigned Idx = 0; Idx < SUI->getNumCases(); ++Idx) {
         APInt AI;
         SILValue EI;
@@ -383,11 +387,10 @@ static bool isUserCode(const SILInstruction *I) {
       return !E->isImplicit();
     if (auto *D = Loc.getAsASTNode<Decl>())
       return !D->isImplicit();
-    if (auto *S = Loc.getAsASTNode<Decl>())
+    if (auto *S = Loc.getAsASTNode<Stmt>())
       return !S->isImplicit();
-    if (auto *P = Loc.getAsASTNode<Decl>())
+    if (auto *P = Loc.getAsASTNode<Pattern>())
       return !P->isImplicit();
-    return true;
   }
   return false;
 }
@@ -404,23 +407,16 @@ static void setOutsideBlockUsesToUndef(SILInstruction *I) {
   for (auto *Use : Uses)
     if (auto *User = dyn_cast<SILInstruction>(Use->getUser()))
       if (User->getParent() != BB)
-        Use->set(SILUndef::get(Use->get().getType(), Mod));
+        Use->set(SILUndef::get(Use->get()->getType(), Mod));
 }
 
 static SILInstruction *getAsCallToNoReturn(SILInstruction *I) {
   if (auto *AI = dyn_cast<ApplyInst>(I))
-    if (AI->getOrigCalleeType()->isNoReturn())
+    if (AI->isCalleeNoReturn())
       return AI;
   
   if (auto *BI = dyn_cast<BuiltinInst>(I)) {
-    // TODO: We should have an "isNoReturn" bit on Swift's BuiltinInfo, but for
-    // now, let's recognize noreturn intrinsics and builtins specially here.
-    if (BI->getIntrinsicInfo().hasAttribute(llvm::Attribute::NoReturn))
-      return BI;
-    if (BI->getBuiltinInfo().ID == BuiltinValueKind::Unreachable
-        || BI->getBuiltinInfo().ID == BuiltinValueKind::CondUnreachable
-        || BI->getBuiltinInfo().ID == BuiltinValueKind::UnexpectedError
-        || BI->getBuiltinInfo().ID == BuiltinValueKind::ErrorInMain)
+    if (BI->getModule().isNoReturnBuiltinOrIntrinsic(BI->getName()))
       return BI;
   }
   return nullptr;
@@ -444,7 +440,7 @@ static SILInstruction *getPrecedingCallToNoReturn(SILBasicBlock &BB) {
     // The predecessor must be the normal edge from a try_apply
     // that invokes a noreturn function.
     if (auto TAI = dyn_cast<TryApplyInst>((*i)->getTerminator())) {
-      if (TAI->getOrigCalleeType()->isNoReturn() &&
+      if (TAI->isCalleeNoReturn() &&
           TAI->isNormalSuccessorRef(i.getSuccessorRef())) {
         if (!first) first = TAI;
         continue;
@@ -791,7 +787,7 @@ namespace {
     
     StringRef getName() override { return "NoReturnFolding"; }
   };
-}
+} // end anonymous namespace
 
 SILTransform *swift::createNoReturnFolding() {
   return new NoReturnFolding();
@@ -807,7 +803,7 @@ namespace {
 
     StringRef getName() override { return "Diagnose Unreachable"; }
   };
-}
+} // end anonymous namespace
 
 SILTransform *swift::createDiagnoseUnreachable() {
   return new DiagnoseUnreachable();

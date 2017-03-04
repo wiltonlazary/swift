@@ -2,11 +2,11 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2016 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 //
@@ -21,6 +21,7 @@
 #include "llvm/ADT/PointerIntPair.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "swift/AST/Availability.h"
+#include "swift/AST/FunctionRefKind.h"
 #include "swift/AST/Type.h"
 #include "swift/AST/Types.h"
 
@@ -88,28 +89,45 @@ class OverloadChoice {
   llvm::PointerIntPair<Type, 3, unsigned> BaseAndBits;
 
   /// \brief Either the declaration pointer (if the low bit is clear) or the
-  /// overload choice kind shifted by 1 with the low bit set.
+  /// overload choice kind shifted two bits with the low bit set.
   uintptr_t DeclOrKind;
+
+  /// The kind of function reference.
+  /// FIXME: This needs two bits. Can we pack them somewhere?
+  FunctionRefKind TheFunctionRefKind;
 
 public:
   OverloadChoice()
-      : BaseAndBits(nullptr, 0), DeclOrKind() {}
+    : BaseAndBits(nullptr, 0), DeclOrKind(),
+      TheFunctionRefKind(FunctionRefKind::Unapplied) {}
 
-  OverloadChoice(
-      Type base, ValueDecl *value, bool isSpecialized, ConstraintSystem &CS);
+  OverloadChoice(Type base, ValueDecl *value, bool isSpecialized,
+                 FunctionRefKind functionRefKind)
+    : BaseAndBits(base, isSpecialized ? IsSpecializedBit : 0),
+      TheFunctionRefKind(functionRefKind) {
+    assert(!base || !base->hasTypeParameter());
+    assert((reinterpret_cast<uintptr_t>(value) & (uintptr_t)0x03) == 0 &&
+           "Badly aligned decl");
+    
+    DeclOrKind = reinterpret_cast<uintptr_t>(value);
+  }
   
-  OverloadChoice(Type base, TypeDecl *type, bool isSpecialized)
-    : BaseAndBits(base, isSpecialized ? IsSpecializedBit : 0) {
+  OverloadChoice(Type base, TypeDecl *type, bool isSpecialized,
+                 FunctionRefKind functionRefKind)
+    : BaseAndBits(base, isSpecialized ? IsSpecializedBit : 0),
+      TheFunctionRefKind(functionRefKind) {
+    assert(!base || !base->hasTypeParameter());
     assert((reinterpret_cast<uintptr_t>(type) & (uintptr_t)0x03) == 0
            && "Badly aligned decl");
     DeclOrKind = reinterpret_cast<uintptr_t>(type) | 0x01;
   }
 
   OverloadChoice(Type base, OverloadChoiceKind kind)
-    : BaseAndBits(base, 0),
-      DeclOrKind((uintptr_t)kind << 2 | (uintptr_t)0x03)
-      {
+      : BaseAndBits(base, 0),
+        DeclOrKind((uintptr_t)kind << 2 | (uintptr_t)0x03),
+        TheFunctionRefKind(FunctionRefKind::Unapplied) {
     assert(base && "Must have a base type for overload choice");
+    assert(!base->hasTypeParameter());
     assert(kind != OverloadChoiceKind::Decl &&
            kind != OverloadChoiceKind::DeclViaDynamic &&
            kind != OverloadChoiceKind::TypeDecl &&
@@ -119,40 +137,48 @@ public:
   }
 
   OverloadChoice(Type base, unsigned index)
-    : BaseAndBits(base, 0),
-      DeclOrKind(((uintptr_t)index
-                  + (uintptr_t)OverloadChoiceKind::TupleIndex) << 2
-                 | (uintptr_t)0x03) {
+      : BaseAndBits(base, 0),
+        DeclOrKind(((uintptr_t)index
+                    + (uintptr_t)OverloadChoiceKind::TupleIndex) << 2
+                    | (uintptr_t)0x03),
+        TheFunctionRefKind(FunctionRefKind::Unapplied) {
     assert(base->getRValueType()->is<TupleType>() && "Must have tuple type");
   }
 
   /// Retrieve an overload choice for a declaration that was found via
   /// dynamic lookup.
-  static OverloadChoice getDeclViaDynamic(Type base, ValueDecl *value) {
+  static OverloadChoice getDeclViaDynamic(Type base, ValueDecl *value,
+                                          FunctionRefKind functionRefKind) {
     OverloadChoice result;
     result.BaseAndBits.setPointer(base);
     result.DeclOrKind = reinterpret_cast<uintptr_t>(value) | 0x02;
+    result.TheFunctionRefKind = functionRefKind;
     return result;
   }
 
   /// Retrieve an overload choice for a declaration that was found via
   /// bridging to an Objective-C class.
-  static OverloadChoice getDeclViaBridge(Type base, ValueDecl *value) {
+  static OverloadChoice getDeclViaBridge(Type base, ValueDecl *value,
+                                         FunctionRefKind functionRefKind) {
     OverloadChoice result;
     result.BaseAndBits.setPointer(base);
     result.BaseAndBits.setInt(IsBridgedBit);
     result.DeclOrKind = reinterpret_cast<uintptr_t>(value);
+    result.TheFunctionRefKind = functionRefKind;
     return result;
   }
 
   /// Retrieve an overload choice for a declaration that was found
   /// by unwrapping an optional context type.
-  static OverloadChoice getDeclViaUnwrappedOptional(Type base,
-                                                    ValueDecl *value) {
+  static OverloadChoice getDeclViaUnwrappedOptional(
+      Type base,
+      ValueDecl *value,
+      FunctionRefKind functionRefKind) {
     OverloadChoice result;
     result.BaseAndBits.setPointer(base);
     result.BaseAndBits.setInt(IsUnwrappedOptionalBit);
     result.DeclOrKind = reinterpret_cast<uintptr_t>(value);
+    result.TheFunctionRefKind = functionRefKind;
     return result;
   }
 
@@ -206,6 +232,8 @@ public:
     case OverloadChoiceKind::TupleIndex:
       return false;
     }
+
+    llvm_unreachable("Unhandled OverloadChoiceKind in switch.");
   }
 
   /// \brief Retrieve the declaration that corresponds to this overload choice.
@@ -225,8 +253,14 @@ public:
   void *getOpaqueChoiceSimple() const {
     return reinterpret_cast<void*>(DeclOrKind);
   }
+
+  FunctionRefKind getFunctionRefKind() const {
+    assert(isDecl() && "only makes sense for declaration choices");
+    return TheFunctionRefKind;
+  }
 };
 
-} } // end namespace swift::constraints
+} // end namespace constraints
+} // end namespace swift
 
 #endif // LLVM_SWIFT_SEMA_OVERLOADCHOICE_H

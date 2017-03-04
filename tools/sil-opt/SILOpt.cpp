@@ -2,11 +2,11 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2016 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 //
@@ -20,6 +20,7 @@
 #include "swift/AST/DiagnosticsFrontend.h"
 #include "swift/AST/SILOptions.h"
 #include "swift/Basic/LLVMInitialize.h"
+#include "swift/Basic/LLVMContext.h"
 #include "swift/Frontend/DiagnosticVerifier.h"
 #include "swift/Frontend/Frontend.h"
 #include "swift/Frontend/PrintingDiagnosticConsumer.h"
@@ -29,6 +30,8 @@
 #include "swift/Serialization/SerializedModuleLoader.h"
 #include "swift/Serialization/SerializedSILLoader.h"
 #include "swift/Serialization/SerializationOptions.h"
+#include "swift/IRGen/IRGenPublic.h"
+#include "swift/IRGen/IRGenSILPasses.h"
 #include "llvm/ADT/Statistic.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/FileSystem.h"
@@ -37,13 +40,12 @@
 #include "llvm/Support/Path.h"
 #include "llvm/Support/Signals.h"
 #include "llvm/Support/TargetSelect.h"
+#include <cstdio>
 using namespace swift;
 
 namespace {
 
-enum class OptGroup {
-  Unknown, Diagnostics, Performance
-};
+enum class OptGroup { Unknown, Diagnostics, Performance, Lowering };
 
 } // end anonymous namespace
 
@@ -65,6 +67,20 @@ ModuleName("module-name", llvm::cl::desc("The name of the module if processing"
                                          " a module. Necessary for processing "
                                          "stdin."));
 
+static llvm::cl::opt<bool>
+EnableResilience("enable-resilience",
+                 llvm::cl::desc("Compile the module to export resilient "
+                                "interfaces for all public declarations by "
+                                "default"));
+
+static llvm::cl::opt<bool>
+EnableSILOwnershipOpt("enable-sil-ownership",
+                 llvm::cl::desc("Compile the module with sil-ownership initially enabled for all functions"));
+
+static llvm::cl::opt<bool>
+EnableSILOpaqueValues("enable-sil-opaque-values",
+                      llvm::cl::desc("Compile the module with sil-opaque-values enabled."));
+
 static llvm::cl::opt<std::string>
 ResourceDir("resource-dir",
     llvm::cl::desc("The directory that holds the compiler resource files"));
@@ -79,11 +95,11 @@ Target("target", llvm::cl::desc("target triple"));
 
 static llvm::cl::opt<OptGroup> OptimizationGroup(
     llvm::cl::desc("Predefined optimization groups:"),
-    llvm::cl::values(clEnumValN(OptGroup::Diagnostics, "diagnostics",
-                                "Run diagnostic passes"),
-                     clEnumValN(OptGroup::Performance, "O",
-                                "Run performance passes"),
-                     clEnumValEnd),
+    llvm::cl::values(
+        clEnumValN(OptGroup::Diagnostics, "diagnostics",
+                   "Run diagnostic passes"),
+        clEnumValN(OptGroup::Performance, "O", "Run performance passes"),
+        clEnumValN(OptGroup::Lowering, "lowering", "Run lowering passes")),
     llvm::cl::init(OptGroup::Unknown));
 
 static llvm::cl::list<PassKind>
@@ -91,7 +107,7 @@ Passes(llvm::cl::desc("Passes:"),
        llvm::cl::values(
 #define PASS(ID, NAME, DESCRIPTION) clEnumValN(PassKind::ID, NAME, DESCRIPTION),
 #include "swift/SILOptimizer/PassManager/Passes.def"
-			clEnumValEnd));
+       clEnumValN(0, "", "")));
 
 static llvm::cl::opt<bool>
 PrintStats("print-stats", llvm::cl::desc("Print various statistics"));
@@ -132,7 +148,7 @@ static llvm::cl::opt<std::string>
 ModuleCachePath("module-cache-path", llvm::cl::desc("Clang module cache path"));
 
 static llvm::cl::opt<bool>
-EnableSILSortOutput("sil-sort-output", llvm::cl::Hidden,
+EnableSILSortOutput("emit-sorted-sil", llvm::cl::Hidden,
                     llvm::cl::init(false),
                     llvm::cl::desc("Sort Functions, VTables, Globals, "
                                    "WitnessTables by name to ease diffing."));
@@ -153,13 +169,27 @@ ASTVerifierProcessId("ast-verifier-process-id", llvm::cl::Hidden,
 static llvm::cl::opt<bool>
 PerformWMO("wmo", llvm::cl::desc("Enable whole-module optimizations"));
 
-static void runCommandLineSelectedPasses(SILModule *Module) {
-  SILPassManager PM(Module);
+static llvm::cl::opt<bool>
+AssumeUnqualifiedOwnershipWhenParsing(
+    "assume-parsing-unqualified-ownership-sil", llvm::cl::Hidden, llvm::cl::init(false),
+    llvm::cl::desc("Assume all parsed functions have unqualified ownership"));
 
-  for (auto Pass : Passes) {
-    PM.addPass(Pass);
+static void runCommandLineSelectedPasses(SILModule *Module,
+                                         irgen::IRGenModule *IRGenMod) {
+  SILPassManager PM(Module, IRGenMod);
+  for (auto P : Passes) {
+#define PASS(ID, Name, Description)
+#define IRGEN_PASS(ID, Name, Description)                                      \
+  if (P == PassKind::ID)                                                       \
+    PM.registerIRGenPass(swift::PassKind::ID, irgen::create##ID());
+#include "swift/SILOptimizer/PassManager/Passes.def"
   }
-  PM.run();
+
+  PM.executePassPipelinePlan(
+      SILPassPipelinePlan::getPassPipelineForKinds(Passes));
+
+  if (Module->getOptions().VerifyAll)
+    Module->verify();
 }
 
 // This function isn't referenced outside its translation unit, but it
@@ -185,7 +215,11 @@ int main(int argc, char **argv) {
 
   // Give the context the list of search paths to use for modules.
   Invocation.setImportSearchPaths(ImportPaths);
-  Invocation.setFrameworkSearchPaths(FrameworkPaths);
+  std::vector<SearchPathOptions::FrameworkSearchPath> FramePaths;
+  for (const auto &path : FrameworkPaths) {
+    FramePaths.push_back({path, /*isSystem=*/false});
+  }
+  Invocation.setFrameworkSearchPaths(FramePaths);
   // Set the SDK path and target if given.
   if (SDKPath.getNumOccurrences() == 0) {
     const char *SDKROOT = getenv("SDKROOT");
@@ -198,17 +232,22 @@ int main(int argc, char **argv) {
     Invocation.setTargetTriple(Target);
   if (!ResourceDir.empty())
     Invocation.setRuntimeResourcePath(ResourceDir);
+  Invocation.getFrontendOptions().EnableResilience = EnableResilience;
   // Set the module cache path. If not passed in we use the default swift module
   // cache.
   Invocation.getClangImporterOptions().ModuleCachePath = ModuleCachePath;
   Invocation.setParseStdlib();
+  Invocation.getLangOptions().DisableAvailabilityChecking = true;
   Invocation.getLangOptions().EnableAccessControl = false;
   Invocation.getLangOptions().EnableObjCAttrRequiresFoundation = false;
+  Invocation.getLangOptions().EnableObjCInterop =
+    llvm::Triple(Target).isOSDarwin();
 
   Invocation.getLangOptions().ASTVerifierProcessCount =
       ASTVerifierProcessCount;
   Invocation.getLangOptions().ASTVerifierProcessId =
       ASTVerifierProcessId;
+  Invocation.getLangOptions().EnableSILOpaqueValues = EnableSILOpaqueValues;
 
   // Setup the SIL Options.
   SILOptions &SILOpts = Invocation.getSILOptions();
@@ -218,7 +257,9 @@ int main(int argc, char **argv) {
   SILOpts.AssertConfig = AssertConfId;
   if (OptimizationGroup != OptGroup::Diagnostics)
     SILOpts.Optimization = SILOptions::SILOptMode::Optimize;
-
+  SILOpts.EnableSILOwnership = EnableSILOwnershipOpt;
+  SILOpts.AssumeUnqualifiedOwnershipWhenParsing =
+    AssumeUnqualifiedOwnershipWhenParsing;
 
   // Load the input file.
   llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> FileBufOrErr =
@@ -278,8 +319,8 @@ int main(int argc, char **argv) {
   if (HasSerializedAST) {
     assert(!CI.hasSILModule() &&
            "performSema() should not create a SILModule.");
-    CI.setSILModule(SILModule::createEmptyModule(CI.getMainModule(),
-                                                 CI.getSILOptions()));
+    CI.setSILModule(SILModule::createEmptyModule(
+        CI.getMainModule(), CI.getSILOptions(), PerformWMO));
     std::unique_ptr<SerializedSILLoader> SL = SerializedSILLoader::create(
         CI.getASTContext(), CI.getSILModule(), nullptr);
 
@@ -298,8 +339,15 @@ int main(int argc, char **argv) {
     runSILDiagnosticPasses(*CI.getSILModule());
   } else if (OptimizationGroup == OptGroup::Performance) {
     runSILOptimizationPasses(*CI.getSILModule());
+  } else if (OptimizationGroup == OptGroup::Lowering) {
+    runSILLoweringPasses(*CI.getSILModule());
   } else {
-    runCommandLineSelectedPasses(CI.getSILModule());
+    auto *SILMod = CI.getSILModule();
+    {
+      auto T = irgen::createIRGenModule(SILMod, getGlobalLLVMContext());
+      runCommandLineSelectedPasses(SILMod, T.second);
+      irgen::deleteIRGenModule(T);
+    }
   }
 
   if (EmitSIB) {
@@ -345,7 +393,9 @@ int main(int argc, char **argv) {
   // If we're in -verify mode, we've buffered up all of the generated
   // diagnostics.  Check now to ensure that they meet our expectations.
   if (VerifyMode) {
-    HadError = verifyDiagnostics(CI.getSourceMgr(), CI.getInputBufferIDs());
+    HadError = verifyDiagnostics(CI.getSourceMgr(), CI.getInputBufferIDs(),
+                                 /*autoApplyFixes*/false,
+                                 /*ignoreUnknown*/false);
     DiagnosticEngine &diags = CI.getDiags();
     if (diags.hasFatalErrorOccurred() &&
         !Invocation.getDiagnosticOptions().ShowDiagnosticsAfterFatalError) {

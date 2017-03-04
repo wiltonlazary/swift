@@ -85,18 +85,18 @@ getElement instruction::
       return getElement(index)
      }
 
-  @_semantics("array.check_subscript") func checkSubscript(index: Int) {
+  @_semantics("array.check_subscript") func checkSubscript(_ index: Int) {
     ...
   }
 
-  @_semantics("array.get_element") func getElement(index: Int) -> Element {
+  @_semantics("array.get_element") func getElement(_ index: Int) -> Element {
     return _buffer[index]
   }
 
 
 Swift optimizations
 -------------------
-The swift optimizer can access the information that is provided by the
+The Swift optimizer can access the information that is provided by the
 ``@_semantics`` attribute to perform high-level optimizations. In the early
 stages of the optimization pipeline the optimizer does not inline functions
 with special semantics in order to allow the early high-level optimization
@@ -132,7 +132,8 @@ Array
 The following semantic tags describe Array operations. The operations
 are first described in terms of the Array "state". Relations between the
 operations are formally defined below. 'Array' refers to the standard library
-Array<T>, ContiguousArray<T>, and ArraySlice<T> data-structures.
+Array<Element>, ContiguousArray<Element>, and ArraySlice<Element>
+data-structures.
 
 We consider the array state to consist of a set of disjoint elements
 and a storage descriptor that encapsulates nonelement data such as the
@@ -156,7 +157,7 @@ array.init
   may act as a guard to other potentially mutating operations, such as
   ``get_element_address``.
 
-array.uninitialized(count: Builtin.Word) -> (Array<T>, Builtin.RawPointer)
+array.uninitialized(count: Builtin.Word) -> (Array<Element>, Builtin.RawPointer)
 
   Creates an array with the specified number of elements. It initializes
   the storage descriptor but not the array elements. The returned tuple
@@ -164,6 +165,7 @@ array.uninitialized(count: Builtin.Word) -> (Array<T>, Builtin.RawPointer)
   The caller is responsible for writing the elements to the element storage.
 
 array.props.isCocoa/needsElementTypeCheck -> Bool
+
   Reads storage descriptors properties (isCocoa, needsElementTypeCheck).
   This is not control dependent or guarded. The optimizer has
   semantic knowledge of the state transfer those properties cannot make:
@@ -248,7 +250,7 @@ interferes-with
 guards
 
   If ``OpA`` guards ``OpB``, then the sequence of operations
-  ``OpA,OpB`` must be preserved on any control flow path on which the
+  ``OpA, OpB`` must be preserved on any control flow path on which the
   sequence originally appears.
 
 An operation can only interfere-with or guard another if they may operate on the same Array.
@@ -288,11 +290,11 @@ string.concat(lhs: String, rhs: String) -> String
   being string literals. In this case, it can be replaced by
   a string literal representing a concatenation of both operands.
 
-string.makeUTF8(start: RawPointer, byteSize: Word, isASCII: Int1) -> String
+string.makeUTF8(start: RawPointer, utf8CodeUnitCount: Word, isASCII: Int1) -> String
 
   Converts a built-in UTF8-encoded string literal into a string.
 
-string.makeUTF16(start: RawPointer, numberOfCodeUnits: Word) -> String
+string.makeUTF16(start: RawPointer, utf16CodeUnitCount: Word) -> String
 
   Converts a built-in UTF16-encoded string literal into a string.
 
@@ -346,6 +348,11 @@ sil.never
   Example:
   @_semantics("optimize.sil.never")
   func miscompile() { ... }
+
+sil.specialize.generic.never
+
+   The sil optimizer should never create generic specializations of this function. 
+
 
 Availability checks
 ~~~~~~~~~~~~~~~~~~~

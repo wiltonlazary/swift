@@ -1,17 +1,18 @@
 // Please keep this file in alphabetical order!
 
 // RUN: rm -rf %t
-// RUN: mkdir %t
+// RUN: mkdir -p %t
 // RUN: %target-swift-frontend(mock-sdk: %clang-importer-sdk) -emit-module -o %t %s -disable-objc-attr-requires-foundation-module
-// RUN: %target-swift-frontend(mock-sdk: %clang-importer-sdk) -parse-as-library %t/extensions.swiftmodule -parse -emit-objc-header-path %t/extensions.h -import-objc-header %S/../Inputs/empty.h -disable-objc-attr-requires-foundation-module
-// RUN: FileCheck %s < %t/extensions.h
-// RUN: FileCheck --check-prefix=NEGATIVE %s < %t/extensions.h
+// RUN: %target-swift-frontend(mock-sdk: %clang-importer-sdk) -parse-as-library %t/extensions.swiftmodule -typecheck -emit-objc-header-path %t/extensions.h -import-objc-header %S/../Inputs/empty.h -disable-objc-attr-requires-foundation-module
+// RUN: %FileCheck %s < %t/extensions.h
+// RUN: %FileCheck --check-prefix=NEGATIVE %s < %t/extensions.h
 // RUN: %check-in-clang %t/extensions.h
 
 // REQUIRES: objc_interop
 
 import Foundation
 import AppKit
+import objc_generics
 
 // CHECK-NOT: AppKit
 
@@ -83,6 +84,13 @@ extension CGColor {
   func anyOldMethod() {}
 }
 
+// CHECK-LABEL: @interface GenericClass<T> (SWIFT_EXTENSION(extensions))
+// CHECK-NEXT: - (void)bar;
+// CHECK-NEXT: @end
+extension GenericClass {
+  func bar() {}
+}
+
 // NEGATIVE-NOT: NotObjC
 class NotObjC {}
 extension NotObjC {}
@@ -98,12 +106,26 @@ extension NSObject {}
 // CHECK-LABEL: @interface NSString (SWIFT_EXTENSION(extensions))
 // CHECK-NEXT: - (void)test;
 // CHECK-NEXT: + (void)test2;
-// CHECK-NEXT: + (NSString * _Nullable)fromColor:(NSColor * _Nonnull)color;
+// CHECK-NEXT: + (NSString * _Nullable)fromColor:(NSColor * _Nonnull)color SWIFT_WARN_UNUSED_RESULT;
 // CHECK-NEXT: @end
 extension NSString {
   func test() {}
   class func test2() {}
 
-  class func fromColor(color: NSColor) -> NSString? { return nil; }
+  class func fromColor(_ color: NSColor) -> NSString? { return nil; }
 }
 
+// CHECK-LABEL: @interface PettableContainer<T> (SWIFT_EXTENSION(extensions))
+// CHECK-NEXT: - (PettableContainer<T> * _Nonnull)duplicate SWIFT_WARN_UNUSED_RESULT;
+// CHECK-NEXT: - (PettableContainer<T> * _Nonnull)duplicate2 SWIFT_WARN_UNUSED_RESULT;
+// CHECK-NEXT: - (PettableContainer<PettableOverextendedMetaphor *> * _Nonnull)duplicate3 SWIFT_WARN_UNUSED_RESULT;
+// CHECK-NEXT: - (T _Nonnull)extract SWIFT_WARN_UNUSED_RESULT;
+// CHECK-NEXT: - (T _Nullable)extract2 SWIFT_WARN_UNUSED_RESULT;
+// CHECK-NEXT: @end
+extension PettableContainer {
+  func duplicate() -> PettableContainer { fatalError() }
+  func duplicate2() -> PettableContainer<T> { fatalError() }
+  func duplicate3() -> PettableContainer<PettableOverextendedMetaphor> { fatalError() }
+  func extract() -> T { fatalError() }
+  func extract2() -> T? { fatalError() }
+}

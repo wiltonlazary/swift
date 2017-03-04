@@ -2,11 +2,11 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2016 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 
@@ -17,6 +17,12 @@
 #include "gtest/gtest.h"
 
 using namespace swift;
+
+// A fake definition of Swift runtime's WeakReference.
+// This has the proper size and alignment which is all we need.
+namespace swift {
+class WeakReference { void *value __attribute__((unused)); };
+}
 
 // Declare some Objective-C stuff.
 extern "C" void objc_release(id);
@@ -37,10 +43,10 @@ static HeapObject *make_objc_object() {
 
 // Make a Native Swift object by calling a Swift function.
 // make_swift_object is defined in TestHelpers.swift as part of StdlibUnittest.
-extern "C" HeapObject *make_swift_object();
+SWIFT_CC(swift) extern "C" HeapObject *make_swift_object();
 
 static unsigned getUnownedRetainCount(HeapObject *object) {
-  return object->weakRefCount.getCount() - 1;
+  return swift_unownedRetainCount(object) - 1;
 }
 
 static void unknown_release(void *value) {
@@ -102,7 +108,7 @@ TEST(WeakTest, simple_objc) {
   ASSERT_NE(o2, nullptr);
 
   DestroyedObjCCount = 0;
-  
+
   WeakReference ref1;
   swift_unknownWeakInit(&ref1, o1);
 
@@ -195,7 +201,7 @@ TEST(WeakTest, simple_swift_and_objc) {
   ASSERT_NE(o2, nullptr);
 
   DestroyedObjCCount = 0;
-  
+
   WeakReference ref1;
   swift_unknownWeakInit(&ref1, o1);
 
@@ -246,7 +252,7 @@ TEST(WeakTest, simple_objc_and_swift) {
   ASSERT_NE(o2, nullptr);
 
   DestroyedObjCCount = 0;
-  
+
   WeakReference ref1;
   swift_unknownWeakInit(&ref1, o1);
 

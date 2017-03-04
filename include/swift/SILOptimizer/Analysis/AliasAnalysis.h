@@ -2,11 +2,11 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2016 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 
@@ -22,37 +22,36 @@
 using swift::RetainObserveKind;
 
 namespace {
-  /// A cache for AliasAnalysis.
-  /// This struct represents the argument list to the method 'alias'.
-  /// The two SILValue pointers are mapped to size_t indices because we need
-  /// an efficient way to invalidate them (the mechanism is described below).
-  /// The Type arguments are translated to void* because their
-  /// underlying storage is opaque pointers that never goes away.
+
+  /// A key used for the AliasAnalysis cache.
+  ///
+  /// This struct represents the argument list to the method 'alias'.  The two
+  /// SILValue pointers are mapped to size_t indices because we need an
+  /// efficient way to invalidate them (the mechanism is described below). The
+  /// Type arguments are translated to void* because their underlying storage is
+  /// opaque pointers that never goes away.
   struct AliasKeyTy {
     // The SILValue pair:
     size_t V1, V2;
-    unsigned ResultNo1, ResultNo2;
     // The TBAAType pair:
     void *T1, *T2;
   };
 
-  /// A cache for MemoryBehavior Analysis.
-  /// The two SILValue pointers are mapped to size_t indices because we need
-  /// an efficient way to invalidate them (the mechanism is described below).
-  /// The RetainObserveKind represents the inspection mode for the memory
-  /// behavior analysis.
+  /// A key used for the MemoryBehavior Analysis cache.
+  ///
+  /// The two SILValue pointers are mapped to size_t indices because we need an
+  /// efficient way to invalidate them (the mechanism is described below).  The
+  /// RetainObserveKind represents the inspection mode for the memory behavior
+  /// analysis.
   struct MemBehaviorKeyTy {
     // The SILValue pair:
     size_t V1, V2;
-    // V1 is a SILInstruction and therefore ResultNo is always 0.
-    unsigned ResultNo2;
     RetainObserveKind InspectionMode; 
   };
 }
 
 namespace swift {
 
-class SILValue;
 class SILInstruction;
 class ValueBase;
 class SideEffectAnalysis;
@@ -104,11 +103,13 @@ private:
   llvm::DenseMap<TBAACacheKey, bool> TypesMayAliasCache;
 
   /// AliasAnalysis value cache.
+  ///
   /// The alias() method uses this map to cache queries.
   llvm::DenseMap<AliasKeyTy, AliasResult> AliasCache;
 
   using MemoryBehavior = SILInstruction::MemoryBehavior;
   /// MemoryBehavior value cache.
+  ///
   /// The computeMemoryBehavior() method uses this map to cache queries.
   llvm::DenseMap<MemBehaviorKeyTy, MemoryBehavior> MemoryBehaviorCache;
 
@@ -140,7 +141,7 @@ private:
   virtual void handleDeleteNotification(ValueBase *I) override {
     // The pointer I is going away.  We can't scan the whole cache and remove
     // all of the occurrences of the pointer. Instead we remove the pointer
-    // from the cache the translates pointers to indices.
+    // from the cache that translates pointers to indices.
     AliasValueBaseToIndex.invalidateValue(I);
     MemoryBehaviorValueBaseToIndex.invalidateValue(I);
   }
@@ -185,6 +186,11 @@ public:
                   SILType TBAAType2 = SILType()) {
     return alias(V1, V2, TBAAType1, TBAAType2) == AliasResult::MayAlias;
   }
+
+  /// \returns True if the release of the \p Ptr can access memory accessed by
+  /// \p User.
+  bool mayValueReleaseInterfereWithInstruction(SILInstruction *User,
+                                               SILValue Ptr);
 
   /// Use the alias analysis to determine the memory behavior of Inst with
   /// respect to V.
@@ -286,18 +292,16 @@ namespace llvm {
   template <> struct llvm::DenseMapInfo<AliasKeyTy> {
     static inline AliasKeyTy getEmptyKey() {
       auto Allone = std::numeric_limits<size_t>::max();
-      return {Allone, Allone, 0xffff, 0xffff, nullptr, nullptr};
+      return {0, Allone, nullptr, nullptr};
     }
     static inline AliasKeyTy getTombstoneKey() {
       auto Allone = std::numeric_limits<size_t>::max();
-      return {Allone, Allone, 0xff, 0xff, nullptr, nullptr};
+      return {Allone, 0, nullptr, nullptr};
     }
     static unsigned getHashValue(const AliasKeyTy Val) {
       unsigned H = 0;
       H ^= DenseMapInfo<size_t>::getHashValue(Val.V1);
       H ^= DenseMapInfo<size_t>::getHashValue(Val.V2);
-      H ^= DenseMapInfo<unsigned>::getHashValue(Val.ResultNo1);
-      H ^= DenseMapInfo<unsigned>::getHashValue(Val.ResultNo2);
       H ^= DenseMapInfo<void *>::getHashValue(Val.T1);
       H ^= DenseMapInfo<void *>::getHashValue(Val.T2);
       return H;
@@ -305,8 +309,6 @@ namespace llvm {
     static bool isEqual(const AliasKeyTy LHS, const AliasKeyTy RHS) {
       return LHS.V1 == RHS.V1 &&
              LHS.V2 == RHS.V2 &&
-             LHS.ResultNo1 == RHS.ResultNo1 &&
-             LHS.ResultNo2 == RHS.ResultNo2 &&
              LHS.T1 == RHS.T1 &&
              LHS.T2 == RHS.T2;
     }
@@ -315,17 +317,16 @@ namespace llvm {
   template <> struct llvm::DenseMapInfo<MemBehaviorKeyTy> {
     static inline MemBehaviorKeyTy getEmptyKey() {
       auto Allone = std::numeric_limits<size_t>::max();
-      return {Allone, Allone, 0xffff, RetainObserveKind::RetainObserveKindEnd};
+      return {0, Allone, RetainObserveKind::RetainObserveKindEnd};
     }
     static inline MemBehaviorKeyTy getTombstoneKey() {
       auto Allone = std::numeric_limits<size_t>::max();
-      return {Allone, Allone, 0xff, RetainObserveKind::RetainObserveKindEnd};
+      return {Allone, 0, RetainObserveKind::RetainObserveKindEnd};
     }
     static unsigned getHashValue(const MemBehaviorKeyTy V) {
       unsigned H = 0;
       H ^= DenseMapInfo<size_t>::getHashValue(V.V1);
       H ^= DenseMapInfo<size_t>::getHashValue(V.V2);
-      H ^= DenseMapInfo<unsigned>::getHashValue(V.ResultNo2);
       H ^= DenseMapInfo<int>::getHashValue(static_cast<int>(V.InspectionMode));
       return H;
     }
@@ -333,7 +334,6 @@ namespace llvm {
                         const MemBehaviorKeyTy RHS) {
       return LHS.V1 == RHS.V1 &&
              LHS.V2 == RHS.V2 &&
-             LHS.ResultNo2 == RHS.ResultNo2 &&
              LHS.InspectionMode == RHS.InspectionMode; 
     }
   };

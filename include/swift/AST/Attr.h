@@ -2,11 +2,11 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2016 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 //
@@ -21,13 +21,18 @@
 #include "swift/Basic/UUID.h"
 #include "swift/Basic/STLExtras.h"
 #include "swift/Basic/Range.h"
+#include "swift/Basic/Version.h"
 #include "swift/AST/Identifier.h"
+#include "swift/AST/AttrKind.h"
+#include "swift/AST/ConcreteDeclRef.h"
 #include "swift/AST/KnownProtocols.h"
 #include "swift/AST/Ownership.h"
 #include "swift/AST/PlatformKind.h"
+#include "swift/AST/Requirement.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/ErrorHandling.h"
+#include "llvm/Support/TrailingObjects.h"
 #include "clang/Basic/VersionTuple.h"
 
 namespace swift {
@@ -36,131 +41,9 @@ class ASTContext;
 struct PrintOptions;
 class Decl;
 class ClassDecl;
-
-/// The associativity of a binary operator.
-enum class Associativity {
-  /// Non-associative operators cannot be written next to other
-  /// operators with the same precedence.  Relational operators are
-  /// typically non-associative.
-  None,
-
-  /// Left-associative operators associate to the left if written next
-  /// to other left-associative operators of the same precedence.
-  Left,
-
-  /// Right-associative operators associate to the right if written
-  /// next to other right-associative operators of the same precedence.
-  Right
-};
-
-/// The kind of unary operator, if any.
-enum class UnaryOperatorKind : uint8_t {
-  None,
-  Prefix,
-  Postfix
-};
-
-/// Access control levels.
-// These are used in diagnostics, so please do not reorder existing values.
-enum class Accessibility : uint8_t {
-  /// Private access is limited to the current file.
-  Private = 0,
-  /// Internal access is limited to the current module.
-  Internal,
-  /// Public access is not limited.
-  Public
-};
-
-enum class InlineKind : uint8_t {
-  Never = 0,
-  Always = 1
-};
-
-/// This enum represents the possible values of the @effects attribute.
-/// These values are ordered from the strongest guarantee to the weakest,
-/// so please do not reorder existing values.
-enum class EffectsKind : uint8_t {
-  ReadNone,
-  ReadOnly,
-  ReadWrite,
-  Unspecified
-};
-
-class InfixData {
-  unsigned Precedence : 8;
-
-  /// Zero if invalid, or else an Associativity+1.
-  unsigned InvalidOrAssoc : 2;
-  
-  unsigned Assignment : 1;
-  
-public:
-  InfixData() : Precedence(0), InvalidOrAssoc(0), Assignment(0) {}
-  InfixData(unsigned char prec, Associativity assoc, bool isAssignment)
-    : Precedence(prec), InvalidOrAssoc(unsigned(assoc) + 1),
-      Assignment((unsigned)isAssignment) {}
-
-  bool isValid() const { return InvalidOrAssoc != 0; }
-
-  Associativity getAssociativity() const {
-    assert(isValid());
-    return Associativity(InvalidOrAssoc - 1);
-  }
-  bool isLeftAssociative() const {
-    return getAssociativity() == Associativity::Left;
-  }
-  bool isRightAssociative() const {
-    return getAssociativity() == Associativity::Right;
-  }
-  bool isNonAssociative() const {
-    return getAssociativity() == Associativity::None;
-  }
-
-  unsigned getPrecedence() const {
-    assert(isValid());
-    return Precedence;
-  }
-  
-  bool isAssignment() const {
-    assert(isValid());
-    return (bool)Assignment;
-  }
-
-  friend bool operator==(InfixData L, InfixData R) {
-    return L.Precedence == R.Precedence
-        && L.InvalidOrAssoc == R.InvalidOrAssoc
-        && L.Assignment == R.Assignment;
-  }
-  friend bool operator!=(InfixData L, InfixData R) {
-    return !operator==(L, R);
-  }
-};
-
-namespace IntrinsicPrecedences {
-  enum : unsigned char {
-    MinPrecedence = 0,
-    IfExpr = 100, // ?:
-    AssignExpr = 90, // =
-    ExplicitCastExpr = 132, // 'is' and 'as'
-    PrefixUnaryExpr = 254,
-    PostfixUnaryExpr = 255,
-    MaxPrecedence = 255
-  };
-}
-
-  
-enum DeclAttrKind : unsigned {
-#define DECL_ATTR(_, NAME, ...) DAK_##NAME,
-#include "swift/AST/Attr.def"
-  DAK_Count
-};
-
-// Define enumerators for each type attribute, e.g. TAK_weak.
-enum TypeAttrKind {
-#define TYPE_ATTR(X) TAK_##X,
-#include "swift/AST/Attr.def"
-  TAK_Count
-};
+class GenericFunctionType;
+class TrailingWhereClause;
+struct TypeLoc;
 
 /// TypeAttributes - These are attributes that may be applied to types.
 class TypeAttributes {
@@ -210,7 +93,8 @@ public:
   // an empty list.
   bool empty() const {
     for (SourceLoc elt : AttrLocs)
-      if (elt.isValid()) return false;
+      if (elt.isValid())
+        return false;
     
     return true;
   }
@@ -239,6 +123,9 @@ public:
   /// corresponds to it.  This returns TAK_Count on failure.
   ///
   static TypeAttrKind getAttrKindFromString(StringRef Str);
+
+  /// Return the name (like "autoclosure") for an attribute ID.
+  static const char *getAttrName(TypeAttrKind kind);
 };
 
 class AttributeBase {
@@ -318,9 +205,9 @@ protected:
     friend class AbstractAccessibilityAttr;
     unsigned : NumDeclAttrBits;
 
-    unsigned AccessLevel : 2;
+    unsigned AccessLevel : 3;
   };
-  enum { NumAccessibilityAttrBits = NumDeclAttrBits + 2 };
+  enum { NumAccessibilityAttrBits = NumDeclAttrBits + 3 };
   static_assert(NumAccessibilityAttrBits <= 32, "fits in an unsigned");
 
   class AutoClosureAttrBitFields {
@@ -378,6 +265,7 @@ public:
     // There is one entry for each DeclKind here, and some higher level buckets
     // down below.  These are used in Attr.def to control which kinds of
     // declarations an attribute can be attached to.
+    OnPrecedenceGroup  = 1 << 7,
     OnImport           = 1 << 8,
     OnExtension        = 1 << 9,
     OnPatternBinding   = 1 << 10,
@@ -413,7 +301,8 @@ public:
                 OnTopLevelCode|OnIfConfig|OnInfixOperator|OnPrefixOperator|
                 OnPostfixOperator|OnEnum|OnStruct|OnClass|OnProtocol|
                 OnTypeAlias|OnVar|OnSubscript|OnConstructor|OnDestructor|
-                OnFunc|OnEnumElement|OnGenericTypeParam|OnAssociatedType|OnParam
+                OnFunc|OnEnumElement|OnGenericTypeParam|OnAssociatedType|
+                OnParam|OnPrecedenceGroup
   };
 
   static unsigned getOptions(DeclAttrKind DK);
@@ -421,6 +310,11 @@ public:
   unsigned getOptions() const {
     return getOptions(getKind());
   }
+
+  /// Prints this attribute (if applicable), returning `true` if anything was
+  /// printed.
+  bool printImpl(ASTPrinter &Printer, const PrintOptions &Options,
+                 const Decl *D = nullptr) const;
 
 public:
   DeclAttrKind getKind() const {
@@ -450,10 +344,11 @@ public:
   }
 
   /// Print the attribute to the provided ASTPrinter.
-  void print(ASTPrinter &Printer, const PrintOptions &Options) const;
+  void print(ASTPrinter &Printer, const PrintOptions &Options,
+             const Decl *D = nullptr) const;
 
   /// Print the attribute to the provided stream.
-  void print(llvm::raw_ostream &OS) const;
+  void print(llvm::raw_ostream &OS, const Decl *D = nullptr) const;
 
   /// Returns true if this attribute can appear on the specified decl.  This is
   /// controlled by the flags in Attr.def.
@@ -573,6 +468,24 @@ public:
   }
 };
 
+/// Defines the @_cdecl attribute.
+class CDeclAttr : public DeclAttribute {
+public:
+  CDeclAttr(StringRef Name, SourceLoc AtLoc, SourceRange Range, bool Implicit)
+    : DeclAttribute(DAK_CDecl, AtLoc, Range, Implicit),
+      Name(Name) {}
+
+  CDeclAttr(StringRef Name, bool Implicit)
+    : CDeclAttr(Name, SourceLoc(), SourceRange(), /*Implicit=*/true) {}
+
+  /// The symbol name.
+  const StringRef Name;
+
+  static bool classof(const DeclAttribute *DA) {
+    return DA->getKind() == DAK_CDecl;
+  }
+};
+
 /// Defines the @_semantics attribute.
 class SemanticsAttr : public DeclAttribute {
 public:
@@ -635,27 +548,34 @@ public:
 };
 
 /// Determine the result of comparing an availability attribute to a specific
-/// minimum platform version.
-enum class MinVersionComparison {
+/// platform or language version.
+enum class AvailableVersionComparison {
   /// The entity is guaranteed to be available.
   Available,
 
   /// The entity is never available.
   Unavailable,
 
-  /// The entity might be unavailable, because it was introduced after
-  /// the minimum version.
+  /// The entity might be unavailable at runtime, because it was introduced
+  /// after the requested minimum platform version.
   PotentiallyUnavailable,
 
   /// The entity has been obsoleted.
   Obsoleted,
 };
 
-/// Describes the unconditional availability of a declaration.
-enum class UnconditionalAvailabilityKind {
+/// Describes the platform-agnostic availability of a declaration.
+enum class PlatformAgnosticAvailabilityKind {
+  /// The associated availability attribute is not platform-agnostic.
   None,
+  /// The declaration is deprecated, but can still be used.
   Deprecated,
+  /// The declaration is unavailable in Swift, specifically
   UnavailableInSwift,
+  /// The declaration is available in some but not all versions
+  /// of Swift, as specified by the VersionTuple members.
+  SwiftVersionSpecific,
+  /// The declaration is unavailable for other reasons.
   Unavailable,
 };
 
@@ -669,16 +589,19 @@ public:
                    PlatformKind Platform,
                    StringRef Message, StringRef Rename,
                    const clang::VersionTuple &Introduced,
+                   SourceRange IntroducedRange,
                    const clang::VersionTuple &Deprecated,
+                   SourceRange DeprecatedRange,
                    const clang::VersionTuple &Obsoleted,
-                   UnconditionalAvailabilityKind Unconditional,
+                   SourceRange ObsoletedRange,
+                   PlatformAgnosticAvailabilityKind PlatformAgnostic,
                    bool Implicit)
     : DeclAttribute(DAK_Available, AtLoc, Range, Implicit),
       Message(Message), Rename(Rename),
-      INIT_VER_TUPLE(Introduced),
-      INIT_VER_TUPLE(Deprecated),
-      INIT_VER_TUPLE(Obsoleted),
-      Unconditional(Unconditional),
+      INIT_VER_TUPLE(Introduced), IntroducedRange(IntroducedRange),
+      INIT_VER_TUPLE(Deprecated), DeprecatedRange(DeprecatedRange),
+      INIT_VER_TUPLE(Obsoleted), ObsoletedRange(ObsoletedRange),
+      PlatformAgnostic(PlatformAgnostic),
       Platform(Platform)
   {}
 
@@ -689,22 +612,38 @@ public:
 
   /// An optional replacement string to emit in a fixit.  This allows simple
   /// declaration renames to be applied by Xcode.
+  ///
+  /// This should take the form of an operator, identifier, or full function
+  /// name, optionally with a prefixed type, similar to the syntax used for
+  /// the `NS_SWIFT_NAME` annotation in Objective-C.
   const StringRef Rename;
 
   /// Indicates when the symbol was introduced.
   const Optional<clang::VersionTuple> Introduced;
 
+  /// Indicates where the Introduced version was specified.
+  const SourceRange IntroducedRange;
+
   /// Indicates when the symbol was deprecated.
   const Optional<clang::VersionTuple> Deprecated;
+
+  /// Indicates where the Deprecated version was specified.
+  const SourceRange DeprecatedRange;
 
   /// Indicates when the symbol was obsoleted.
   const Optional<clang::VersionTuple> Obsoleted;
 
-  /// Indicates if the declaration has unconditional availability.
-  const UnconditionalAvailabilityKind Unconditional;
+  /// Indicates where the Obsoleted version was specified.
+  const SourceRange ObsoletedRange;
+
+  /// Indicates if the declaration has platform-agnostic availability.
+  const PlatformAgnosticAvailabilityKind PlatformAgnostic;
 
   /// The platform of the availability.
   const PlatformKind Platform;
+
+  /// Whether this is a language-version-specific entity.
+  bool isLanguageVersionSpecific() const;
 
   /// Whether this is an unconditionally unavailable entity.
   bool isUnconditionallyUnavailable() const;
@@ -712,9 +651,9 @@ public:
   /// Whether this is an unconditionally deprecated entity.
   bool isUnconditionallyDeprecated() const;
 
-  /// Returns the unconditional unavailability.
-  UnconditionalAvailabilityKind getUnconditionalAvailability() const {
-    return Unconditional;
+  /// Returns the platform-agnostic availability.
+  PlatformAgnosticAvailabilityKind getPlatformAgnosticAvailability() const {
+    return PlatformAgnostic;
   }
 
   /// Determine if a given declaration should be considered unavailable given
@@ -742,17 +681,19 @@ public:
   /// Returns true if this attribute is active given the current platform.
   bool isActivePlatform(const ASTContext &ctx) const;
 
-  /// Compare this attribute's version information against the minimum platform
-  /// version (assuming the this attribute pertains to the active platform).
-  MinVersionComparison getMinVersionAvailability(
-                         clang::VersionTuple minVersion) const;
+  /// Compare this attribute's version information against the platform or
+  /// language version (assuming the this attribute pertains to the active
+  /// platform).
+  AvailableVersionComparison getVersionAvailability(const ASTContext &ctx) const;
 
   /// Create an AvailableAttr that indicates specific availability
   /// for all platforms.
   static AvailableAttr *
-  createUnconditional(ASTContext &C, StringRef Message, StringRef Rename = "",
-                      UnconditionalAvailabilityKind Reason
-                        = UnconditionalAvailabilityKind::Unavailable);
+  createPlatformAgnostic(ASTContext &C, StringRef Message, StringRef Rename = "",
+                      PlatformAgnosticAvailabilityKind Reason
+                         = PlatformAgnosticAvailabilityKind::Unavailable,
+                         clang::VersionTuple Obsoleted
+                         = clang::VersionTuple());
 
   static bool classof(const DeclAttribute *DA) {
     return DA->getKind() == DAK_Available;
@@ -760,7 +701,10 @@ public:
 };
 
 /// Indicates that the given declaration is visible to Objective-C.
-class ObjCAttr : public DeclAttribute {
+class ObjCAttr final : public DeclAttribute,
+    private llvm::TrailingObjects<ObjCAttr, SourceLoc> {
+  friend TrailingObjects;
+
   /// The Objective-C name associated with this entity, stored in its opaque
   /// representation so that we can use null as an indicator for "no name".
   void *NameData;
@@ -793,7 +737,7 @@ class ObjCAttr : public DeclAttribute {
     unsigned length = 2;
     if (auto name = getName())
       length += name->getNumSelectorPieces();
-    return { reinterpret_cast<SourceLoc *>(this + 1), length };
+    return {getTrailingObjects<SourceLoc>(), length};
   }
 
   /// Retrieve the trailing location information.
@@ -802,7 +746,7 @@ class ObjCAttr : public DeclAttribute {
     unsigned length = 2;
     if (auto name = getName())
       length += name->getNumSelectorPieces();
-    return { reinterpret_cast<const SourceLoc *>(this + 1), length };
+    return {getTrailingObjects<SourceLoc>(), length};
   }
 
 public:
@@ -1097,81 +1041,72 @@ public:
   }
 };
 
-/// The @warn_unused_result attribute, which specifies that we should
-/// receive a warning if a function is called but its result is
-/// unused.
-///
-/// The @warn_unused_result attribute can optionally be provided with
-/// a message and a mutable variant. For example:
-///
-/// \code
-/// struct X {
-///   @warn_unused_result(message="this string affects your health")
-///   func methodA() -> String { ... }
-///
-///   @warn_unused_result(mutable_variant="jumpInPlace")
-///   func jump() -> X { ... }
-///
-///   mutating func jumpInPlace() { ... }
-/// }
-/// \endcode
-class WarnUnusedResultAttr : public DeclAttribute {
-  /// The optional message.
-  const StringRef Message;
-
-  /// An optional name of the mutable variant of the given method,
-  /// which will be suggested as a replacement if it can be called.
-  const StringRef MutableVariant;
-
+/// The @_specialize attribute, which forces specialization on the specified
+/// type list.
+class SpecializeAttr : public DeclAttribute {
 public:
-  /// A @warn_unused_result attribute with no options.
-  WarnUnusedResultAttr(SourceLoc atLoc, SourceLoc attrLoc, bool implicit)
-    : DeclAttribute(DAK_WarnUnusedResult, atLoc, SourceRange(atLoc, attrLoc),
-                    implicit),
-      Message(""), MutableVariant("") { }
+  enum class SpecializationKind {
+    Full,
+    Partial
+  };
 
-  /// A @warn_unused_result attribute with a message or mutable variant.
-  WarnUnusedResultAttr(SourceLoc atLoc, SourceLoc attrLoc, SourceLoc lParenLoc,
-                       StringRef message, StringRef mutableVariant,
-                       SourceLoc rParenLoc, bool implicit)
-    : DeclAttribute(DAK_WarnUnusedResult, attrLoc,
-                    SourceRange(atLoc, rParenLoc),
-                    implicit),
-      Message(message), MutableVariant(mutableVariant) { }
+private:
+  unsigned numRequirements;
+  TrailingWhereClause *trailingWhereClause;
+  SpecializationKind kind;
+  bool exported;
 
-  /// Retrieve the message associated with this attribute.
-  StringRef getMessage() const { return Message; }
-
-  /// Retrieve the name of the mutable variant of this method.
-  StringRef getMutableVariant() const { return MutableVariant; }
-
-  static bool classof(const DeclAttribute *DA) {
-    return DA->getKind() == DAK_WarnUnusedResult;
+  Requirement *getRequirementsData() {
+    return reinterpret_cast<Requirement *>(this+1);
   }
-};
 
-/// The internal @_migration_id attribute, which is used to keep track of stdlib
-/// changes for migration purposes.
-class MigrationIdAttr : public DeclAttribute {
-  StringRef Ident;
-  StringRef PatternId;
+  SpecializeAttr(SourceLoc atLoc, SourceRange Range,
+                 TrailingWhereClause *clause, bool exported,
+                 SpecializationKind kind);
+
+  SpecializeAttr(SourceLoc atLoc, SourceRange Range,
+                 ArrayRef<Requirement> requirements,
+                 bool exported,
+                 SpecializationKind kind);
 
 public:
-  MigrationIdAttr(SourceLoc atLoc, SourceLoc attrLoc, SourceLoc lParenLoc,
-                  StringRef ident, StringRef patternId,
-                  SourceLoc rParenLoc, bool implicit)
-    : DeclAttribute(DAK_MigrationId, attrLoc,
-                    SourceRange(atLoc, rParenLoc), implicit),
-      Ident(ident), PatternId(patternId) {}
+  static SpecializeAttr *create(ASTContext &Ctx, SourceLoc atLoc,
+                                SourceRange Range, TrailingWhereClause *clause,
+                                bool exported, SpecializationKind kind);
 
-  /// Retrieve the migration identifier associated with the symbol.
-  StringRef getIdent() const { return Ident; }
+  static SpecializeAttr *create(ASTContext &Ctx, SourceLoc atLoc,
+                                SourceRange Range,
+                                ArrayRef<Requirement> requirement,
+                                bool exported, SpecializationKind kind);
 
-  /// Retrieve pattern identifier associated with the symbol.
-  StringRef getPatternId() const { return PatternId; }
+  TrailingWhereClause *getTrailingWhereClause() const;
+
+  ArrayRef<Requirement> getRequirements() const;
+
+  MutableArrayRef<Requirement> getRequirements() {
+    return { getRequirementsData(), numRequirements };
+  }
+
+  void setRequirements(ASTContext &Ctx, ArrayRef<Requirement> requirements);
+
+  bool isExported() const {
+    return exported;
+  }
+
+  SpecializationKind getSpecializationKind() const {
+    return kind;
+  }
+
+  bool isFullSpecialization() const {
+    return kind == SpecializationKind::Full;
+  }
+
+  bool isPartialSpecialization() const {
+    return kind == SpecializationKind::Partial;
+  }
 
   static bool classof(const DeclAttribute *DA) {
-    return DA->getKind() == DAK_MigrationId;
+    return DA->getKind() == DAK_Specialize;
   }
 };
 
@@ -1208,6 +1143,12 @@ public:
     return getUnavailable(ctx) != nullptr;
   }
 
+  /// Determine whether there is a swiftVersionSpecific attribute that's
+  /// unavailable relative to the provided language version (defaulting to
+  /// current language version).
+  bool isUnavailableInSwiftVersion(const version::Version &effectiveVersion =
+           version::Version::getCurrentLanguageVersion()) const;
+
   /// Returns the first @available attribute that indicates
   /// a declaration is unavailable, or null otherwise.
   const AvailableAttr *getUnavailable(const ASTContext &ctx) const;
@@ -1216,8 +1157,9 @@ public:
   /// a declaration is deprecated on all deployment targets, or null otherwise.
   const AvailableAttr *getDeprecated(const ASTContext &ctx) const;
 
-  void dump() const;
-  void print(ASTPrinter &Printer, const PrintOptions &Options) const;
+  void dump(const Decl *D = nullptr) const;
+  void print(ASTPrinter &Printer, const PrintOptions &Options,
+             const Decl *D = nullptr) const;
 
   template <typename T, typename DERIVED>
   class iterator_base : public std::iterator<std::forward_iterator_tag, T *> {
@@ -1290,10 +1232,10 @@ private:
   template <typename ATTR, bool AllowInvalid> struct ToAttributeKind {
     ToAttributeKind() {}
 
-    Optional<const DeclAttribute *>
+    Optional<const ATTR *>
     operator()(const DeclAttribute *Attr) const {
       if (isa<ATTR>(Attr) && (Attr->isValid() || AllowInvalid))
-        return Attr;
+        return cast<ATTR>(Attr);
       return None;
     }
   };

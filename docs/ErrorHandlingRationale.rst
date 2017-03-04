@@ -1,6 +1,8 @@
 Error Handling Rationale and Proposal
 *************************************
 
+.. contents::
+
 This paper surveys the error-handling world, analyzes various ideas
 which have been proposed or are in practice in other languages, and
 ultimately proposes an error-handling scheme for Swift together
@@ -213,7 +215,7 @@ implementing it in the future:
   a major compatibility break.
 
 - With some admitted awkwardness, external exceptions can be reflected
-  into an ``ErrorType`` - like model automatically by the catch
+  into an ``Error`` - like model automatically by the catch
   mechanism.
 
 - In the meanwhile, developers who must handle an Objective-C
@@ -636,7 +638,7 @@ of the disadvantages and investigate ways to ameliorate them:
 
   - There are many situations where errors are not actually possible
     because the programmer has carefully restricted the input.  For
-    example, matching :code:``/[0-9]{4}/`` and then parsing the result
+    example, matching ``/[0-9]{4}/`` and then parsing the result
     as an integer.  It needs to be convenient to do this in a context
     that cannot actually propagate errors, but the facility to do this
     needs to be carefully designed to discourage use for swallowing
@@ -775,7 +777,7 @@ not free:
   to resume normal execution from the landing pad: if the landing pad
   only has clean-ups and therefore always restarts propagation, those
   registers will have been saved and restored further out.
-  
+
 * Languages like C++, ObjC ARC, and Swift that have non-trivial
   clean-ups for many local variables tend to have many functions with
   interesting frames.  This means both that the context-saving
@@ -877,15 +879,19 @@ generally needs as much code in the function as implicit manual
 propagation would.  However, we could optimize this for many common
 cases by causing clean-ups to be called automatically by the
 interpretation function.  That is, instead of a landing pad that looks
-notionally like this::
+notionally like this:
 
-  void *exception = ...;
+.. code-block:: objc++
+
+  void *exception = /*...*/;
   SomeCXXType::~SomeCXXType(&foo);
   objc_release(bar);
   objc_release(baz);
   _Unwind_Resume(exception);
 
-The unwind table would have a record that looks notionally like this::
+The unwind table would have a record that looks notionally like this:
+
+.. code-block:: objc++
 
   CALL_WITH_FRAME_ADDRESS(&SomeCXXType::~SomeCXXType, FRAME_OFFSET_OF(foo))
   CALL_WITH_FRAME_VALUE(&objc_release, FRAME_OFFSET_OF(bar))
@@ -1043,9 +1049,9 @@ C++ has exceptions.  Exceptions can have almost any type in the
 language.  Propagation typing is tied only to declarations; an
 indirect function pointer is generally assumed to be able to throw.
 Propagation typing used to allow functions to be specific about the
-kinds of exceptions they could throw (:code:``throws
+kinds of exceptions they could throw (``throws
 (std::exception)``), but this is deprecated in favor of just indicating
-whether a function can throw (:code:``noexcept(false)``).
+whether a function can throw (``noexcept(false)``).
 
 C++ aspires to making out-of-memory a recoverable condition, and so
 allocation can throw.  Therefore, it is essentially compulsory for the
@@ -1070,10 +1076,10 @@ from out-of-memory conditions.  For this reason, many C++ projects
 explicitly disable exceptions and rely on other error propagation
 mechanisms, on which there is no widespread consensus.
 
-Objective C
+Objective-C
 -----------
 
-Objective C has a first-class exceptions mechanism which is similar in
+Objective-C has a first-class exceptions mechanism which is similar in
 feature set to Java's: ``@throw`` / ``@try`` / ``@catch`` / ``@finally``.
 Exception values must be instances of an Objective-C class.  The
 language does a small amount of implicit frame cleanup during
@@ -1082,18 +1088,18 @@ stack copies of ``__block`` variables are torn down, and ARC ``__weak``
 variables are destroyed.  However, the language does not release
 object pointers held in local variables, even (by default) under ARC.
 
-Objective C exceptions used to be implemented with ``setjmp``,
+Objective-C exceptions used to be implemented with ``setjmp``,
 ``longjmp``, and thread-local state managed by a runtime, but the only
 surviving platform we support which does that is i386, and all others
 now use a "zero-cost" implementation that interoperates with C++
 exceptions.
 
-Objective C exceptions are *mostly* only used for unrecoverable
+Objective-C exceptions are *mostly* only used for unrecoverable
 conditions, akin to what I called "failures" above.  There are a few
 major exceptions to this rule, where APIs that do use exceptions to
 report errors.
 
-Instead, Objective C mostly relies on manual propagation,
+Instead, Objective-C mostly relies on manual propagation,
 predominantly using out-parameters of type ``NSError**``.  Whether the
 call failed is usually *not* indicated by whether a non-``nil`` error
 was written into this parameter; calls are permitted both to succeed
@@ -1108,7 +1114,7 @@ null object result is valid.
 CF APIs, meanwhile, have their own magnificent set of somewhat
 inconsistent conventions.
 
-Therefore, we can expect that incrementally improving CF / Objective C
+Therefore, we can expect that incrementally improving CF / Objective-C
 interoperation is going to be a long and remarkably painful process.
 
 
@@ -1316,16 +1322,16 @@ generalized ``do`` statement::
   }
 
 Swift should also provide some tools for doing manual propagation.  We
-should have a standard Rust-like :code:``Result<T>`` enum in the
+should have a standard Rust-like ``Result<T>`` enum in the
 library, as well as a rich set of tools, e.g.:
 
 - A function to evaluate an error-producing closure and capture the
-  result as a :code:``Result<T>``.
+  result as a ``Result<T>``.
 
-- A function to unpack a :code:``Result<T>`` by either returning its
+- A function to unpack a ``Result<T>`` by either returning its
   value or propagating the error in the current context.
 
-- A futures library that traffics in :code:``Result<T>`` when
+- A futures library that traffics in ``Result<T>`` when
   applicable.
 
 - An overload of ``dispatch_sync`` which takes an error-producing
@@ -1359,7 +1365,7 @@ declaration or type::
     return try stream.readInt()
   }
 
-  // ‘throws’ is written before the arrow to give a sensible and
+  // 'throws' is written before the arrow to give a sensible and
   // consistent grammar for function types and implicit () result types.
   func baz() throws {
     if let byte = try stream.getOOB() where byte == PROTO_RESET {
@@ -1367,8 +1373,8 @@ declaration or type::
     }
   }
 
-  // ‘throws’ appears in a consistent position in function types.
-  func fred(callback: (UInt8) throws -> ()) throws {
+  // 'throws' appears in a consistent position in function types.
+  func fred(_ callback: (UInt8) throws -> ()) throws {
      while true {
        let code = try stream.readByte()
        if code == OPER_CLOSE { return }
@@ -1379,8 +1385,8 @@ declaration or type::
   // It only applies to the innermost function for curried functions;
   // this function has type:
   //   (Int) -> (Int) throws -> Int
-  func jerry(i: Int)(j: Int) throws -> Int {
-    // It’s not an error to use ‘throws’ on a function that can’t throw.
+  func jerry(_ i: Int)(j: Int) throws -> Int {
+    // It's not an error to use 'throws' on a function that can't throw.
     return i + j
   }
 
@@ -1456,7 +1462,7 @@ done in a fairly simple way: a function can declare that it throws if
 any of a set of named arguments do.  As an example (using strawman
 syntax)::
 
-  func map<T,U>(array: [T], fn: T throws -> U) throwsIf(fn) -> [U] {
+  func map<T, U>(_ array: [T], fn: T throws -> U) throwsIf(fn) -> [U] {
     ...
   }
 
@@ -1521,12 +1527,12 @@ allowed in a blocking context.
 Error type
 ~~~~~~~~~~
 
-The Swift standard library will provide ``ErrorType``, a protocol with
+The Swift standard library will provide ``Error``, a protocol with
 a very small interface (which is not described in this proposal).  The
 standard pattern should be to define the conformance of an ``enum`` to
 the type::
 
-  enum HomeworkError : ErrorType {
+  enum HomeworkError : Error {
     case Overworked
     case Impossible
     case EatenByCat(Cat)
@@ -1543,13 +1549,13 @@ techniques for that will work fine in the future.
 Note that this corresponds very cleanly to the ``NSError`` model of an
 error domain, an error code, and optional user data.  We expect to
 import system error domains as enums that follow this approach and
-implement ``ErrorType``.  ``NSError`` and ``CFError`` themselves will also
-conform to ``ErrorType``.
+implement ``Error``.  ``NSError`` and ``CFError`` themselves will also
+conform to ``Error``.
 
 The physical representation (still being nailed down) will make it
-efficient to embed an ``NSError`` as an ``ErrorType`` and vice-versa.  It
+efficient to embed an ``NSError`` as an ``Error`` and vice-versa.  It
 should be possible to turn an arbitrary Swift ``enum`` that conforms to
-``ErrorType`` into an ``NSError`` by using the qualified type name as the
+``Error`` into an ``NSError`` by using the qualified type name as the
 domain key, the enumerator as the error code, and turning the payload
 into user data.
 
@@ -1570,7 +1576,7 @@ wrapped around an arbitrary expression::
 
   // This try applies to readBool().
   if try stream.readBool() {
-  
+
     // This try applies to both of these calls.
     let x = try stream.readInt() + stream.readInt()
 
@@ -1806,9 +1812,9 @@ Let's wade into the details.
 Error types
 ~~~~~~~~~~~
 
-``NSError`` and ``CFError`` should implement the ``ErrorType`` protocol.  It
+``NSError`` and ``CFError`` should implement the ``Error`` protocol.  It
 should be possible to turn an arbitrary Swift ``enum`` that conforms to
-``ErrorType`` into an ``NSError`` by using the qualified type name as the
+``Error`` into an ``NSError`` by using the qualified type name as the
 domain key, the enumerator as the error code, and turning the payload
 into user data.
 
@@ -1906,7 +1912,7 @@ this one from ``NSAttributedString``::
 
 would be imported as::
 
-  func dataFromRange(range: NSRange,
+  func dataFromRange(_ range: NSRange,
                      documentAttributes dict: NSDictionary) throws -> NSData
 
 However, applying this rule haphazardly causes problems for
@@ -2028,7 +2034,7 @@ other words, we should not use table-based unwinding.
 
 Error propagation for universal errors should be handled by
 table-based unwinding.  ``catch`` handlers can catch both, mapping
-unwind exceptions to ``ErrorType`` values as necessary.  With a
+unwind exceptions to ``Error`` values as necessary.  With a
 carefully-designed interpretation function aimed to solve the specific
 needs of Swift, we can avoid most of the code-size impact by shifting
 it to the unwind tables, which needn't ever be loaded in the common

@@ -2,11 +2,11 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2016 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 //
@@ -34,6 +34,7 @@
 #include "swift/SIL/SILModule.h"
 #include "swift/SIL/SILUndef.h"
 #include "swift/SIL/DebugUtils.h"
+#include "swift/SIL/InstructionUtils.h"
 #include "swift/SILOptimizer/Analysis/ArraySemantic.h"
 #include "swift/SILOptimizer/Utils/Local.h"
 #include "swift/SILOptimizer/Utils/SILSSAUpdater.h"
@@ -82,7 +83,7 @@ static SILFunction *getDestructor(AllocRefInst *ARI) {
   // If the destructor has an objc_method calling convention, we cannot
   // analyze it since it could be swapped out from under us at runtime.
   if (Fn->getRepresentation() == SILFunctionTypeRepresentation::ObjCMethod) {
-    DEBUG(llvm::dbgs() << "        Found objective-c destructor. Can't "
+    DEBUG(llvm::dbgs() << "        Found Objective-C destructor. Can't "
           "analyze!\n");
     return nullptr;
   }
@@ -100,9 +101,9 @@ static bool doesDestructorHaveSideEffects(AllocRefInst *ARI) {
     return true;
 
   // A destructor only has one argument, self.
-  assert(Fn->begin()->getNumBBArg() == 1 &&
+  assert(Fn->begin()->getNumArguments() == 1 &&
          "Destructor should have only one argument, self.");
-  SILArgument *Self = Fn->begin()->getBBArg(0);
+  SILArgument *Self = Fn->begin()->getArgument(0);
 
   DEBUG(llvm::dbgs() << "    Analyzing destructor.\n");
 
@@ -123,7 +124,7 @@ static bool doesDestructorHaveSideEffects(AllocRefInst *ARI) {
       // destructor. RefCountingOperations on other instructions could have side
       // effects though.
       if (auto *RefInst = dyn_cast<RefCountingInst>(&I)) {
-        if (RefInst->getOperand(0).stripCasts().getDef() == Self) {
+        if (stripCasts(RefInst->getOperand(0)) == Self) {
           // For now all ref counting insts have 1 operand. Put in an assert
           // just in case.
           assert(RefInst->getNumOperands() == 1 &&
@@ -148,7 +149,7 @@ static bool doesDestructorHaveSideEffects(AllocRefInst *ARI) {
       // dealloc_ref on self can be ignored, but dealloc_ref on anything else
       // cannot be eliminated.
       if (auto *DeallocRef = dyn_cast<DeallocRefInst>(&I)) {
-        if (DeallocRef->getOperand().stripCasts().getDef() == Self) {
+        if (stripCasts(DeallocRef->getOperand()) == Self) {
           DEBUG(llvm::dbgs() << "            SAFE! dealloc_ref on self.\n");
           continue;
         } else {
@@ -160,7 +161,7 @@ static bool doesDestructorHaveSideEffects(AllocRefInst *ARI) {
 
       // Storing into the object can be ignored.
       if (auto *SI = dyn_cast<StoreInst>(&I))
-        if (SI->getDest().stripAddressProjections().getDef() == Self) {
+        if (stripAddressProjections(SI->getDest()) == Self) {
           DEBUG(llvm::dbgs() << "            SAFE! Instruction is a store into "
                 "self.\n");
           continue;
@@ -179,9 +180,7 @@ void static
 removeInstructions(ArrayRef<SILInstruction*> UsersToRemove) {
   for (auto *I : UsersToRemove) {
     if (!I->use_empty())
-      for (unsigned i = 0, e = I->getNumTypes(); i != e; ++i)
-        SILValue(I, i).replaceAllUsesWith(SILUndef::get(I->getType(i),
-                                                        I->getModule()));
+      I->replaceAllUsesWith(SILUndef::get(I->getType(), I->getModule()));
     // Now we know that I should not have any uses... erase it from its parent.
     I->eraseFromParent();
   }
@@ -320,7 +319,7 @@ public:
 
   ArrayRef<IndexTrieNode*> getChildren() const { return Children; }
 };
-}
+} // end anonymous namespace
 
 namespace {
 /// Determine if an object is dead. Compute its original lifetime. Find the
@@ -372,19 +371,19 @@ public:
 
 private:
   void addStore(StoreInst *Store, IndexTrieNode *AddressNode);
-  bool recursivelyCollectInteriorUses(ValueBase *defInst,
+  bool recursivelyCollectInteriorUses(ValueBase *DefInst,
                                       IndexTrieNode *AddressNode,
                                       bool IsInteriorAddress);
 
   template<typename Visitor>
   void visitStoreLocations(Visitor visitor, IndexTrieNode *AddressNode);
 };
-}
+} // end anonymous namespace
 
 // Record a store into this object.
 void DeadObjectAnalysis::
 addStore(StoreInst *Store, IndexTrieNode *AddressNode) {
-  if (Store->getSrc().getType().isTrivial(Store->getModule()))
+  if (Store->getSrc()->getType().isTrivial(Store->getModule()))
     return;
 
   // SSAUpdater cannot handle multiple defs in the same blocks. Therefore, we
@@ -438,7 +437,7 @@ recursivelyCollectInteriorUses(ValueBase *DefInst,
     // Initialization points.
     if (auto *Store = dyn_cast<StoreInst>(User)) {
       // Bail if this address is stored to another object.
-      if (Store->getDest().getDef() != DefInst) {
+      if (Store->getDest() != DefInst) {
         DEBUG(llvm::dbgs() << "        Found an escaping store: " << *User);
         return false;
       }
@@ -468,7 +467,7 @@ recursivelyCollectInteriorUses(ValueBase *DefInst,
     if (PI.isValid()) {
       IndexTrieNode *ProjAddrNode = AddressNode;
       bool ProjInteriorAddr = IsInteriorAddress;
-      if (Projection::isAddrProjection(User)) {
+      if (Projection::isAddressProjection(User)) {
         if (User->getKind() == ValueKind::IndexAddrInst) {
           // Don't support indexing within an interior address.
           if (IsInteriorAddress)
@@ -506,7 +505,7 @@ bool DeadObjectAnalysis::analyze() {
 
   // Populate AllValues, AddressProjectionTrie, and StoredLocations.
   AddressProjectionTrie = new IndexTrieNode();
-  if (!recursivelyCollectInteriorUses(NewAddrValue.getDef(),
+  if (!recursivelyCollectInteriorUses(NewAddrValue,
                                       AddressProjectionTrie, false)) {
     return false;
   }
@@ -545,11 +544,12 @@ static void insertReleases(ArrayRef<StoreInst*> Stores,
   assert(!Stores.empty());
   SILValue StVal = Stores.front()->getSrc();
 
-  SSAUp.Initialize(StVal.getType());
+  SSAUp.Initialize(StVal->getType());
 
   for (auto *Store : Stores)
     SSAUp.AddAvailableValue(Store->getParent(), Store->getSrc());
 
+  SILLocation Loc = Stores[0]->getLoc();
   for (auto *RelPoint : ReleasePoints) {
     SILBuilder B(RelPoint);
     // This does not use the SSAUpdater::RewriteUse API because it does not do
@@ -557,10 +557,10 @@ static void insertReleases(ArrayRef<StoreInst*> Stores,
     // per block, and all release points occur after all stores. Therefore we
     // can simply ask SSAUpdater for the reaching store.
     SILValue RelVal = SSAUp.GetValueAtEndOfBlock(RelPoint->getParent());
-    if (StVal.getType().isReferenceCounted(RelPoint->getModule()))
-      B.createStrongRelease(RelPoint->getLoc(), RelVal)->getOperandRef();
+    if (StVal->getType().isReferenceCounted(RelPoint->getModule()))
+      B.createStrongRelease(Loc, RelVal, B.getDefaultAtomicity());
     else
-      B.createReleaseValue(RelPoint->getLoc(), RelVal)->getOperandRef();
+      B.createReleaseValue(Loc, RelVal, B.getDefaultAtomicity());
   }
 }
 
@@ -574,22 +574,19 @@ static void insertReleases(ArrayRef<StoreInst*> Stores,
 // TODO: This relies on the lowest level array.uninitialized not being
 // inlined. To do better we could either run this pass before semantic inlining,
 // or we could also handle calls to array.init.
-static bool removeAndReleaseArray(SILValue NewArrayValue) {
+static bool removeAndReleaseArray(SILValue NewArrayValue, bool &CFGChanged) {
   TupleExtractInst *ArrayDef = nullptr;
   TupleExtractInst *StorageAddress = nullptr;
   for (auto *Op : NewArrayValue->getUses()) {
     auto *TupleElt = dyn_cast<TupleExtractInst>(Op->getUser());
     if (!TupleElt)
       return false;
-    switch (TupleElt->getFieldNo()) {
-    default:
-      return false;
-    case 0:
+    if (TupleElt->getFieldNo() == 0 && !ArrayDef) {
       ArrayDef = TupleElt;
-      break;
-    case 1:
+    } else if (TupleElt->getFieldNo() == 1 && !StorageAddress) {
       StorageAddress = TupleElt;
-      break;
+    } else {
+      return false;
     }
   }
   if (!ArrayDef)
@@ -624,24 +621,23 @@ static bool removeAndReleaseArray(SILValue NewArrayValue) {
     return false;
 
   // Find array object lifetime.
-  ValueLifetimeAnalysis VLA(ArrayDef);
-  ValueLifetime Lifetime = VLA.computeFromUserList(DeadArray.getAllUsers());
+  ValueLifetimeAnalysis VLA(NewArrayValue, DeadArray.getAllUsers());
 
-  // Check that all storage users are in the Array's live blocks and never the
-  // last user.
+  // Check that all storage users are in the Array's live blocks.
   for (auto *User : DeadStorage.getAllUsers()) {
-    auto *BB = User->getParent();
-    if (!VLA.successorHasLiveIn(BB)
-        && VLA.findLastSpecifiedUseInBlock(BB) == User) {
-        return false;
-    }
+    if (!VLA.isWithinLifetime(User))
+      return false;
   }
   // For each store location, insert releases.
   // This makes a strong assumption that the allocated object is released on all
   // paths in which some object initialization occurs.
   SILSSAUpdater SSAUp;
+  ValueLifetimeAnalysis::Frontier ArrayFrontier;
+  CFGChanged |= !VLA.computeFrontier(ArrayFrontier,
+                                     ValueLifetimeAnalysis::IgnoreExitEdges);
+
   DeadStorage.visitStoreLocations([&] (ArrayRef<StoreInst*> Stores) {
-      insertReleases(Stores, Lifetime.getLastUsers(), SSAUp);
+      insertReleases(Stores, ArrayFrontier, SSAUp);
     });
 
   // Delete all uses of the dead array and its storage address.
@@ -666,6 +662,7 @@ namespace {
 class DeadObjectElimination : public SILFunctionTransform {
   llvm::DenseMap<SILType, bool> DestructorAnalysisCache;
   llvm::SmallVector<SILInstruction*, 16> Allocations;
+  bool CFGChanged = false;
 
   void collectAllocations(SILFunction &Fn) {
     for (auto &BB : Fn)
@@ -701,8 +698,11 @@ class DeadObjectElimination : public SILFunctionTransform {
   }
 
   void run() override {
+    CFGChanged = false;
     if (processFunction(*getFunction())) {
-      invalidateAnalysis(SILAnalysis::InvalidationKind::CallsAndInstructions);
+      invalidateAnalysis(CFGChanged ?
+                         SILAnalysis::InvalidationKind::FunctionBody :
+                         SILAnalysis::InvalidationKind::CallsAndInstructions);
     }
   }
 
@@ -781,7 +781,7 @@ bool DeadObjectElimination::processAllocApply(ApplyInst *AI) {
 
   ApplyInst *AllocBufferAI = nullptr;
   SILValue Arg0 = AI->getArgument(0);
-  if (Arg0.getType().isExistentialType()) {
+  if (Arg0->getType().isExistentialType()) {
     // This is a version of the initializer which receives a pre-allocated
     // buffer as first argument. If we want to delete the initializer we also
     // have to delete the allocation.
@@ -790,7 +790,7 @@ bool DeadObjectElimination::processAllocApply(ApplyInst *AI) {
       return false;
   }
 
-  if (!removeAndReleaseArray(AI))
+  if (!removeAndReleaseArray(AI, CFGChanged))
     return false;
 
   DEBUG(llvm::dbgs() << "    Success! Eliminating apply allocate(...).\n");

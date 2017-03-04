@@ -2,11 +2,11 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2016 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 
@@ -19,6 +19,7 @@
 #include "swift/SIL/SILCloner.h"
 #include "swift/SIL/SILInstruction.h"
 #include "swift/SIL/DebugUtils.h"
+#include "swift/SIL/InstructionUtils.h"
 #include "swift/SILOptimizer/Analysis/ArraySemantic.h"
 #include "swift/SILOptimizer/Analysis/AliasAnalysis.h"
 #include "swift/SILOptimizer/Analysis/ARCAnalysis.h"
@@ -50,8 +51,8 @@ COWViewCFGFunction("view-cfg-before-cow-for", llvm::cl::init(""),
 /// distinguish between indexing and subelement access. The same index could
 /// either refer to the next element (indexed) or a subelement.
 static SILValue getAccessPath(SILValue V, SmallVectorImpl<unsigned>& Path) {
-  V = V.stripCasts();
-  ProjectionIndex PI(V.getDef());
+  V = stripCasts(V);
+  ProjectionIndex PI(V);
   if (!PI.isValid() || V->getKind() == ValueKind::IndexAddrInst)
     return V;
 
@@ -142,7 +143,7 @@ protected:
     if (auto *Arg = dyn_cast<SILArgument>(V))
       return Arg->getType().isObject();
     if (auto *Inst = dyn_cast<SILInstruction>(V))
-      return Inst->getNumTypes() == 1 && Inst->getType(0).isObject();
+      return Inst->hasValue() && Inst->getType().isObject();
     return false;
   }
 
@@ -215,8 +216,7 @@ protected:
       }
 
       // An alloc_box returns its address as the second value.
-      assert((PI.Aggregate == V || PI.Aggregate == SILValue(V, 1)) &&
-             "Expected unary element addr inst.");
+      assert(PI.Aggregate && "Expected unary element addr inst.");
 
       // Recursively check for users after stripping this component from the
       // access path.
@@ -224,7 +224,7 @@ protected:
     }
   }
 };
-} // namespace
+} // end anonymous namespace
 
 // Do the two values \p A and \p B reference the same 'array' after potentially
 // looking through a load. To identify a common array address this functions
@@ -262,7 +262,7 @@ static bool isRelease(SILInstruction *Inst, SILValue RetainedValue,
   // We don't want to match the release with both retains in the example below.
   //
   //   retain %a  <--|
-  //   retain %a     | Match.   <-| Dont't match.
+  //   retain %a     | Match.   <-| Don't match.
   //   release %a <--|          <-|
   //
   if (auto *R = dyn_cast<ReleaseValueInst>(Inst))
@@ -284,7 +284,7 @@ static bool isRelease(SILInstruction *Inst, SILValue RetainedValue,
       }
 
   if (auto *AI = dyn_cast<ApplyInst>(Inst)) {
-    if (auto *F = AI->getCalleeFunction()) {
+    if (auto *F = AI->getReferencedFunction()) {
       auto Params = F->getLoweredFunctionType()->getParameters();
       auto Args = AI->getArguments();
       for (unsigned ArgIdx = 0, ArgEnd = Params.size(); ArgIdx != ArgEnd;
@@ -359,14 +359,14 @@ class COWArrayOpt {
   // make_mutable calls are required within the loop body for that array.
   llvm::SmallDenseMap<SILValue, ApplyInst*> ArrayMakeMutableMap;
 
-  // \brief Transient per-Array user set.
-  //
-  // Track all known array users with the exception of struct_extract users
-  // (checkSafeArrayElementUse prohibits struct_extract users from mutating the
-  // array). During analysis of retains/releases within the loop body, the
-  // users in this set are assumed to cover all possible mutating operations on
-  // the array. If the array escaped through an unknown use, the analysis must
-  // abort earlier.
+  /// \brief Transient per-Array user set.
+  ///
+  /// Track all known array users with the exception of struct_extract users
+  /// (checkSafeArrayElementUse prohibits struct_extract users from mutating the
+  /// array). During analysis of retains/releases within the loop body, the
+  /// users in this set are assumed to cover all possible mutating operations on
+  /// the array. If the array escaped through an unknown use, the analysis must
+  /// abort earlier.
   SmallPtrSet<SILInstruction*, 8> ArrayUserSet;
 
   // When matching retains to releases we must not match the same release twice.
@@ -382,7 +382,7 @@ class COWArrayOpt {
   SmallPtrSet<Operand*, 8> MatchedReleases;
 
   // The address of the array passed to the current make_mutable we are
-  // analysing.
+  // analyzing.
   SILValue CurrentArrayAddr;
 public:
   COWArrayOpt(RCIdentityFunctionInfo *RCIA, SILLoop *L,
@@ -410,7 +410,7 @@ protected:
       SILValue V, llvm::SmallSet<SILInstruction *, 16> &Releases);
   bool hoistInLoopWithOnlyNonArrayValueMutatingOperations();
 };
-} // namespace
+} // end anonymous namespace
 
 /// \return true of the given container is known to be a unique copy of the
 /// array with no aliases. Cases we check:
@@ -427,7 +427,7 @@ bool COWArrayOpt::checkUniqueArrayContainer(SILValue ArrayContainer) {
     // Check that the argument is passed as an inout type. This means there are
     // no aliases accessible within this function scope.
     auto Params = Function->getLoweredFunctionType()->getParameters();
-    ArrayRef<SILArgument*> FunctionArgs = Function->begin()->getBBArgs();
+    ArrayRef<SILArgument *> FunctionArgs = Function->begin()->getArguments();
     for (unsigned ArgIdx = 0, ArgEnd = Params.size();
          ArgIdx != ArgEnd; ++ArgIdx) {
       if (FunctionArgs[ArgIdx] != Arg)
@@ -466,8 +466,8 @@ SmallPtrSetImpl<SILBasicBlock*> &COWArrayOpt::getReachingBlocks() {
 }
 
 
-// \return true if the instruction is a call to a non-mutating array semantic
-// function.
+/// \return true if the instruction is a call to a non-mutating array semantic
+/// function.
 static bool isNonMutatingArraySemanticCall(SILInstruction *Inst) {
   ArraySemanticsCall Call(Inst);
   if (!Call)
@@ -486,10 +486,13 @@ static bool isNonMutatingArraySemanticCall(SILInstruction *Inst) {
     return true;
   case ArrayCallKind::kMakeMutable:
   case ArrayCallKind::kMutateUnknown:
+  case ArrayCallKind::kWithUnsafeMutableBufferPointer:
   case ArrayCallKind::kArrayInit:
   case ArrayCallKind::kArrayUninitialized:
     return false;
   }
+
+  llvm_unreachable("Unhandled ArrayCallKind in switch.");
 }
 
 /// \return true if the given retain instruction is followed by a release on the
@@ -635,7 +638,7 @@ static bool isTransitiveSafeUser(SILInstruction *I) {
   case ValueKind::EnumInst:
   case ValueKind::UncheckedRefCastInst:
   case ValueKind::UncheckedBitwiseCastInst:
-    assert(I->getNumTypes() == 1 && "We assume these are unary");
+    assert(I->hasValue() && "We assume these are unary");
     return true;
   default:
     return false;
@@ -744,7 +747,7 @@ bool COWArrayOpt::checkSafeArrayElementUse(SILInstruction *UseInst,
   //   $Builtin.NativeObject
   //   %60 = struct_extract %53 : $UnsafeMutablePointer<Int>,
   //   #UnsafeMutablePointer
-  //   %61 = pointer_to_address %60 : $Builtin.RawPointer to $*Int
+  //   %61 = pointer_to_address %60 : $Builtin.RawPointer to strict $*Int
   //   %62 = mark_dependence %61 : $*Int on %59 : $Builtin.NativeObject
   //
   // The struct_extract, unchecked_ref_cast is handled below in the
@@ -786,14 +789,14 @@ bool COWArrayOpt::checkSafeElementValueUses(UserOperList &ElementValueUsers) {
   return true;
 }
 static bool isArrayEltStore(StoreInst *SI) {
-  SILValue Dest = SI->getDest().stripAddressProjections();
+  SILValue Dest = stripAddressProjections(SI->getDest());
   if (auto *MD = dyn_cast<MarkDependenceInst>(Dest))
     Dest = MD->getOperand(0);
 
   if (auto *PtrToAddr =
-          dyn_cast<PointerToAddressInst>(Dest.stripAddressProjections()))
+          dyn_cast<PointerToAddressInst>(stripAddressProjections(Dest)))
     if (auto *SEI = dyn_cast<StructExtractInst>(PtrToAddr->getOperand())) {
-      ArraySemanticsCall Call(SEI->getOperand().getDef());
+      ArraySemanticsCall Call(SEI->getOperand());
       if (Call && Call.getKind() == ArrayCallKind::kGetElementAddress)
         return true;
     }
@@ -819,15 +822,19 @@ static bool mayChangeArrayValueToNonUniqueState(ArraySemanticsCall &Call) {
 
   case ArrayCallKind::kNone:
   case ArrayCallKind::kMutateUnknown:
+  case ArrayCallKind::kWithUnsafeMutableBufferPointer:
   case ArrayCallKind::kArrayInit:
   case ArrayCallKind::kArrayUninitialized:
     return true;
   }
+
+  llvm_unreachable("Unhandled ArrayCallKind in switch.");
 }
 
 /// Check that the array value stored in \p ArrayStruct is released by \Inst.
-bool isReleaseOfArrayValueAt(AllocStackInst *ArrayStruct, SILInstruction *Inst,
-                             RCIdentityFunctionInfo *RCIA) {
+static bool isReleaseOfArrayValueAt(AllocStackInst *ArrayStruct,
+                                    SILInstruction *Inst,
+                                    RCIdentityFunctionInfo *RCIA) {
   auto *SRI = dyn_cast<StrongReleaseInst>(Inst);
   if (!SRI)
    return false;
@@ -836,21 +843,35 @@ bool isReleaseOfArrayValueAt(AllocStackInst *ArrayStruct, SILInstruction *Inst,
   if (!ArrayLoad)
     return false;
 
-  if (ArrayLoad->getOperand().getDef() == ArrayStruct)
+  if (ArrayLoad->getOperand() == ArrayStruct)
     return true;
 
   return false;
 }
 
+static bool isReleaseOfArrayValue(SILValue Array, SILInstruction *Inst,
+                                  RCIdentityFunctionInfo *RCIA) {
+  if (!isa<StrongReleaseInst>(Inst) && !isa<ReleaseValueInst>(Inst))
+    return false;
+  SILValue Root = RCIA->getRCIdentityRoot(Inst->getOperand(0));
+  return Root == Array;
+}
+
 /// Check that the array value is released before a mutating operation happens.
 bool COWArrayOpt::isArrayValueReleasedBeforeMutate(
     SILValue V, llvm::SmallSet<SILInstruction *, 16> &Releases) {
-  auto *ASI = dyn_cast<AllocStackInst>(V.getDef());
-  if (!ASI)
-    return false;
-
-  for (auto II = std::next(SILBasicBlock::iterator(ASI)),
-            IE = ASI->getParent()->end();
+  AllocStackInst *ASI = nullptr;
+  SILInstruction *StartInst = nullptr;
+  if (V->getType().isAddress()) {
+    ASI = dyn_cast<AllocStackInst>(V);
+    if (!ASI)
+      return false;
+    StartInst = ASI;
+  } else {
+    StartInst = cast<SILInstruction>(V);
+  }
+  for (auto II = std::next(SILBasicBlock::iterator(StartInst)),
+            IE = StartInst->getParent()->end();
        II != IE; ++II) {
     auto *Inst = &*II;
     // Ignore matched releases.
@@ -861,9 +882,16 @@ bool COWArrayOpt::isArrayValueReleasedBeforeMutate(
       if (MatchedReleases.count(&RVI->getOperandRef()))
         continue;
 
-    if (isReleaseOfArrayValueAt(ASI, &*II, RCIA)) {
-      Releases.erase(&*II);
-      return true;
+    if (ASI) {
+      if (isReleaseOfArrayValueAt(ASI, &*II, RCIA)) {
+        Releases.erase(&*II);
+        return true;
+      }
+    } else {
+      if (isReleaseOfArrayValue(V, &*II, RCIA)) {
+        Releases.erase(&*II);
+        return true;
+      }
     }
 
     if (isa<RetainValueInst>(II) || isa<StrongRetainInst>(II))
@@ -883,7 +911,7 @@ bool COWArrayOpt::isArrayValueReleasedBeforeMutate(
 }
 
 static SILInstruction *getInstBefore(SILInstruction *I) {
-  auto It = SILBasicBlock::reverse_iterator(I->getIterator());
+  auto It = ++I->getIterator().getReverse();
   if (I->getParent()->rend() == It)
     return nullptr;
   return &*It;
@@ -903,8 +931,8 @@ static SILValue
 stripValueProjections(SILValue V,
                       SmallVectorImpl<SILInstruction *> &ValuePrjs) {
   while (V->getKind() == ValueKind::StructExtractInst) {
-    ValuePrjs.push_back(cast<SILInstruction>(V.getDef()));
-    V = cast<SILInstruction>(V.getDef())->getOperand(0);
+    ValuePrjs.push_back(cast<SILInstruction>(V));
+    V = cast<SILInstruction>(V)->getOperand(0);
   }
   return V;
 }
@@ -914,9 +942,8 @@ stripValueProjections(SILValue V,
 /// If we found a make_mutable call this means that check_subscript was removed
 /// by the array bounds check elimination pass.
 static SILInstruction *
-findPreceedingCheckSubscriptOrMakeMutable(ApplyInst *GetElementAddr) {
-  for (auto ReverseIt =
-           SILBasicBlock::reverse_iterator(GetElementAddr->getIterator()),
+findPrecedingCheckSubscriptOrMakeMutable(ApplyInst *GetElementAddr) {
+  for (auto ReverseIt = ++GetElementAddr->getIterator().getReverse(),
             End = GetElementAddr->getParent()->rend();
        ReverseIt != End; ++ReverseIt) {
     auto Apply = dyn_cast<ApplyInst>(&*ReverseIt);
@@ -988,11 +1015,11 @@ struct HoistableMakeMutable {
     MakeMutable = M;
 
     // The function_ref needs to be invariant.
-    if (Loop->contains(MakeMutable->getCallee()->getParentBB()))
+    if (Loop->contains(MakeMutable->getCallee()->getParentBlock()))
       return;
 
     // The array reference is invariant.
-    if (!L->contains(M.getSelf()->getParentBB())) {
+    if (!L->contains(M.getSelf()->getParentBlock())) {
       IsHoistable = true;
       return;
     }
@@ -1037,7 +1064,7 @@ private:
     // %132 = unchecked_ref_cast %131
     // %133 = enum $Optional<NativeObject>, #Optional.Some!enumelt.1, %132
     // %134 = struct_extract %129
-    // %135 = pointer_to_address %134 to $*Array<Int>
+    // %135 = pointer_to_address %134 to strict $*Array<Int>
     // %136 = mark_dependence %135 on %133
 
     auto *MarkDependence = dyn_cast<MarkDependenceInst>(M.getSelf());
@@ -1070,26 +1097,26 @@ private:
 
     SILValue ArrayBuffer = stripValueProjections(UncheckedRefCast->getOperand(), DepInsts);
     auto *BaseLoad = dyn_cast<LoadInst>(ArrayBuffer);
-    if (!BaseLoad ||  Loop->contains(BaseLoad->getOperand()->getParentBB()))
+    if (!BaseLoad ||  Loop->contains(BaseLoad->getOperand()->getParentBlock()))
       return false;
     DepInsts.push_back(BaseLoad);
 
     // Check the get_element_addr call.
     ArraySemanticsCall GetElementAddrCall(
-        StructExtractArrayAddr->getOperand().getDef());
+        StructExtractArrayAddr->getOperand());
     if (!GetElementAddrCall ||
         GetElementAddrCall.getKind() != ArrayCallKind::kGetElementAddress)
       return false;
     if (Loop->contains(
-            ((ApplyInst *)GetElementAddrCall)->getCallee()->getParentBB()))
+            ((ApplyInst *)GetElementAddrCall)->getCallee()->getParentBlock()))
       return false;
-    if (Loop->contains(GetElementAddrCall.getIndex()->getParentBB()))
+    if (Loop->contains(GetElementAddrCall.getIndex()->getParentBlock()))
       return false;
 
     auto *GetElementAddrArrayLoad =
         dyn_cast<LoadInst>(GetElementAddrCall.getSelf());
     if (!GetElementAddrArrayLoad ||
-        Loop->contains(GetElementAddrArrayLoad->getOperand()->getParentBB()))
+        Loop->contains(GetElementAddrArrayLoad->getOperand()->getParentBlock()))
       return false;
 
     // Check the retain/release around the get_element_addr call.
@@ -1107,7 +1134,7 @@ private:
     // strong_release %120
     //
     // Find the check_subscript call.
-    auto *Check = findPreceedingCheckSubscriptOrMakeMutable(GetElementAddrCall);
+    auto *Check = findPrecedingCheckSubscriptOrMakeMutable(GetElementAddrCall);
     if (!Check)
       return false;
 
@@ -1116,18 +1143,18 @@ private:
     if (CheckSubscript.getKind() == ArrayCallKind::kMakeMutable)
       return true;
 
-    if (Loop->contains(CheckSubscript.getIndex()->getParentBB()) ||
+    if (Loop->contains(CheckSubscript.getIndex()->getParentBlock()) ||
         Loop->contains(CheckSubscript.getArrayPropertyIsNativeTypeChecked()
-                           ->getParentBB()))
+                           ->getParentBlock()))
       return false;
 
     auto *CheckSubscriptArrayLoad =
         dyn_cast<LoadInst>(CheckSubscript.getSelf());
     if (!CheckSubscript ||
-        Loop->contains(CheckSubscriptArrayLoad->getOperand()->getParentBB()))
+        Loop->contains(CheckSubscriptArrayLoad->getOperand()->getParentBlock()))
       return false;
   if (Loop->contains(
-            ((ApplyInst *)CheckSubscript)->getCallee()->getParentBB()))
+            ((ApplyInst *)CheckSubscript)->getCallee()->getParentBlock()))
       return false;
 
     // The array must match get_element_addr's array.
@@ -1198,9 +1225,11 @@ bool COWArrayOpt::hoistInLoopWithOnlyNonArrayValueMutatingOperations() {
         // We must make sure that any non-trivial generated values (== +1)
         // are release before we hit a make_unique instruction.
         ApplyInst *SemCall = Sem;
-        if (Sem.getKind() == ArrayCallKind::kGetElement &&
-            !SemCall->getArgument(0).getType().isTrivial(Module)) {
-          CreatedNonTrivialValues.insert(SemCall->getArgument(0));
+        if (Sem.getKind() == ArrayCallKind::kGetElement) {
+          SILValue Elem = (Sem.hasGetElementDirectResult() ? Inst :
+                           SemCall->getArgument(0));
+          if (!Elem->getType().isTrivial(Module))
+            CreatedNonTrivialValues.insert(Elem);
         } else if (Sem.getKind() == ArrayCallKind::kMakeMutable) {
           MakeMutableCalls.push_back(Sem);
         }
@@ -1229,7 +1258,7 @@ bool COWArrayOpt::hoistInLoopWithOnlyNonArrayValueMutatingOperations() {
       // is trivial.
       if (StoreInst *SI = dyn_cast<StoreInst>(Inst)) {
         if (!isArrayEltStore(SI) ||
-            !SI->getSrc().getType().isTrivial(Module)) {
+            !SI->getSrc()->getType().isTrivial(Module)) {
           DEBUG(llvm::dbgs()
                 << "     (NO) non trivial store could store an array value "
                 << *Inst);
@@ -1316,7 +1345,7 @@ bool COWArrayOpt::hasLoopOnlyDestructorSafeArrayOperations() {
   if (CachedSafeLoop.first)
     return CachedSafeLoop.second;
 
-  assert(CachedSafeLoop.second == false &&
+  assert(!CachedSafeLoop.second &&
          "We only move to a true state below");
 
   // We will compute the state of this loop now.
@@ -1351,12 +1380,12 @@ bool COWArrayOpt::hasLoopOnlyDestructorSafeArrayOperations() {
         // that all types are the same make guarantees that this cannot happen.
         if (SameTy.isNull()) {
           SameTy =
-              Sem.getSelf().getType().getSwiftRValueType()->getCanonicalType();
+              Sem.getSelf()->getType().getSwiftRValueType()->getCanonicalType();
           continue;
         }
         
         if (Sem.getSelf()
-                       .getType()
+                       ->getType()
                        .getSwiftRValueType()
                        ->getCanonicalType() != SameTy) {
           DEBUG(llvm::dbgs() << "    (NO) mismatching array types\n");
@@ -1415,7 +1444,7 @@ void COWArrayOpt::hoistMakeMutableAndSelfProjection(
     ArraySemanticsCall MakeMutable, bool HoistProjection) {
   // Hoist projections.
   if (HoistProjection)
-    MakeMutable.getSelfOperand().hoistAddressProjections(
+    hoistAddressProjections(MakeMutable.getSelfOperand(),
       Preheader->getTerminator(), DomTree);
 
   assert(MakeMutable.canHoist(Preheader->getTerminator(), DomTree) &&
@@ -1433,8 +1462,8 @@ bool COWArrayOpt::hoistMakeMutable(ArraySemanticsCall MakeMutable) {
 
   // We can hoist address projections (even if they are only conditionally
   // executed).
-  auto ArrayAddrBase = CurrentArrayAddr.stripAddressProjections();
-  SILBasicBlock *ArrayAddrBaseBB = ArrayAddrBase.getDef()->getParentBB();
+  auto ArrayAddrBase = stripUnaryAddressProjections(CurrentArrayAddr);
+  SILBasicBlock *ArrayAddrBaseBB = ArrayAddrBase->getParentBlock();
 
   if (ArrayAddrBaseBB && !DomTree->dominates(ArrayAddrBaseBB, Preheader)) {
     DEBUG(llvm::dbgs() << "    Skipping Array: does not dominate loop!\n");
@@ -1463,7 +1492,7 @@ bool COWArrayOpt::hoistMakeMutable(ArraySemanticsCall MakeMutable) {
   // Check that the Array is not retained with this loop and it's address does
   // not escape within this function.
   StructUseCollector StructUses;
-  StructUses.collectUses(ArrayContainer.getDef(), AccessPath);
+  StructUses.collectUses(ArrayContainer, AccessPath);
   for (auto *Oper : StructUses.Visited)
     ArrayUserSet.insert(Oper->getUser());
 
@@ -1575,7 +1604,7 @@ class COWArrayOptPass : public SILFunctionTransform {
 
   StringRef getName() override { return "SIL COW Array Optimization"; }
 };
-} // anonymous
+} // end anonymous namespace
 
 SILTransform *swift::createCOWArrayOpts() {
   return new COWArrayOptPass();
@@ -1686,7 +1715,7 @@ private:
   /// Strip the struct load and the address projection to the location
   /// holding the array struct.
   SILValue stripArrayStructLoad(SILValue V) {
-    if (auto LI = dyn_cast<LoadInst>(V.getDef())) {
+    if (auto LI = dyn_cast<LoadInst>(V)) {
       auto Val = LI->getOperand();
       // We could have two arrays in a surrounding container so we can only
       // strip off the 'array struct' project.
@@ -1695,7 +1724,7 @@ private:
       //   var a2 : [ClassA]
       // }
       // 'a1' and 'a2' are different arrays.
-      if (auto SEAI = dyn_cast<StructElementAddrInst>(Val.getDef()))
+      if (auto SEAI = dyn_cast<StructElementAddrInst>(Val))
         Val = SEAI->getOperand();
       return Val;
     }
@@ -1789,24 +1818,25 @@ private:
   // will check in checkSafeArrayAddressUses that all initialization stores to
   // this variable are safe (i.e the store dominates the loop etc).
   bool isSafeArrayContainer(SILValue V) {
-    if (auto *Arg = dyn_cast<SILArgument>(V.getDef())) {
+    if (auto *Arg = dyn_cast<SILArgument>(V)) {
       // Check that the argument is passed as an inout or by value type. This
       // means there are no aliases accessible within this function scope.
       auto Params = Fun->getLoweredFunctionType()->getParameters();
-      ArrayRef<SILArgument*> FunctionArgs = Fun->begin()->getBBArgs();
+      ArrayRef<SILArgument *> FunctionArgs = Fun->begin()->getArguments();
       for (unsigned ArgIdx = 0, ArgEnd = Params.size(); ArgIdx != ArgEnd;
            ++ArgIdx) {
         if (FunctionArgs[ArgIdx] != Arg)
           continue;
 
-        if (!Params[ArgIdx].isIndirectInOut() && Params[ArgIdx].isIndirect()) {
+        if (!Params[ArgIdx].isIndirectInOut()
+            && Params[ArgIdx].isFormalIndirect()) {
           DEBUG(llvm::dbgs()
                 << "    Skipping Array: Not an inout or by val argument!\n");
           return false;
         }
       }
       return true;
-    } else if (isa<AllocStackInst>(V.getDef()))
+    } else if (isa<AllocStackInst>(V))
       return true;
 
     DEBUG(llvm::dbgs()
@@ -1833,11 +1863,8 @@ private:
   }
 
   bool isClassElementTypeArray(SILValue Arr) {
-    auto Ty = Arr.getType().getSwiftRValueType();
-    auto Canonical = Ty.getCanonicalTypeOrNull();
-    if (Canonical.isNull())
-      return false;
-    auto *Struct = Canonical->getStructOrBoundGenericStruct();
+    auto Ty = Arr->getType().getSwiftRValueType();
+    auto *Struct = Ty->getStructOrBoundGenericStruct();
     assert(Struct && "Array must be a struct !?");
     if (Struct) {
       // No point in hoisting generic code.
@@ -1847,11 +1874,8 @@ private:
 
       // Check the array element type parameter.
       bool isClass = false;
-      for (auto TP : BGT->getGenericArgs()) {
-        auto EltTy = TP.getCanonicalTypeOrNull();
-        if (EltTy.isNull())
-          return false;
-        if (!EltTy.hasReferenceSemantics())
+      for (auto EltTy : BGT->getGenericArgs()) {
+        if (!EltTy->hasReferenceSemantics())
           return false;
         isClass = true;
       }
@@ -1891,7 +1915,7 @@ private:
       return false;
 
     StructUseCollector StructUses;
-    StructUses.collectUses(ArrayContainer.getDef(), AccessPath);
+    StructUses.collectUses(ArrayContainer, AccessPath);
 
     if (!checkSafeArrayAddressUses(StructUses.AggregateAddressUsers) ||
         !checkSafeArrayAddressUses(StructUses.StructAddressUsers) ||
@@ -1904,7 +1928,7 @@ private:
     return true;
   }
 };
-} // End anonymous namespace.
+} // end anonymous namespace
 
 namespace {
 /// Clone a single exit multiple exit region starting at basic block and ending
@@ -1926,9 +1950,7 @@ public:
 
   SILBasicBlock *cloneRegion() {
     assert (DomTree.getNode(StartBB) != nullptr && "Can't cloned dead code");
-
     auto CurFun = StartBB->getParent();
-    auto &Mod = CurFun->getModule();
 
     // We don't want to visit blocks outside of the region. visitSILBasicBlocks
     // checks BBMap before it clones a block. So we mark exiting blocks as
@@ -1941,7 +1963,7 @@ public:
     // inside the cloned region. The SSAUpdater can't handle critical non
     // cond_br edges.
     for (auto *BB : OutsideBBs) {
-      SmallVector<SILBasicBlock*, 8> Preds(BB->getPreds());
+      SmallVector<SILBasicBlock *, 8> Preds(BB->getPredecessorBlocks());
       for (auto *Pred : Preds)
         if (!isa<CondBranchInst>(Pred->getTerminator()) &&
             !isa<BranchInst>(Pred->getTerminator()))
@@ -1949,13 +1971,13 @@ public:
     }
 
     // Create the cloned start basic block.
-    auto *ClonedStartBB = new (Mod) SILBasicBlock(CurFun);
+    auto *ClonedStartBB = CurFun->createBasicBlock();
     BBMap[StartBB] = ClonedStartBB;
 
     // Clone the arguments.
-    for (auto &Arg : StartBB->getBBArgs()) {
-      SILValue MappedArg =
-          new (Mod) SILArgument(ClonedStartBB, getOpType(Arg->getType()));
+    for (auto &Arg : StartBB->getArguments()) {
+      SILValue MappedArg = ClonedStartBB->createPHIArgument(
+          getOpType(Arg->getType()), ValueOwnershipKind::Owned);
       ValueMap.insert(std::make_pair(Arg, MappedArg));
     }
 
@@ -2017,7 +2039,7 @@ protected:
   }
 
   SILValue remapValue(SILValue V) {
-    if (auto *BB = V.getDef()->getParentBB()) {
+    if (auto *BB = V->getParentBlock()) {
       if (!DomTree.dominates(StartBB, BB)) {
         // Must be a value that dominates the start basic block.
         assert(DomTree.dominates(BB, StartBB) &&
@@ -2037,7 +2059,7 @@ protected:
                          SILSSAUpdater &SSAUp) {
     // Collect outside uses.
     SmallVector<UseWrapper, 16> UseList;
-    for (auto Use : V.getUses())
+    for (auto Use : V->getUses())
       if (OutsideBBs.count(Use->getUser()->getParent()) ||
           !BBMap.count(Use->getUser()->getParent())) {
         UseList.push_back(UseWrapper(Use));
@@ -2046,7 +2068,7 @@ protected:
       return;
 
     // Update SSA form.
-    SSAUp.Initialize(V.getType());
+    SSAUp.Initialize(V->getType());
     SSAUp.AddAvailableValue(OrigBB, V);
     SILValue NewVal = remapValue(V);
     SSAUp.AddAvailableValue(BBMap[OrigBB], NewVal);
@@ -2065,20 +2087,17 @@ protected:
       auto *OrigBB = Entry.first;
 
       // Update outside used phi values.
-      for (auto *Arg : OrigBB->getBBArgs())
+      for (auto *Arg : OrigBB->getArguments())
         updateSSAForValue(OrigBB, Arg, SSAUp);
 
       // Update outside used instruction values.
       for (auto &Inst : *OrigBB) {
-        for (unsigned i = 0, e = Inst.getNumTypes(); i != e; ++i) {
-          SILValue V(&Inst, i);
-          updateSSAForValue(OrigBB, V, SSAUp);
-        }
+        updateSSAForValue(OrigBB, &Inst, SSAUp);
       }
     }
   }
 };
-} // End anonymous namespace.
+} // end anonymous namespace
 
 namespace {
 /// This class transforms a hoistable loop nest into a speculatively specialized
@@ -2099,17 +2118,18 @@ public:
 
   SILLoop *getLoop() {
     auto *LoopInfo = LoopAnalysis->get(HoistableLoopPreheader->getParent());
-    return LoopInfo->getLoopFor(HoistableLoopPreheader->getSingleSuccessor());
+    return LoopInfo->getLoopFor(
+        HoistableLoopPreheader->getSingleSuccessorBlock());
   }
 
 protected:
   void specializeLoopNest();
 };
-} // End anonymous namespace.
+} // end anonymous namespace
 
 static SILValue createStructExtract(SILBuilder &B, SILLocation Loc,
                                     SILValue Opd, unsigned FieldNo) {
-  SILType Ty = Opd.getType();
+  SILType Ty = Opd->getType();
   auto SD = Ty.getStructOrBoundGenericStruct();
   auto Properties = SD->getStoredProperties();
   unsigned Counter = 0;
@@ -2133,9 +2153,9 @@ static Identifier getBinaryFunction(StringRef Name, SILType IntSILTy,
 /// Create a binary and function.
 static SILValue createAnd(SILBuilder &B, SILLocation Loc, SILValue Opd1,
                           SILValue Opd2) {
-  auto AndFn = getBinaryFunction("and", Opd1.getType(), B.getASTContext());
+  auto AndFn = getBinaryFunction("and", Opd1->getType(), B.getASTContext());
   SILValue Args[] = {Opd1, Opd2};
-  return B.createBuiltin(Loc, AndFn, Opd1.getType(), {}, Args);
+  return B.createBuiltin(Loc, AndFn, Opd1->getType(), {}, Args);
 }
 
 /// Create a check over all array.props calls that they have the 'fast native
@@ -2153,7 +2173,7 @@ createFastNativeArraysCheck(SmallVectorImpl<ArraySemanticsCall> &ArrayProps,
     auto Loc = (*Call).getLoc();
     auto CallKind = Call.getKind();
     if (CallKind == ArrayCallKind::kArrayPropsIsNativeTypeChecked) {
-      auto Val = createStructExtract(B, Loc, SILValue(Call, 0), 0);
+      auto Val = createStructExtract(B, Loc, SILValue(Call), 0);
       Result = createAnd(B, Loc, Result, Val);
     }
   }
@@ -2213,7 +2233,7 @@ void ArrayPropertiesSpecializer::specializeLoopNest() {
       HoistableLoopPreheader->getTerminator(), DomTree, nullptr);
 
   // Get the exit blocks of the original loop.
-  auto *Header = CheckBlock->getSingleSuccessor();
+  auto *Header = CheckBlock->getSingleSuccessorBlock();
   assert(Header);
 
   // Our loop info is not really completely valid anymore since the cloner does
@@ -2336,7 +2356,7 @@ class SwiftArrayOptPass : public SILFunctionTransform {
 
   StringRef getName() override { return "SIL Swift Array Optimization"; }
 };
-} // End anonymous namespace.
+} // end anonymous namespace
 
 SILTransform *swift::createSwiftArrayOpts() {
   return new SwiftArrayOptPass();

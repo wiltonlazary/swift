@@ -1,8 +1,8 @@
-// RUN: %target-swift-frontend -emit-sil %s -parse-stdlib -o /dev/null -verify
+// RUN: %target-swift-frontend -assume-parsing-unqualified-ownership-sil -emit-sil %s -parse-stdlib -o /dev/null -verify
 
 import Swift
 
-func markUsed<T>(t: T) {}
+func markUsed<T>(_ t: T) {}
 
 // These are tests for definite initialization, which is implemented by the
 // memory promotion pass.
@@ -13,8 +13,8 @@ func test1() -> Int {
   return a     // expected-error {{variable 'a' used before being initialized}}
 }
 
-func takes_inout(inout a: Int) {}
-func takes_closure(fn: () -> ()) {}
+func takes_inout(_ a: inout Int) {}
+func takes_closure(_ fn: () -> ()) {}
 
 class SomeClass { 
   var x : Int   // expected-note {{'self.x' not initialized}}
@@ -47,6 +47,7 @@ func test2() {
   // Address-of with Builtin.addressof.
   var a4 : Int            // expected-note {{variable defined here}}
   Builtin.addressof(&a4)  // expected-error {{address of variable 'a4' taken before it is initialized}}
+  // expected-warning @-1 {{result of call to 'addressof' is unused}}
 
 
   // Closures.
@@ -162,13 +163,13 @@ func test4() {
   markUsed(t6.b)
 }
 
-func tupleinout(inout a: (lo: Int, hi: Int)) {
+func tupleinout(_ a: inout (lo: Int, hi: Int)) {
   markUsed(a.0)   // ok
   markUsed(a.1)   // ok
 }
 
 // Address only types
-func test5<T>(x: T, y: T) {
+func test5<T>(_ x: T, y: T) {
   var a : ((T, T), T)  // expected-note {{variable defined here}}
   a.0 = (x, y)
   
@@ -188,7 +189,7 @@ func test6() -> Int {
 }
 
 // Control flow.
-func test7(cond: Bool) {
+func test7(_ cond: Bool) {
   var a : Int
   
   if cond { a = 42 } else { a = 17 }
@@ -205,7 +206,7 @@ protocol SomeProtocol {
 
 protocol DerivedProtocol : SomeProtocol {}
 
-func existentials(i: Int, dp: DerivedProtocol) {
+func existentials(_ i: Int, dp: DerivedProtocol) {
   // expected-warning @+1 {{variable 'a' was written to, but never read}}
   var a : Any = ()
   a = i
@@ -256,7 +257,7 @@ class DITLC_Class {
 
 struct EmptyStruct {}
 
-func useEmptyStruct(a: EmptyStruct) {}
+func useEmptyStruct(_ a: EmptyStruct) {}
 
 func emptyStructTest() {
   // <rdar://problem/20065892> Diagnostic for an uninitialized constant calls it a variable
@@ -284,11 +285,11 @@ func emptyStructTest() {
   useEmptyStruct(g.1)
 }
 
-func takesTuplePair(inout a : (SomeClass, SomeClass)) {}
+func takesTuplePair(_ a : inout (SomeClass, SomeClass)) {}
 
 // This tests cases where a store might be an init or assign based on control
 // flow path reaching it.
-func conditionalInitOrAssign(c : Bool, x : Int) {
+func conditionalInitOrAssign(_ c : Bool, x : Int) {
   var t : Int  // Test trivial types.
   if c {
     t = 0
@@ -413,7 +414,6 @@ class SomeDerivedClass : SomeClass {
 //  Delegating initializers
 //===----------------------------------------------------------------------===//
 
-
 class DelegatingCtorClass {
   var ivar: EmptyStruct
 
@@ -448,7 +448,7 @@ class DelegatingCtorClass {
   }                // expected-error {{self.init isn't called on all paths before returning from initializer}}
 
   convenience init(bool: Bool) {
-    doesntReturn()
+    doesNotReturn()
   }
 
   convenience init(double: Double) {
@@ -526,54 +526,19 @@ enum DelegatingCtorEnum {
 
 protocol TriviallyConstructible {
   init()
-  func go(x: Int)
+  func go(_ x: Int)
 }
 
 extension TriviallyConstructible {
-  init(up: Int) {
-    self.init()
-    go(up)
-  }
-
   init(down: Int) {
     go(down) // expected-error {{'self' used before self.init call}}
     self.init()
   }
 }
 
-class TrivialClass : TriviallyConstructible {
-  required init() {}
-
-  func go(x: Int) {}
-
-  convenience init(y: Int) {
-    self.init(up: y * y)
-  }
-}
-
-struct TrivialStruct : TriviallyConstructible {
-  init() {}
-
-  func go(x: Int) {}
-
-  init(y: Int) {
-    self.init(up: y * y)
-  }
-}
-
-enum TrivialEnum : TriviallyConstructible {
-  case NotSoTrivial
-
-  init() {
-    self = NotSoTrivial
-  }
-
-  func go(x: Int) {}
-
-  init(y: Int) {
-    self.init(up: y * y)
-  }
-}
+//===----------------------------------------------------------------------===//
+//  Various bugs
+//===----------------------------------------------------------------------===//
 
 // rdar://16119509 - Dataflow problem where we reject valid code.
 class rdar16119509_Buffer {
@@ -607,25 +572,24 @@ class Foo {
 
 
 
-@noreturn
-func doesntReturn() {
+func doesNotReturn() -> Never {
   while true {}
 }
 
 func doesReturn() {}
 
-func testNoReturn1(b : Bool) -> Any {
+func testNoReturn1(_ b : Bool) -> Any {
   var a : Any
   if b {
     a = 42
   } else {
-    doesntReturn()
+    doesNotReturn()
   }
 
   return a   // Ok, because the noreturn call path isn't viable.
 }
 
-func testNoReturn2(b : Bool) -> Any {
+func testNoReturn2(_ b : Bool) -> Any {
   var a : Any  // expected-note {{variable defined here}}
   if b {
     a = 42
@@ -638,15 +602,15 @@ func testNoReturn2(b : Bool) -> Any {
 }
 
 class PerpetualMotion {
-  @noreturn func start() {
+  func start() -> Never {
     repeat {} while true
   }
-  @noreturn static func stop() {
+  static func stop() -> Never {
     repeat {} while true
   }
 }
 
-func testNoReturn3(b : Bool) -> Any {
+func testNoReturn3(_ b : Bool) -> Any {
   let a : Int
 
   switch b {
@@ -657,7 +621,7 @@ func testNoReturn3(b : Bool) -> Any {
   return a
 }
 
-func testNoReturn4(b : Bool) -> Any {
+func testNoReturn4(_ b : Bool) -> Any {
   let a : Int
 
   switch b {
@@ -767,7 +731,7 @@ class rdar18414728Base {
     final_method()  // ok
   }
 
-  func method1(a : Int) {}
+  func method1(_ a : Int) {}
   final func final_method() {}
 }
 
@@ -825,7 +789,7 @@ struct rdar18414728Struct {
     j = 2
   }
 
-  func method(a : Int) {}
+  func method(_ a : Int) {}
 }
 
 
@@ -899,7 +863,7 @@ struct LetProperties {
     arr = []
     arr += []      // expected-error {{mutating operator '+=' may not be used on immutable value 'self.arr'}}
     arr.append(4)  // expected-error {{mutating method 'append' may not be used on immutable value 'self.arr'}}
-    arr[12] = 17   // expected-error {{immutable value 'self.arr' may not be assigned to}}
+    arr[12] = 17   // expected-error {{mutating subscript 'subscript' may not be used on immutable value 'self.arr'}}
   }
 }
 
@@ -931,7 +895,7 @@ struct MyMutabilityImplementation : TestMutabilityProtocol {
 
 
 // <rdar://problem/16181314> don't require immediate initialization of 'let' values
-func testLocalProperties(b : Int) -> Int {
+func testLocalProperties(_ b : Int) -> Int {
   // expected-note @+1 {{change 'let' to 'var' to make it mutable}} {{3-6=var}}
   let x : Int
   let y : Int // never assigned is ok    expected-warning {{immutable value 'y' was never used}} {{7-8=_}}
@@ -952,7 +916,7 @@ func testLocalProperties(b : Int) -> Int {
 }
 
 // Should be rejected as multiple assignment.
-func testAddressOnlyProperty<T>(b : T) -> T {
+func testAddressOnlyProperty<T>(_ b : T) -> T {
   // expected-note @+1 {{change 'let' to 'var' to make it mutable}} {{3-6=var}}
   let x : T
   let y : T
@@ -1018,7 +982,7 @@ struct StructMutatingMethodTest {
 }
 
 @_transparent
-func myTransparentFunction(inout x : Int) {}
+func myTransparentFunction(_ x : inout Int) {}
 
 
 // <rdar://problem/19782264> Immutable, optional class members can't have their subproperties read from during init()
@@ -1133,13 +1097,13 @@ extension ProtocolInitTest {
   }
 
   init(test2 ii: Int) {
-    self = unsafeBitCast(0, Self.self)
+    self = unsafeBitCast(0, to: Self.self)
     i = ii
   }
 
   init(test3 ii: Int) {
     i = ii                // expected-error {{'self' used before chaining to another self.init requirement}}
-    self = unsafeBitCast(0, Self.self)
+    self = unsafeBitCast(0, to: Self.self)
   }
 
   init(test4 ii: Int) {
@@ -1148,7 +1112,7 @@ extension ProtocolInitTest {
 }
 
 // <rdar://problem/22436880> Function accepting UnsafeMutablePointer is able to change value of immutable value
-func bug22436880(x: UnsafeMutablePointer<Int>) {}
+func bug22436880(_ x: UnsafeMutablePointer<Int>) {}
 func test22436880() {
   let x: Int
   x = 1
@@ -1157,6 +1121,138 @@ func test22436880() {
 
 // sr-184
 let x: String? // expected-note 2 {{constant defined here}}
-print(x?.characters.count) // expected-error {{constant 'x' used before being initialized}}
+print(x?.characters.count as Any) // expected-error {{constant 'x' used before being initialized}}
 print(x!) // expected-error {{constant 'x' used before being initialized}}
 
+
+// <rdar://problem/22723281> QoI: [DI] Misleading error from Swift compiler when using an instance method in init()
+protocol PMI {
+  func getg()
+}
+
+extension PMI {
+  func getg() {}
+}
+
+class WS: PMI {
+  final let x: String  // expected-note {{'self.x' not initialized}}
+  
+  init() {
+    getg()   // expected-error {{use of 'self' in method call 'getg' before all stored properties are initialized}}
+    self.x = "foo"
+  }
+}
+
+// <rdar://problem/23013334> DI QoI: Diagnostic claims that property is being used when it actually isn't
+class r23013334 {
+  var B: Int   // expected-note {{'self.B' not initialized}}
+  var A: String
+  
+  init(A: String) throws {
+    self.A = A
+    self.A.withCString { cString -> () in  // expected-error {{'self' captured by a closure before all members were initialized}}
+
+      print(self.A)
+      return ()
+    }
+    
+    self.B = 0
+  }
+  
+}
+
+class r23013334Derived : rdar16119509_Base {
+  var B: Int   // expected-note {{'self.B' not initialized}}
+  var A: String
+  
+  init(A: String) throws {
+    self.A = A
+    self.A.withCString { cString -> () in  // expected-error {{'self' captured by a closure before all members were initialized}}
+      
+      print(self.A)
+      return ()
+    }
+    
+    self.B = 0
+  }
+
+}
+
+// sr-1469
+struct SR1469_Struct1 {
+  let a: Int
+  let b: Int // expected-note {{'self.b' not initialized}}
+  
+  init?(x: Int, y: Int) {
+    self.a = x
+    if y == 42 {
+      return // expected-error {{return from initializer without initializing all stored properties}}
+    }
+    // many lines later
+    self.b = y
+  }
+}
+
+struct SR1469_Struct2 {
+  let a: Int
+  let b: Int // expected-note {{'self.b' not initialized}}
+  
+  init?(x: Int, y: Int) {
+    self.a = x
+    return // expected-error {{return from initializer without initializing all stored properties}}
+  }
+}
+
+struct SR1469_Struct3 {
+  let a: Int
+  let b: Int // expected-note {{'self.b' not initialized}}
+  
+  init?(x: Int, y: Int) {
+    self.a = x
+    if y == 42 {
+      self.b = y
+      return
+    }
+  } // expected-error {{return from initializer without initializing all stored properties}}
+}
+
+enum SR1469_Enum1 {
+  case A, B
+  
+  init?(x: Int) {
+    if x == 42 {
+      return // expected-error {{return from enum initializer method without storing to 'self'}}
+    }
+    // many lines later
+    self = .A
+  }
+}
+
+enum SR1469_Enum2 {
+  case A, B
+  
+  init?() {
+    return // expected-error {{return from enum initializer method without storing to 'self'}}
+  }
+}
+enum SR1469_Enum3 {
+  case A, B
+  
+  init?(x: Int) {
+    if x == 42 {
+      self = .A
+      return
+    }
+  } // expected-error {{return from enum initializer method without storing to 'self'}}
+}
+
+class BadFooSuper {
+  init() {}
+  init(_ x: BadFooSuper) {}
+}
+
+class BadFooSubclass: BadFooSuper {
+  override init() {
+    super.init(self) // expected-error {{'self' used before super.init call}}
+  }
+}

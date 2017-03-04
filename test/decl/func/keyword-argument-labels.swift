@@ -1,9 +1,9 @@
-// RUN: %target-parse-verify-swift
+// RUN: %target-typecheck-verify-swift
 
 struct SomeRange { }
 
 // Function declarations.
-func paramName(func: Int, in: SomeRange) { }
+func paramName(_ func: Int, in: SomeRange) { }
 func firstArgumentLabelWithParamName(in range: SomeRange) { }
 func firstArgumentLabelWithParamName2(range in: SomeRange) { }
 
@@ -31,10 +31,10 @@ struct SomeType {
 class SomeClass { }
 
 // Function types.
-typealias functionType = (in: SomeRange) -> Bool
+typealias functionType = (_ in: SomeRange) -> Bool
 
 // Calls
-func testCalls(range: SomeRange) {
+func testCalls(_ range: SomeRange) {
   paramName(0, in: range)
   firstArgumentLabelWithParamName(in: range)
   firstArgumentLabelWithParamName2(range: range)

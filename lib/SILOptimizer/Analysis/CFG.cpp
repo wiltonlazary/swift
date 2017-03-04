@@ -2,11 +2,11 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2016 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 
@@ -14,6 +14,7 @@
 #include "swift/SIL/SILFunction.h"
 #include "swift/SIL/SILInstruction.h"
 #include "swift/SIL/SILValue.h"
+#include "swift/Basic/ManglingMacros.h"
 #include "llvm/ADT/TinyPtrVector.h"
 
 using namespace swift;
@@ -34,15 +35,16 @@ static bool isSafeNonExitTerminator(TermInst *TI) {
   case TermKind::ThrowInst:
   case TermKind::TryApplyInst:
     return false;
-  case TermKind::Invalid:
-    llvm_unreachable("Invalid Term Inst?!");
   }
+
+  llvm_unreachable("Unhandled TermKind in switch.");
 }
 
 static bool isTrapNoReturnFunction(ApplyInst *AI) {
-  const char *fatalName =
-      "_TFs18_fatalErrorMessageFTVs12StaticStringS_S_Su_T_";
-  auto *Fn = AI->getCalleeFunction();
+  const char *fatalName = MANGLE_AS_STRING(SELECT_MANGLING(
+                            Fs18_fatalErrorMessageFTVs12StaticStringS_S_Su_T_,
+                            s18_fatalErrorMessageys12StaticStringV_AcCSutF));
+  auto *Fn = AI->getReferencedFunction();
 
   // We use endswith here since if we specialize fatal error we will always
   // prepend the specialization records to fatalName.
@@ -83,7 +85,7 @@ findAllNonFailureExitBBs(SILFunction *F,
     // non-failure exit BB. Add it to our list and continue.
     auto PrevIter = std::prev(SILBasicBlock::iterator(TI));
     if (auto *AI = dyn_cast<ApplyInst>(&*PrevIter)) {
-      if (AI->getSubstCalleeType()->isNoReturn() &&
+      if (AI->isCalleeNoReturn() &&
           !isTrapNoReturnFunction(AI)) {
         BBs.push_back(&BB);
         continue;

@@ -2,11 +2,11 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2016 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 //
@@ -89,14 +89,6 @@ public:
       add(UI->getUser());
   }
 
-  /// If only one result of an instruction has been simplified, add all of the
-  /// users of that result to the worklist since additional simplifications of
-  /// its users may have been exposed.
-  void addUsersToWorklist(ValueBase *I, unsigned Index) {
-    for (auto UI : SILValue(I, Index).getUses())
-      add(UI->getUser());
-  }
-
   /// Check that the worklist is empty and nuke the backing store for the map if
   /// it is large.
   void zap() {
@@ -162,11 +154,6 @@ public:
   // so that the combiner will know that I was modified.
   SILInstruction *replaceInstUsesWith(SILInstruction &I, ValueBase *V);
 
-  /// This is meant to be used when one is attempting to replace only one of the
-  /// results of I with a result of V.
-  SILInstruction *replaceInstUsesWith(SILInstruction &I, ValueBase *V,
-                                      unsigned IIndex, unsigned VIndex=0);
-
   // Some instructions can never be "trivially dead" due to side effects or
   // producing a void value. In those cases, since we cannot rely on
   // SILCombines trivially dead instruction DCE in order to delete the
@@ -203,6 +190,7 @@ public:
   SILInstruction *visitUpcastInst(UpcastInst *UCI);
   SILInstruction *visitLoadInst(LoadInst *LI);
   SILInstruction *visitAllocStackInst(AllocStackInst *AS);
+  SILInstruction *visitAllocRefInst(AllocRefInst *AR);
   SILInstruction *visitSwitchEnumAddrInst(SwitchEnumAddrInst *SEAI);
   SILInstruction *visitInjectEnumAddrInst(InjectEnumAddrInst *IEAI);
   SILInstruction *visitPointerToAddressInst(PointerToAddressInst *PTAI);
@@ -239,10 +227,16 @@ public:
   SILInstruction *visitAllocRefDynamicInst(AllocRefDynamicInst *ARDI);
   SILInstruction *visitEnumInst(EnumInst *EI);
   SILInstruction *visitConvertFunctionInst(ConvertFunctionInst *CFI);
-  SILInstruction *visitWitnessMethodInst(WitnessMethodInst *WMI);
 
   /// Instruction visitor helpers.
   SILInstruction *optimizeBuiltinCanBeObjCClass(BuiltinInst *AI);
+
+  // Optimize the "trunc_N1_M2" builtin. if N1 is a result of "zext_M1_*" and
+  // the following holds true: N1 > M1 and M2>= M1
+  SILInstruction *optimizeBuiltinTruncOrBitCast(BuiltinInst *I);
+
+  // Optimize the "zext_M2_M3" builtin. if M2 is a result of "zext_M1_M2"
+  SILInstruction *optimizeBuiltinZextOrBitCast(BuiltinInst *I);
 
   // Optimize the "cmp_eq_XXX" builtin. If \p NegateResult is true then negate
   // the result bit.
@@ -265,8 +259,9 @@ private:
                                                SILValue NewSelf,
                                                SILValue Self,
                                                CanType ConcreteType,
+                                               SILValue ConcreteTypeDef,
                                                ProtocolConformanceRef Conformance,
-                                               CanType OpenedArchetype);
+                                               ArchetypeType *OpenedArchetype);
   SILInstruction *
   propagateConcreteTypeOfInitExistential(FullApplySite AI,
       ProtocolDecl *Protocol,
@@ -292,7 +287,8 @@ private:
 
   /// Erases an apply instruction including all it's uses \p.
   /// Inserts release/destroy instructions for all owner and in-parameters.
-  void eraseApply(FullApplySite FAS, const UserListTy &Users);
+  /// \return Returns true if successful.
+  bool eraseApply(FullApplySite FAS, const UserListTy &Users);
 
   /// Returns true if the results of a try_apply are not used.
   static bool isTryApplyResultNotUsed(UserListTy &AcceptedUses,

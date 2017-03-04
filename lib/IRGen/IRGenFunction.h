@@ -2,11 +2,11 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2016 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 //
@@ -37,6 +37,7 @@ namespace llvm {
 
 namespace swift {
   class ArchetypeType;
+  class AssociatedTypeDecl;
   class ClassDecl;
   class ConstructorDecl;
   class Decl;
@@ -53,6 +54,10 @@ namespace swift {
   class Substitution;
   class ValueDecl;
   class VarDecl;
+
+namespace Lowering {
+  class TypeConverter;
+}
   
 namespace irgen {
   class Explosion;
@@ -75,6 +80,9 @@ public:
   IRBuilder Builder;
 
   llvm::Function *CurFn;
+  ModuleDecl *getSwiftModule() const;
+  SILModule &getSILModule() const;
+  Lowering::TypeConverter &getSILTypes() const;
 
   IRGenFunction(IRGenModule &IGM, llvm::Function *fn,
                 const SILDebugScope *DbgScope = nullptr,
@@ -88,7 +96,8 @@ public:
 //--- Function prologue and epilogue -------------------------------------------
 public:
   Explosion collectParameters();
-  void emitScalarReturn(SILType resultTy, Explosion &scalars);
+  void emitScalarReturn(SILType resultTy, Explosion &scalars,
+                        bool isSwiftCCReturn);
   void emitScalarReturn(llvm::Type *resultTy, Explosion &scalars);
   
   void emitBBForReturn();
@@ -116,6 +125,8 @@ private:
 public:
   Address createAlloca(llvm::Type *ty, Alignment align,
                        const llvm::Twine &name);
+  Address createAlloca(llvm::Type *ty, llvm::Value *ArraySize, Alignment align,
+                       const llvm::Twine &name);
   Address createFixedSizeBufferAlloca(const llvm::Twine &name);
 
   llvm::BasicBlock *createBasicBlock(const llvm::Twine &Name);
@@ -138,6 +149,16 @@ public:
   Address emitByteOffsetGEP(llvm::Value *base, llvm::Value *offset,
                             const TypeInfo &type,
                             const llvm::Twine &name = "");
+
+  void emitStoreOfRelativeIndirectablePointer(llvm::Value *value,
+                                              Address addr,
+                                              bool isFar);
+
+  llvm::Value *
+  emitLoadOfRelativeIndirectablePointer(Address addr, bool isFar,
+                                        llvm::PointerType *expectedType,
+                                        const llvm::Twine &name = "");
+
 
   llvm::Value *emitAllocObjectCall(llvm::Value *metadata, llvm::Value *size,
                                    llvm::Value *alignMask,
@@ -210,8 +231,12 @@ private:
 
 //--- Reference-counting methods -----------------------------------------------
 public:
+  // Returns the default atomicity of the module.
+  Atomicity getDefaultAtomicity();
+
   llvm::Value *emitUnmanagedAlloc(const HeapLayout &layout,
                                   const llvm::Twine &name,
+                                  llvm::Constant *captureDescriptor,
                                   const HeapNonFixedOffsets *offsets = 0);
 
   // Functions that don't care about the reference-counting style.
@@ -219,16 +244,22 @@ public:
 
   // Routines that are generic over the reference-counting style:
   //   - strong references
-  void emitStrongRetain(llvm::Value *value, ReferenceCounting refcounting);
-  void emitStrongRelease(llvm::Value *value, ReferenceCounting refcounting);
+  void emitStrongRetain(llvm::Value *value, ReferenceCounting refcounting,
+                        Atomicity atomicity);
+  void emitStrongRelease(llvm::Value *value, ReferenceCounting refcounting,
+                         Atomicity atomicity);
   llvm::Value *emitLoadRefcountedPtr(Address addr, ReferenceCounting style);
 
   //   - unowned references
-  void emitUnownedRetain(llvm::Value *value, ReferenceCounting style);
-  void emitUnownedRelease(llvm::Value *value, ReferenceCounting style);
-  void emitStrongRetainUnowned(llvm::Value *value, ReferenceCounting style);
+  void emitUnownedRetain(llvm::Value *value, ReferenceCounting style,
+                         Atomicity atomicity);
+  void emitUnownedRelease(llvm::Value *value, ReferenceCounting style,
+                          Atomicity atomicity);
+  void emitStrongRetainUnowned(llvm::Value *value, ReferenceCounting style,
+                               Atomicity atomicity);
   void emitStrongRetainAndUnownedRelease(llvm::Value *value,
-                                         ReferenceCounting style);
+                                         ReferenceCounting style,
+                                         Atomicity atomicity);
   void emitUnownedInit(llvm::Value *val, Address dest, ReferenceCounting style);
   void emitUnownedAssign(llvm::Value *value, Address dest,
                          ReferenceCounting style);
@@ -271,13 +302,15 @@ public:
   //   - strong references
   void emitNativeStrongAssign(llvm::Value *value, Address addr);
   void emitNativeStrongInit(llvm::Value *value, Address addr);
-  void emitNativeStrongRetain(llvm::Value *value);
-  void emitNativeStrongRelease(llvm::Value *value);
+  void emitNativeStrongRetain(llvm::Value *value, Atomicity atomicity);
+  void emitNativeStrongRelease(llvm::Value *value, Atomicity atomicity);
+  void emitNativeSetDeallocating(llvm::Value *value);
   //   - unowned references
-  void emitNativeUnownedRetain(llvm::Value *value);
-  void emitNativeUnownedRelease(llvm::Value *value);
-  void emitNativeStrongRetainUnowned(llvm::Value *value);
-  void emitNativeStrongRetainAndUnownedRelease(llvm::Value *value);
+  void emitNativeUnownedRetain(llvm::Value *value, Atomicity atomicity);
+  void emitNativeUnownedRelease(llvm::Value *value, Atomicity atomicity);
+  void emitNativeStrongRetainUnowned(llvm::Value *value, Atomicity atomicity);
+  void emitNativeStrongRetainAndUnownedRelease(llvm::Value *value,
+                                               Atomicity atomicity);
   void emitNativeUnownedInit(llvm::Value *val, Address dest);
   void emitNativeUnownedAssign(llvm::Value *value, Address dest);
   void emitNativeUnownedCopyInit(Address destAddr, Address srcAddr);
@@ -299,8 +332,8 @@ public:
   void emitNativeWeakCopyAssign(Address destAddr, Address srcAddr);
   void emitNativeWeakTakeAssign(Address destAddr, Address srcAddr);
   //   - other operations
-  llvm::Value *emitNativeTryPin(llvm::Value *object);
-  void emitNativeUnpin(llvm::Value *handle);
+  llvm::Value *emitNativeTryPin(llvm::Value *object, Atomicity atomicity);
+  void emitNativeUnpin(llvm::Value *handle, Atomicity atomicity);
 
   // Routines for the ObjC reference-counting style.
   void emitObjCStrongRetain(llvm::Value *value);
@@ -314,8 +347,8 @@ public:
   // Routines for an unknown reference-counting style (meaning,
   // dynamically something compatible with either the ObjC or Swift styles).
   //   - strong references
-  void emitUnknownStrongRetain(llvm::Value *value);
-  void emitUnknownStrongRelease(llvm::Value *value);
+  void emitUnknownStrongRetain(llvm::Value *value, Atomicity atomicity);
+  void emitUnknownStrongRelease(llvm::Value *value, Atomicity atomicity);
   //   - unowned references
   void emitUnknownUnownedInit(llvm::Value *val, Address dest);
   void emitUnknownUnownedAssign(llvm::Value *value, Address dest);
@@ -338,8 +371,8 @@ public:
   llvm::Value *emitUnknownWeakTakeStrong(Address src, llvm::Type *type);
 
   // Routines for the Builtin.NativeObject reference-counting style.
-  void emitBridgeStrongRetain(llvm::Value *value);
-  void emitBridgeStrongRelease(llvm::Value *value);
+  void emitBridgeStrongRetain(llvm::Value *value, Atomicity atomicity);
+  void emitBridgeStrongRelease(llvm::Value *value, Atomicity atomicity);
 
   // Routines for the ErrorType reference-counting style.
   void emitErrorStrongRetain(llvm::Value *value);
@@ -359,25 +392,56 @@ public:
                      llvm::Value *metadata,
                      ArrayRef<llvm::Value*> wtables);
 
+  struct ArchetypeAccessPath {
+    CanArchetypeType BaseType;
+    AssociatedTypeDecl *Association;
+  };
+
+  /// Register an additional access path to the given archetype besides
+  /// (if applicable) just drilling down from its parent.
+  ///
+  /// This is necessary when an archetype gains conformances from an
+  /// associated type that it's been constrained to be equal to
+  /// but which is not simply its parent.
+  void addArchetypeAccessPath(CanArchetypeType targetArchetype,
+                              ArchetypeAccessPath accessPath);
+
+  ArrayRef<ArchetypeAccessPath>
+  getArchetypeAccessPaths(CanArchetypeType targetArchetype);
+
 //--- Type emission ------------------------------------------------------------
 public:
-  /// Look for a mapping for a local type-metadata reference.
-  /// The lookup is done for the current block which is the Builder's
-  /// insert-block.
-  llvm::Value *tryGetLocalTypeData(CanType type, LocalTypeDataKind kind);
+  /// Look up a local type data reference, returning null if no entry was
+  /// found.  This will emit code to materialize the reference if an
+  /// "abstract" entry is present.
+  llvm::Value *tryGetLocalTypeData(CanType type, LocalTypeDataKind kind) {
+    return tryGetLocalTypeData(LocalTypeDataKey{type, kind});
+  }
+  llvm::Value *tryGetLocalTypeData(LocalTypeDataKey key);
 
-  /// Retrieve a local type-metadata reference which is known to exist.
+  /// Look up a local type data reference, returning null if no entry was
+  /// found or if the only viable entries are abstract.  This will never
+  /// emit code.
+  llvm::Value *tryGetConcreteLocalTypeData(LocalTypeDataKey key);
+
+  /// Retrieve a local type data reference which is known to exist.
   llvm::Value *getLocalTypeData(CanType type, LocalTypeDataKind kind);
 
   /// Add a local type-metadata reference at a point which definitely
   /// dominates all of its uses.
   void setUnscopedLocalTypeData(CanType type, LocalTypeDataKind kind,
-                                llvm::Value *data);
+                                llvm::Value *data) {
+    setUnscopedLocalTypeData(LocalTypeDataKey{type, kind}, data);
+  }
+  void setUnscopedLocalTypeData(LocalTypeDataKey key, llvm::Value *data);
   
   /// Add a local type-metadata reference, valid at the current insertion
   /// point.
   void setScopedLocalTypeData(CanType type, LocalTypeDataKind kind,
-                              llvm::Value *data);
+                              llvm::Value *data) {
+    setScopedLocalTypeData(LocalTypeDataKey{type, kind}, data);
+  }
+  void setScopedLocalTypeData(LocalTypeDataKey key, llvm::Value *data);
 
   /// The same as tryGetLocalTypeData, just for the Layout metadata.
   ///
@@ -398,8 +462,8 @@ public:
 
   /// Given a concrete type metadata node, add all the local type data
   /// that we can reach from it.
-  void addLocalTypeDataForTypeMetadata(CanType type, IsExact_t isExact,
-                                       llvm::Value *metadata);
+  void bindLocalTypeDataFromTypeMetadata(CanType type, IsExact_t isExact,
+                                         llvm::Value *metadata);
 
   void setDominanceResolver(DominanceResolverFunction resolver) {
     assert(DominanceResolver == nullptr);
@@ -468,6 +532,7 @@ public:
     IRGenFunction &IGF;
     ConditionalDominanceScope *OldScope;
     SmallVector<LocalTypeDataKey, 2> RegisteredKeys;
+
   public:
     explicit ConditionalDominanceScope(IRGenFunction &IGF)
         : IGF(IGF), OldScope(IGF.ConditionalDominance) {
@@ -482,12 +547,7 @@ public:
       RegisteredKeys.push_back(key);
     }
 
-    ~ConditionalDominanceScope() {
-      IGF.ConditionalDominance = OldScope;
-      if (!RegisteredKeys.empty()) {
-        IGF.unregisterConditionalLocalTypeDataKeys(RegisteredKeys);
-      }
-    }
+    ~ConditionalDominanceScope();
   };
 
   /// The kind of value LocalSelf is.
@@ -506,7 +566,6 @@ public:
 private:
   LocalTypeDataCache &getOrCreateLocalTypeData();
   void destroyLocalTypeData();
-  void unregisterConditionalLocalTypeDataKeys(ArrayRef<LocalTypeDataKey> keys);
 
   LocalTypeDataCache *LocalTypeData = nullptr;
 
@@ -520,6 +579,9 @@ private:
   llvm::Value *LocalSelf = nullptr;
   
   LocalSelfKind SelfKind;
+
+  llvm::DenseMap<CanType, std::vector<ArchetypeAccessPath>>
+  ArchetypeAccessPaths;
 };
 
 using ConditionalDominanceScope = IRGenFunction::ConditionalDominanceScope;

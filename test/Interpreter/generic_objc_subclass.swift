@@ -3,7 +3,7 @@
 //
 // RUN: %target-clang -fobjc-arc %S/Inputs/ObjCClasses/ObjCClasses.m -c -o %t/ObjCClasses.o
 // RUN: %target-build-swift -I %S/Inputs/ObjCClasses/ -Xlinker %t/ObjCClasses.o %s -o %t/a.out
-// RUN: %target-run %t/a.out | FileCheck %s
+// RUN: %target-run %t/a.out | %FileCheck %s
 
 // REQUIRES: executable_test
 // REQUIRES: objc_interop
@@ -15,9 +15,17 @@ import ObjCClasses
   func calculatePrice() -> Int
 }
 
+protocol PP {
+  func calculateTaxes() -> Int
+}
+
+//
+// Generic subclass of an @objc class
+//
+
 class A<T> : HasHiddenIvars, P {
   var first: Int = 16
-  var second: T? = nil
+  var second: T?
   var third: Int = 61
 
   override var description: String {
@@ -56,6 +64,10 @@ print(f())
 a.second = 121
 print(f())
 
+//
+// Instantiate the class with a different set of generic parameters
+//
+
 let aa = A<(Int, Int)>()
 let ff = { (aa.x, aa.y, aa.z, aa.t, aa.first, aa.second, aa.third) }
 
@@ -69,6 +81,10 @@ aa.third = 17
 // CHECK: (101, 0, 0, 0, 16, Optional((19, 84)), 17)
 print(ff())
 
+//
+// Concrete subclass of generic subclass of @objc class
+//
+
 class B : A<(Int, Int)> {
   override var description: String {
     return "Salmon"
@@ -81,7 +97,7 @@ class B : A<(Int, Int)> {
 
 class BB : B {}
 
-class C : A<(Int, Int)> {
+class C : A<(Int, Int)>, PP {
   @nonobjc override var description: String {
     return "Invisible Chicken"
   }
@@ -89,14 +105,20 @@ class C : A<(Int, Int)> {
   override func calculatePrice() -> Int {
     return 650
   }
+
+  func calculateTaxes() -> Int {
+    return 110
+  }
 }
 
 // CHECK: 400
 // CHECK: 400
 // CHECK: 650
+// CHECK: 110
 print((BB() as P).calculatePrice())
 print((B() as P).calculatePrice())
 print((C() as P).calculatePrice())
+print((C() as PP).calculateTaxes())
 
 // CHECK: Salmon
 // CHECK: Grilled artichokes
@@ -115,6 +137,10 @@ b.third = 17
 
 // CHECK: (101, 0, 0, 0, 16, Optional((19, 84)), 17)
 print(g())
+
+//
+// Generic subclass of @objc class without any generically-sized members
+//
 
 class FixedA<T> : HasHiddenIvars, P {
   var first: Int = 16
@@ -157,6 +183,28 @@ print(fixedF())
 fixedA.second = [121]
 print(fixedF())
 
+//
+// Instantiate the class with a different set of generic parameters
+//
+
+let fixedAA = FixedA<(Int, Int)>()
+let fixedFF = { (fixedAA.x, fixedAA.y, fixedAA.z, fixedAA.t, fixedAA.first, fixedAA.second, fixedAA.third) }
+
+// CHECK: (0, 0, 0, 0, 16, [], 61)
+print(fixedFF())
+
+fixedAA.x = 101
+fixedAA.second = [(19, 84)]
+fixedAA.third = 17
+
+// CHECK: (101, 0, 0, 0, 16, [(19, 84)], 17)
+print(fixedFF())
+
+//
+// Concrete subclass of generic subclass of @objc class
+// without any generically-sized members
+//
+
 class FixedB : FixedA<Int> {
   override var description: String {
     return "Salmon"
@@ -185,3 +233,19 @@ fixedB.third = 17
 
 // CHECK: (101, 0, 0, 0, 16, [19, 84], 17)
 print(fixedG())
+
+// Problem with field alignment in direct generic subclass of NSObject -
+// <https://bugs.swift.org/browse/SR-2586>
+public class PandorasBox<T>: NSObject {
+    final public var value: T
+
+    public init(_ value: T) {
+        // Uses ConstantIndirect access pattern
+        self.value = value
+    }
+}
+
+let c = PandorasBox(30)
+// CHECK: 30
+// Uses ConstantDirect access pattern
+print(c.value)

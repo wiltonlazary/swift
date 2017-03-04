@@ -1,12 +1,12 @@
-//===--- DiagnosticEngine.cpp - Diagnostic Display Engine -------*- C++ -*-===//
+//===--- DiagnosticEngine.cpp - Diagnostic Display Engine -----------------===//
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2016 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 //
@@ -28,8 +28,10 @@
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/Twine.h"
 #include "llvm/Support/raw_ostream.h"
+
 using namespace swift;
 
+namespace {
 enum class DiagnosticOptions {
   /// No options.
   none,
@@ -39,35 +41,60 @@ enum class DiagnosticOptions {
   /// beginning of the line, then the location is adjusted to point to the end
   /// of the previous token.
   ///
-  /// This behaviour improves experience for "expected token X" diagnostics.
+  /// This behavior improves experience for "expected token X" diagnostics.
   PointsToFirstBadToken,
 
   /// After a fatal error subsequent diagnostics are suppressed.
   Fatal,
 };
-
 struct StoredDiagnosticInfo {
-  /// \brief The kind of diagnostic we're dealing with.
-  DiagnosticKind Kind;
+  DiagnosticKind kind : 2;
+  bool pointsToFirstBadToken : 1;
+  bool isFatal : 1;
 
-  DiagnosticOptions Options;
-
-  // FIXME: Category
-  
-  /// \brief Text associated with the diagnostic
-  const char *Text;
+  StoredDiagnosticInfo(DiagnosticKind k, bool firstBadToken, bool fatal)
+      : kind(k), pointsToFirstBadToken(firstBadToken), isFatal(fatal) {}
+  StoredDiagnosticInfo(DiagnosticKind k, DiagnosticOptions opts)
+      : StoredDiagnosticInfo(k,
+                             opts == DiagnosticOptions::PointsToFirstBadToken,
+                             opts == DiagnosticOptions::Fatal) {}
 };
 
-static StoredDiagnosticInfo StoredDiagnosticInfos[] = {
-#define ERROR(ID,Category,Options,Text,Signature) \
-  { DiagnosticKind::Error, DiagnosticOptions::Options, Text },
-#define WARNING(ID,Category,Options,Text,Signature) \
-  { DiagnosticKind::Warning, DiagnosticOptions::Options, Text },
-#define NOTE(ID,Category,Options,Text,Signature) \
-  { DiagnosticKind::Note, DiagnosticOptions::Options, Text },
+// Reproduce the DiagIDs, as we want both the size and access to the raw ids
+// themselves.
+enum LocalDiagID : uint32_t {
+#define DIAG(KIND, ID, Options, Text, Signature) ID,
 #include "swift/AST/DiagnosticsAll.def"
-  { DiagnosticKind::Error, DiagnosticOptions::none, "<not a diagnostic>" }
+  NumDiags
 };
+} // end anonymous namespace
+
+// TODO: categorization
+static StoredDiagnosticInfo storedDiagnosticInfos[] = {
+#define ERROR(ID, Options, Text, Signature)                                    \
+  StoredDiagnosticInfo(DiagnosticKind::Error, DiagnosticOptions::Options),
+#define WARNING(ID, Options, Text, Signature)                                  \
+  StoredDiagnosticInfo(DiagnosticKind::Warning, DiagnosticOptions::Options),
+#define NOTE(ID, Options, Text, Signature)                                     \
+  StoredDiagnosticInfo(DiagnosticKind::Note, DiagnosticOptions::Options),
+#include "swift/AST/DiagnosticsAll.def"
+};
+static_assert(sizeof(storedDiagnosticInfos) / sizeof(StoredDiagnosticInfo) ==
+                  LocalDiagID::NumDiags,
+              "array size mismatch");
+
+static const char *diagnosticStrings[] = {
+#define ERROR(ID, Options, Text, Signature) Text,
+#define WARNING(ID, Options, Text, Signature) Text,
+#define NOTE(ID, Options, Text, Signature) Text,
+#include "swift/AST/DiagnosticsAll.def"
+    "<not a diagnostic>",
+};
+
+DiagnosticState::DiagnosticState() {
+  // Initialize our per-diagnostic state to default
+  perDiagnosticBehavior.resize(LocalDiagID::NumDiags, Behavior::Unspecified);
+}
 
 static CharSourceRange toCharSourceRange(SourceManager &SM, SourceRange SR) {
   return CharSourceRange(SM, SR.Start, Lexer::getLocForEndOfToken(SM, SR.End));
@@ -76,6 +103,26 @@ static CharSourceRange toCharSourceRange(SourceManager &SM, SourceRange SR) {
 static CharSourceRange toCharSourceRange(SourceManager &SM, SourceLoc Start,
                                          SourceLoc End) {
   return CharSourceRange(SM, Start, End);
+}
+
+/// \brief Extract a character at \p Loc. If \p Loc is the end of the buffer,
+/// return '\f'.
+static char extractCharAfter(SourceManager &SM, SourceLoc Loc) {
+  auto chars = SM.extractText({Loc, 1});
+  return chars.empty() ? '\f' : chars[0];
+}
+
+/// \brief Extract a character immediately before \p Loc. If \p Loc is the
+/// start of the buffer, return '\f'.
+static char extractCharBefore(SourceManager &SM, SourceLoc Loc) {
+  // We have to be careful not to go off the front of the buffer.
+  auto bufferID = SM.findBufferContainingLoc(Loc);
+  auto bufferRange = SM.getRangeForBuffer(bufferID);
+  if (bufferRange.getStart() == Loc)
+    return '\f';
+  auto chars = SM.extractText({Loc.getAdvancedLoc(-1), 1}, bufferID);
+  assert(!chars.empty() && "Couldn't extractText with valid range");
+  return chars[0];
 }
 
 InFlightDiagnostic &InFlightDiagnostic::highlight(SourceRange R) {
@@ -120,23 +167,10 @@ InFlightDiagnostic &InFlightDiagnostic::fixItRemove(SourceRange R) {
   // space around its hole.  Specifically, check to see there is whitespace
   // before and after the end of range.  If so, nuke the space afterward to keep
   // things consistent.
-  if (SM.extractText({charRange.getEnd(), 1}) == " ") {
-    // Check before the string, we have to be careful not to go off the front of
-    // the buffer.
-    auto bufferRange =
-      SM.getRangeForBuffer(SM.findBufferContainingLoc(charRange.getStart()));
-    bool ShouldRemove = false;
-    if (bufferRange.getStart() == charRange.getStart())
-      ShouldRemove = true;
-    else {
-      auto beforeChars =
-        SM.extractText({charRange.getStart().getAdvancedLoc(-1), 1});
-      ShouldRemove = !beforeChars.empty() && isspace(beforeChars[0]);
-    }
-    if (ShouldRemove) {
-      charRange = CharSourceRange(charRange.getStart(),
-                                  charRange.getByteLength()+1);
-    }
+  if (extractCharAfter(SM, charRange.getEnd()) == ' ' &&
+      isspace(extractCharBefore(SM, charRange.getStart()))) {
+    charRange = CharSourceRange(charRange.getStart(),
+                                charRange.getByteLength()+1);
   }
   Engine->getActiveDiagnostic().addFixIt(Diagnostic::FixIt(charRange, {}));
   return *this;
@@ -149,9 +183,23 @@ InFlightDiagnostic &InFlightDiagnostic::fixItReplace(SourceRange R,
     return fixItRemove(R);
 
   assert(IsActive && "Cannot modify an inactive diagnostic");
-  if (Engine && R.isValid())
-    Engine->getActiveDiagnostic().addFixIt(
-        Diagnostic::FixIt(toCharSourceRange(Engine->SourceMgr, R), Str));
+  if (R.isInvalid() || !Engine) return *this;
+
+  auto &SM = Engine->SourceMgr;
+  auto charRange = toCharSourceRange(SM, R);
+
+  // If we're replacing with something that wants spaces around it, do a bit of
+  // extra work so that we don't suggest extra spaces.
+  if (Str.back() == ' ') {
+    if (isspace(extractCharAfter(SM, charRange.getEnd())))
+      Str = Str.drop_back();
+  }
+  if (!Str.empty() && Str.front() == ' ') {
+    if (isspace(extractCharBefore(SM, charRange.getStart())))
+      Str = Str.drop_front();
+  }
+
+  Engine->getActiveDiagnostic().addFixIt(Diagnostic::FixIt(charRange, Str));
   return *this;
 }
 
@@ -165,6 +213,25 @@ InFlightDiagnostic &InFlightDiagnostic::fixItReplaceChars(SourceLoc Start,
   return *this;
 }
 
+InFlightDiagnostic &InFlightDiagnostic::fixItExchange(SourceRange R1,
+                                                      SourceRange R2) {
+  assert(IsActive && "Cannot modify an inactive diagnostic");
+
+  auto &SM = Engine->SourceMgr;
+  // Convert from a token range to a CharSourceRange
+  auto charRange1 = toCharSourceRange(SM, R1);
+  auto charRange2 = toCharSourceRange(SM, R2);
+  // Extract source text.
+  auto text1 = SM.extractText(charRange1);
+  auto text2 = SM.extractText(charRange2);
+
+  Engine->getActiveDiagnostic()
+    .addFixIt(Diagnostic::FixIt(charRange1, text2));
+  Engine->getActiveDiagnostic()
+    .addFixIt(Diagnostic::FixIt(charRange2, text1));
+  return *this;
+}
+
 void InFlightDiagnostic::flush() {
   if (!IsActive)
     return;
@@ -175,15 +242,7 @@ void InFlightDiagnostic::flush() {
 }
 
 bool DiagnosticEngine::isDiagnosticPointsToFirstBadToken(DiagID ID) const {
-  const StoredDiagnosticInfo &StoredInfo =
-      StoredDiagnosticInfos[(unsigned) ID];
-  return StoredInfo.Options == DiagnosticOptions::PointsToFirstBadToken;
-}
-
-bool DiagnosticEngine::isDiagnosticFatal(DiagID ID) const {
-  const StoredDiagnosticInfo &StoredInfo =
-      StoredDiagnosticInfos[(unsigned) ID];
-  return StoredInfo.Options == DiagnosticOptions::Fatal;
+  return storedDiagnosticInfos[(unsigned) ID].pointsToFirstBadToken;
 }
 
 /// \brief Skip forward to one of the given delimiters.
@@ -191,15 +250,18 @@ bool DiagnosticEngine::isDiagnosticFatal(DiagID ID) const {
 /// \param Text The text to search through, which will be updated to point
 /// just after the delimiter.
 ///
-/// \param Delim1 The first character delimiter to search for.
+/// \param Delim The first character delimiter to search for.
 ///
-/// \param Delim2 The second character delimiter to search for.
+/// \param FoundDelim On return, true if the delimiter was found, or false
+/// if the end of the string was reached.
 ///
 /// \returns The string leading up to the delimiter, or the empty string
 /// if no delimiter is found.
 static StringRef 
-skipToDelimiter(StringRef &Text, char Delim1, char Delim2 = 0) {
+skipToDelimiter(StringRef &Text, char Delim, bool *FoundDelim = nullptr) {
   unsigned Depth = 0;
+  if (FoundDelim)
+    *FoundDelim = false;
 
   unsigned I = 0;
   for (unsigned N = Text.size(); I != N; ++I) {
@@ -213,8 +275,11 @@ skipToDelimiter(StringRef &Text, char Delim1, char Delim2 = 0) {
       continue;
     }
     
-    if (Text[I] == Delim1 || Text[I] == Delim2)
+    if (Text[I] == Delim) {
+      if (FoundDelim)
+        *FoundDelim = true;
       break;
+    }
   }
 
   assert(Depth == 0 && "Unbalanced {} set in diagnostic text");
@@ -236,8 +301,11 @@ static void formatSelectionArgument(StringRef ModifierArguments,
                                     ArrayRef<DiagnosticArgument> Args,
                                     unsigned SelectedIndex,
                                     llvm::raw_ostream &Out) {
+  bool foundPipe = false;
   do {
-    StringRef Text = skipToDelimiter(ModifierArguments, '|');
+    assert((!ModifierArguments.empty() || foundPipe) &&
+           "Index beyond bounds in %select modifier");
+    StringRef Text = skipToDelimiter(ModifierArguments, '|', &foundPipe);
     if (SelectedIndex == 0) {
       formatDiagnosticText(Text, Args, Out);
       break;
@@ -313,16 +381,10 @@ static void formatDiagnosticArgument(StringRef Modifier,
     // cases to avoid too much noise.
     bool showAKA = !type->isCanonical();
 
-    // Substituted types are uninteresting sugar that prevents the heuristics
-    // below from kicking in.
-    if (showAKA)
-      if (auto *ST = dyn_cast<SubstitutedType>(type.getPointer()))
-        type = ST->getReplacementType();
-
     // If we're complaining about a function type, don't "aka" just because of
     // differences in the argument or result types.
-    if (showAKA && type->is<FunctionType>() &&
-        isa<FunctionType>(type.getPointer()))
+    if (showAKA && type->is<AnyFunctionType>() &&
+        isa<AnyFunctionType>(type.getPointer()))
       showAKA = false;
 
     // Don't unwrap intentional sugar types like T? or [T].
@@ -338,7 +400,7 @@ static void formatDiagnosticArgument(StringRef Modifier,
       showAKA = false;
 
     // Don't show generic type parameters.
-    if (showAKA && type->getCanonicalType()->hasTypeParameter())
+    if (showAKA && type->hasTypeParameter())
       showAKA = false;
 
     if (showAKA)
@@ -384,6 +446,10 @@ static void formatDiagnosticArgument(StringRef Modifier,
            "Improper modifier for VersionTuple argument");
     Out << Arg.getAsVersionTuple().getAsString();
     break;
+  case DiagnosticArgumentKind::LayoutConstraint:
+    assert(Modifier.empty() && "Improper modifier for LayoutConstraint argument");
+    Out << '\'' << Arg.getAsLayoutConstraint() << '\'';
+    break;
   }
 }
 
@@ -415,13 +481,17 @@ static void formatDiagnosticText(StringRef InText,
     // Parse an optional modifier.
     StringRef Modifier;
     {
-      unsigned Length = 0;
-      while (isalpha(InText[Length]))
-        ++Length;
+      size_t Length = InText.find_if_not(isalpha);
       Modifier = InText.substr(0, Length);
       InText = InText.substr(Length);
     }
     
+    if (Modifier == "error") {
+      assert(false && "encountered %error in diagnostic text");
+      Out << StringRef("<<ERROR>>");
+      break;
+    }
+
     // Parse the optional argument list for a modifier, which is brace-enclosed.
     StringRef ModifierArguments;
     if (InText[0] == '{') {
@@ -429,24 +499,99 @@ static void formatDiagnosticText(StringRef InText,
       ModifierArguments = skipToDelimiter(InText, '}');
     }
     
-    // Find the digit sequence.
-    unsigned Length = 0;
-    for (size_t N = InText.size(); Length != N; ++Length) {
-      if (!isdigit(InText[Length]))
-        break;
-    }
-      
-    // Parse the digit sequence into an argument index.
+    // Find the digit sequence, and parse it into an argument index.
+    size_t Length = InText.find_if_not(isdigit);
     unsigned ArgIndex;      
     bool Result = InText.substr(0, Length).getAsInteger(10, ArgIndex);
     assert(!Result && "Unparseable argument index value?");
     (void)Result;
     assert(ArgIndex < Args.size() && "Out-of-range argument index");
     InText = InText.substr(Length);
-    
+
     // Convert the argument to a string.
     formatDiagnosticArgument(Modifier, ModifierArguments, Args, ArgIndex, Out);
   }
+}
+
+static DiagnosticKind toDiagnosticKind(DiagnosticState::Behavior behavior) {
+  switch (behavior) {
+  case DiagnosticState::Behavior::Unspecified:
+    llvm_unreachable("unspecified behavior");
+  case DiagnosticState::Behavior::Ignore:
+    llvm_unreachable("trying to map an ignored diagnostic");
+  case DiagnosticState::Behavior::Error:
+  case DiagnosticState::Behavior::Fatal:
+    return DiagnosticKind::Error;
+  case DiagnosticState::Behavior::Note:
+    return DiagnosticKind::Note;
+  case DiagnosticState::Behavior::Warning:
+    return DiagnosticKind::Warning;
+  }
+
+  llvm_unreachable("Unhandled DiagnosticKind in switch.");
+}
+
+DiagnosticState::Behavior DiagnosticState::determineBehavior(DiagID id) {
+  auto set = [this](DiagnosticState::Behavior lvl) {
+    if (lvl == Behavior::Fatal) {
+      fatalErrorOccurred = true;
+      anyErrorOccurred = true;
+    } else if (lvl == Behavior::Error) {
+      anyErrorOccurred = true;
+    }
+
+    previousBehavior = lvl;
+    return lvl;
+  };
+
+  // We determine how to handle a diagnostic based on the following rules
+  //   1) If current state dictates a certain behavior, follow that
+  //   2) If the user provided a behavior for this specific diagnostic, follow
+  //      that
+  //   3) If the user provided a behavior for this diagnostic's kind, follow
+  //      that
+  //   4) Otherwise remap the diagnostic kind
+
+  auto diagInfo = storedDiagnosticInfos[(unsigned)id];
+  bool isNote = diagInfo.kind == DiagnosticKind::Note;
+
+  //   1) If current state dictates a certain behavior, follow that
+
+  // Notes relating to ignored diagnostics should also be ignored
+  if (previousBehavior == Behavior::Ignore && isNote)
+    return set(Behavior::Ignore);
+
+  // Suppress diagnostics when in a fatal state, except for follow-on notes
+  if (fatalErrorOccurred)
+    if (!showDiagnosticsAfterFatalError && !isNote)
+      return set(Behavior::Ignore);
+
+  //   2) If the user provided a behavior for this specific diagnostic, follow
+  //      that
+
+  if (perDiagnosticBehavior[(unsigned)id] != Behavior::Unspecified)
+    return set(perDiagnosticBehavior[(unsigned)id]);
+
+  //   3) If the user provided a behavior for this diagnostic's kind, follow
+  //      that
+  if (diagInfo.kind == DiagnosticKind::Warning) {
+    if (suppressWarnings)
+      return set(Behavior::Ignore);
+    if (warningsAsErrors)
+      return set(Behavior::Error);
+  }
+
+  //   4) Otherwise remap the diagnostic kind
+  switch (diagInfo.kind) {
+  case DiagnosticKind::Note:
+    return set(Behavior::Note);
+  case DiagnosticKind::Error:
+    return set(diagInfo.isFatal ? Behavior::Fatal : Behavior::Error);
+  case DiagnosticKind::Warning:
+    return set(Behavior::Warning);
+  }
+
+  llvm_unreachable("Unhandled DiagnosticKind in switch.");
 }
 
 void DiagnosticEngine::flushActiveDiagnostic() {
@@ -467,33 +612,9 @@ void DiagnosticEngine::emitTentativeDiagnostics() {
 }
 
 void DiagnosticEngine::emitDiagnostic(const Diagnostic &diagnostic) {
-  const StoredDiagnosticInfo &StoredInfo
-    = StoredDiagnosticInfos[(unsigned)diagnostic.getID()];
-
-  if (FatalState != FatalErrorState::None) {
-    bool shouldIgnore = true;
-    if (StoredInfo.Kind == DiagnosticKind::Note)
-      shouldIgnore = (FatalState == FatalErrorState::Fatal);
-    else
-      FatalState = FatalErrorState::Fatal;
-
-    if (shouldIgnore && !ShowDiagnosticsAfterFatalError) {
-      return;
-    }
-  }
-
-  // Check whether this is an error.
-  switch (StoredInfo.Kind) {
-  case DiagnosticKind::Error:
-    HadAnyError = true;
-    if (isDiagnosticFatal(diagnostic.getID()))
-      FatalState = FatalErrorState::JustEmitted;
-    break;
-    
-  case DiagnosticKind::Note:
-  case DiagnosticKind::Warning:
-    break;
-  }
+  auto behavior = state.determineBehavior(diagnostic.getID());
+  if (behavior == DiagnosticState::Behavior::Ignore)
+    return;
 
   // Figure out the source location.
   SourceLoc loc = diagnostic.getLoc();
@@ -550,8 +671,8 @@ void DiagnosticEngine::emitDiagnostic(const Diagnostic &diagnostic) {
               ppDecl = cast<ExtensionDecl>(dc);
               break;
 
-            case DeclContextKind::NominalTypeDecl:
-              ppDecl = cast<NominalTypeDecl>(dc);
+            case DeclContextKind::GenericTypeDecl:
+              ppDecl = cast<GenericTypeDecl>(dc);
               break;
 
             case DeclContextKind::SerializedLocal:
@@ -569,7 +690,7 @@ void DiagnosticEngine::emitDiagnostic(const Diagnostic &diagnostic) {
           // build the name of the buffer.
           SmallVector<StringRef, 4> nameComponents;
           while (dc) {
-            nameComponents.push_back(cast<Module>(dc)->getName().str());
+            nameComponents.push_back(cast<ModuleDecl>(dc)->getName().str());
             dc = dc->getParent();
           }
 
@@ -613,7 +734,8 @@ void DiagnosticEngine::emitDiagnostic(const Diagnostic &diagnostic) {
   llvm::SmallString<256> Text;
   {
     llvm::raw_svector_ostream Out(Text);
-    formatDiagnosticText(StoredInfo.Text, diagnostic.getArgs(), Out);
+    formatDiagnosticText(diagnosticStrings[(unsigned)diagnostic.getID()],
+                         diagnostic.getArgs(), Out);
   }
 
   // Pass the diagnostic off to the consumer.
@@ -622,7 +744,8 @@ void DiagnosticEngine::emitDiagnostic(const Diagnostic &diagnostic) {
   Info.Ranges = diagnostic.getRanges();
   Info.FixIts = diagnostic.getFixIts();
   for (auto &Consumer : Consumers) {
-    Consumer->handleDiagnostic(SourceMgr, loc, StoredInfo.Kind, Text, Info);
+    Consumer->handleDiagnostic(SourceMgr, loc, toDiagnosticKind(behavior), Text,
+                               Info);
   }
 }
 

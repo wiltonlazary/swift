@@ -2,11 +2,11 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2016 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 
@@ -17,28 +17,55 @@ using namespace swift;
 // SILBuilder Implementation
 //===----------------------------------------------------------------------===//
 
+TupleInst *SILBuilder::createTuple(SILLocation loc, ArrayRef<SILValue> elts) {
+  // Derive the tuple type from the elements.
+  SmallVector<TupleTypeElt, 4> eltTypes;
+  for (auto elt : elts)
+    eltTypes.push_back(elt->getType().getSwiftRValueType());
+  auto tupleType = SILType::getPrimitiveObjectType(
+      CanType(TupleType::get(eltTypes, F.getASTContext())));
+
+  return createTuple(loc, tupleType, elts);
+}
+
 SILType SILBuilder::getPartialApplyResultType(SILType origTy, unsigned argCount,
-                                              SILModule &M,
-                                              ArrayRef<Substitution> subs) {
+                                        SILModule &M,
+                                        SubstitutionList subs,
+                                        ParameterConvention calleeConvention) {
   CanSILFunctionType FTI = origTy.castTo<SILFunctionType>();
   if (!subs.empty())
-    FTI = FTI->substGenericArgs(M, M.getSwiftModule(), subs);
+    FTI = FTI->substGenericArgs(M, subs);
   
   assert(!FTI->isPolymorphic()
          && "must provide substitutions for generic partial_apply");
   auto params = FTI->getParameters();
   auto newParams = params.slice(0, params.size() - argCount);
 
-  auto extInfo = SILFunctionType::ExtInfo(
-                                        SILFunctionType::Representation::Thick,
-                                        /*noreturn*/ FTI->isNoReturn());
-  
+  auto extInfo = FTI->getExtInfo().withRepresentation(
+      SILFunctionType::Representation::Thick);
+
+  // If the original method has an @unowned_inner_pointer return, the partial
+  // application thunk will lifetime-extend 'self' for us, converting the
+  // return value to @unowned.
+  //
+  // If the original method has an @autoreleased return, the partial application
+  // thunk will retain it for us, converting the return value to @owned.
+  SmallVector<SILResultInfo, 4> results;
+  results.append(FTI->getResults().begin(), FTI->getResults().end());
+  for (auto &result : results) {
+    if (result.getConvention() == ResultConvention::UnownedInnerPointer)
+      result = SILResultInfo(result.getType(), ResultConvention::Unowned);
+    else if (result.getConvention() == ResultConvention::Autoreleased)
+      result = SILResultInfo(result.getType(), ResultConvention::Owned);
+  }
+
   auto appliedFnType = SILFunctionType::get(nullptr, extInfo,
-                                            ParameterConvention::Direct_Owned,
+                                            calleeConvention,
                                             newParams,
-                                            FTI->getResult(),
+                                            results,
                                             FTI->getOptionalErrorResult(),
                                             M.getASTContext());
+
   return SILType::getPrimitiveObjectType(appliedFnType);
 }
 
@@ -48,11 +75,11 @@ SILInstruction *SILBuilder::tryCreateUncheckedRefCast(SILLocation Loc,
                                                       SILValue Op,
                                                       SILType ResultTy) {
   auto &M = F.getModule();
-  if (!SILType::canRefCast(Op.getType(), ResultTy, M))
+  if (!SILType::canRefCast(Op->getType(), ResultTy, M))
     return nullptr;
 
-  return insert(
-      new (M) UncheckedRefCastInst(createSILDebugLocation(Loc), Op, ResultTy));
+  return insert(UncheckedRefCastInst::create(getSILDebugLocation(Loc), Op,
+                                             ResultTy, F, OpenedArchetypes));
 }
 
 // Create the appropriate cast instruction based on result type.
@@ -61,16 +88,16 @@ SILInstruction *SILBuilder::createUncheckedBitCast(SILLocation Loc,
                                                    SILType Ty) {
   auto &M = F.getModule();
   if (Ty.isTrivial(M))
-    return insert(new (M) UncheckedTrivialBitCastInst(
-        createSILDebugLocation(Loc), Op, Ty));
+    return insert(UncheckedTrivialBitCastInst::create(
+        getSILDebugLocation(Loc), Op, Ty, F, OpenedArchetypes));
 
   if (auto refCast = tryCreateUncheckedRefCast(Loc, Op, Ty))
-    return refCast;  
+    return refCast;
 
   // The destination type is nontrivial, and may be smaller than the source
   // type, so RC identity cannot be assumed.
-  return insert(
-      new (M) UncheckedBitwiseCastInst(createSILDebugLocation(Loc), Op, Ty));
+  return insert(UncheckedBitwiseCastInst::create(getSILDebugLocation(Loc), Op,
+                                                 Ty, F, OpenedArchetypes));
 }
 
 BranchInst *SILBuilder::createBranch(SILLocation Loc,
@@ -91,7 +118,7 @@ void SILBuilder::emitBlock(SILBasicBlock *BB, SILLocation BranchLoc) {
   }
 
   // Fall though from the currently active block into the given block.
-  assert(BB->bbarg_empty() && "cannot fall through to bb with args");
+  assert(BB->args_empty() && "cannot fall through to bb with args");
 
   // This is a fall through into BB, emit the fall through branch.
   createBranch(BranchLoc, BB);
@@ -111,11 +138,11 @@ void SILBuilder::emitBlock(SILBasicBlock *BB, SILLocation BranchLoc) {
 SILBasicBlock *SILBuilder::splitBlockForFallthrough() {
   // If we are concatenating, just create and return a new block.
   if (insertingAtEndOfBlock()) {
-    return new (F.getModule()) SILBasicBlock(&F, BB);
+    return F.createBasicBlock(BB);
   }
 
   // Otherwise we need to split the current block at the insertion point.
-  auto *NewBB = BB->splitBasicBlock(InsertPt);
+  auto *NewBB = BB->split(InsertPt);
   InsertPt = BB->end();
   return NewBB;
 }
@@ -165,7 +192,7 @@ static bool couldReduceStrongRefcount(SILInstruction *Inst) {
   // value drops a retain.  We would have to do more alias analysis to be able
   // to safely ignore one of those.
   if (auto AI = dyn_cast<AssignInst>(Inst)) {
-    auto StoredType = AI->getOperand(0).getType();
+    auto StoredType = AI->getOperand(0)->getType();
     if (StoredType.isTrivial(Inst->getModule()) ||
         StoredType.is<ReferenceStorageType>())
       return false;
@@ -176,7 +203,7 @@ static bool couldReduceStrongRefcount(SILInstruction *Inst) {
     if (CAI->isInitializationOfDest())
       return false;
 
-    SILType StoredType = CAI->getOperand(0).getType().getObjectType();
+    SILType StoredType = CAI->getOperand(0)->getType().getObjectType();
     if (StoredType.isTrivial(Inst->getModule()) ||
         StoredType.is<ReferenceStorageType>())
       return false;
@@ -218,7 +245,7 @@ SILBuilder::emitStrongRelease(SILLocation Loc, SILValue Operand) {
   }
 
   // If we didn't find a retain to fold this into, emit the release.
-  return createStrongRelease(Loc, Operand);
+  return createStrongRelease(Loc, Operand, getDefaultAtomicity());
 }
 
 /// Emit a release_value instruction at the current location, attempting to
@@ -245,9 +272,32 @@ SILBuilder::emitReleaseValue(SILLocation Loc, SILValue Operand) {
   }
 
   // If we didn't find a retain to fold this into, emit the release.
-  return createReleaseValue(Loc, Operand);
+  return createReleaseValue(Loc, Operand, getDefaultAtomicity());
 }
 
+PointerUnion<CopyValueInst *, DestroyValueInst *>
+SILBuilder::emitDestroyValue(SILLocation Loc, SILValue Operand) {
+  // Check to see if the instruction immediately before the insertion point is a
+  // retain_value of the specified operand.  If so, we can zap the pair.
+  auto I = getInsertionPoint(), BBStart = getInsertionBB()->begin();
+  while (I != BBStart) {
+    auto *Inst = &*--I;
+
+    if (auto *CVI = dyn_cast<CopyValueInst>(Inst)) {
+      if (SILValue(CVI) == Operand || CVI->getOperand() == Operand)
+        return CVI;
+      // Skip past unrelated retains.
+      continue;
+    }
+
+    // Scan past simple instructions that cannot reduce refcounts.
+    if (couldReduceStrongRefcount(Inst))
+      break;
+  }
+
+  // If we didn't find a retain to fold this into, emit the release.
+  return createDestroyValue(Loc, Operand);
+}
 
 SILValue SILBuilder::emitThickToObjCMetatype(SILLocation Loc, SILValue Op,
                                              SILType Ty) {
@@ -283,18 +333,4 @@ SILValue SILBuilder::emitObjCToThickMetatype(SILLocation Loc, SILValue Op,
 
   // Just create the objc_to_thick_metatype instruction.
   return createObjCToThickMetatype(Loc, Op, Ty);
-}
-
-SILDebugLocation *
-SILBuilder::getOrCreateDebugLocation(SILLocation Loc, const SILDebugScope *DS) {
-  // Check whether the location already exists.
-  assert(DS && "empty debug scope");
-  SILDebugLocation TmpLoc(Loc, DS);
-  auto *&L = DebugLocs[SILDebugLocationID(TmpLoc)];
-  if (L)
-    return L;
- 
-  // It's new, allocate it on our own allocator and insert it into the set.
-  L = new (F.getModule()) SILDebugLocation(Loc, DS);
-  return L;
 }

@@ -2,11 +2,11 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2016 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 //
@@ -21,9 +21,11 @@
 #include "swift/SIL/SILGlobalVariable.h"
 #include "llvm/IR/GlobalVariable.h"
 
+#include "DebugTypeInfo.h"
 #include "Explosion.h"
 #include "GenHeap.h"
 #include "GenTuple.h"
+#include "IRGenDebugInfo.h"
 #include "IRGenFunction.h"
 #include "IRGenModule.h"
 #include "FixedTypeInfo.h"
@@ -37,8 +39,15 @@ Address IRGenModule::emitSILGlobalVariable(SILGlobalVariable *var) {
   
   // If the variable is empty in all resilience domains, don't actually emit it;
   // just return undef.
-  if (ti.isKnownEmpty(ResilienceExpansion::Minimal))
+  if (ti.isKnownEmpty(ResilienceExpansion::Minimal)) {
+    if (DebugInfo && var->getDecl()) {
+      auto DbgTy = DebugTypeInfo::getGlobal(var, Int8Ty, Size(0), Alignment(1));
+      DebugInfo->emitGlobalVariableDeclaration(
+          nullptr, var->getDecl()->getName().str(), "", DbgTy,
+          var->getLinkage() != SILLinkage::Public, SILLocation(var->getDecl()));
+    }
     return ti.getUndefAddress();
+  }
 
   /// Get the global variable.
   Address addr = getAddrOfSILGlobalVariable(var, ti,
@@ -53,24 +62,31 @@ Address IRGenModule::emitSILGlobalVariable(SILGlobalVariable *var) {
   return addr;
 }
 
-ContainedAddress FixedTypeInfo::allocateStack(IRGenFunction &IGF, SILType T,
-                                              const Twine &name) const {
+StackAddress FixedTypeInfo::allocateStack(IRGenFunction &IGF, SILType T,
+                                          bool isEntryBlock,
+                                          const Twine &name) const {
   // If the type is known to be empty, don't actually allocate anything.
   if (isKnownEmpty(ResilienceExpansion::Maximal)) {
     auto addr = getUndefAddress();
-    return { addr, addr };
+    return { addr };
   }
 
   Address alloca =
     IGF.createAlloca(getStorageType(), getFixedAlignment(), name);
   IGF.Builder.CreateLifetimeStart(alloca, getFixedSize());
   
-  return { alloca, alloca };
+  return { alloca };
 }
 
-void FixedTypeInfo::deallocateStack(IRGenFunction &IGF, Address addr,
+void FixedTypeInfo::destroyStack(IRGenFunction &IGF, StackAddress addr,
+                                 SILType T) const {
+  destroy(IGF, addr.getAddress(), T);
+  FixedTypeInfo::deallocateStack(IGF, addr, T);
+}
+
+void FixedTypeInfo::deallocateStack(IRGenFunction &IGF, StackAddress addr,
                                     SILType T) const {
   if (isKnownEmpty(ResilienceExpansion::Maximal))
     return;
-  IGF.Builder.CreateLifetimeEnd(addr, getFixedSize());
+  IGF.Builder.CreateLifetimeEnd(addr.getAddress(), getFixedSize());
 }

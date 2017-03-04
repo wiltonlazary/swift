@@ -1,12 +1,12 @@
-//===--- LICM.cpp - Loop invariant code motion ------------------*- C++ -*-===//
+//===--- LICM.cpp - Loop invariant code motion ----------------------------===//
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2016 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 
@@ -27,6 +27,7 @@
 #include "swift/SIL/SILArgument.h"
 #include "swift/SIL/SILBuilder.h"
 #include "swift/SIL/SILInstruction.h"
+#include "swift/SIL/InstructionUtils.h"
 
 #include "llvm/ADT/DepthFirstIterator.h"
 #include "llvm/ADT/SmallPtrSet.h"
@@ -111,7 +112,7 @@ static bool hasLoopInvariantOperands(SILInstruction *I, SILLoop *L) {
 
   return std::all_of(Opds.begin(), Opds.end(), [=](Operand &Op) {
 
-    auto *Def = Op.get().getDef();
+    ValueBase *Def = Op.get();
 
     // Operand is defined outside the loop.
     if (auto *Inst = dyn_cast<SILInstruction>(Def))
@@ -125,7 +126,7 @@ static bool hasLoopInvariantOperands(SILInstruction *I, SILLoop *L) {
 
 /// Check if an address does not depend on other values in a basic block.
 static SILInstruction *addressIndependent(SILValue Addr) {
-  Addr = Addr.stripCasts();
+  Addr = stripCasts(Addr);
   if (GlobalAddrInst *SGAI = dyn_cast<GlobalAddrInst>(Addr))
     return SGAI;
   if (StructElementAddrInst *SEAI = dyn_cast<StructElementAddrInst>(Addr))
@@ -286,7 +287,7 @@ static bool hoistInstructions(SILLoop *Loop, DominanceInfo *DT,
         DEBUG(llvm::dbgs() << "   hoisting to preheader.\n");
         Changed = true;
         Inst->moveBefore(Preheader->getTerminator());
-      } else if (RunsOnHighLevelSil){
+      } else if (RunsOnHighLevelSil) {
         ArraySemanticsCall semCall(Inst);
         switch (semCall.getKind()) {
         case ArrayCallKind::kGetCount:
@@ -347,7 +348,7 @@ static bool sinkFixLifetime(SILLoop *Loop, DominanceInfo *DomTree,
   // Sink the fix_lifetime instruction.
   bool Changed = false;
   for (auto *FLI : FixLifetimeInsts)
-    if (DomTree->dominates(FLI->getOperand().getDef()->getParentBB(),
+    if (DomTree->dominates(FLI->getOperand()->getParentBlock(),
                            Preheader)) {
       auto Succs = ExitingBB->getSuccessors();
       for (unsigned EdgeIdx = 0; EdgeIdx <  Succs.size(); ++EdgeIdx) {
@@ -435,7 +436,7 @@ protected:
   /// \brief Optimize the current loop nest.
   void optimizeLoop(SILLoop *CurrentLoop, ReadSet &SafeReads);
 };
-}
+} // end anonymous namespace
 
 bool LoopTreeOptimization::optimize() {
   // Process loops bottom up in the loop tree.
@@ -449,7 +450,7 @@ bool LoopTreeOptimization::optimize() {
     auto CurrLoopSummary = llvm::make_unique<LoopNestSummary>(CurrentLoop);
     propagateSummaries(CurrLoopSummary);
 
-    // Analyse the current loop for reads that can be hoisted.
+    // Analyze the current loop for reads that can be hoisted.
     ReadSet SafeReads;
     analyzeCurrentLoop(CurrLoopSummary, SafeReads);
 
@@ -474,7 +475,7 @@ void LoopTreeOptimization::analyzeCurrentLoop(
     std::unique_ptr<LoopNestSummary> &CurrSummary, ReadSet &SafeReads) {
   WriteSet &MayWrites = CurrSummary->MayWrites;
   SILLoop *Loop = CurrSummary->Loop;
-  DEBUG(llvm::dbgs() << " Analysing accesses.\n");
+  DEBUG(llvm::dbgs() << " Analyzing accesses.\n");
 
   // Contains function calls in the loop, which only read from memory.
   SmallVector<ApplyInst *, 8> ReadOnlyApplies;
@@ -575,7 +576,7 @@ public:
     }
   }
 };
-}
+} // end anonymous namespace
 
 SILTransform *swift::createLICM() {
   return new LICM(false);

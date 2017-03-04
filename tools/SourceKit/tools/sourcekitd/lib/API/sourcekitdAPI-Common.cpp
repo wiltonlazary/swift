@@ -2,17 +2,18 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2016 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 
 #include "DictionaryKeys.h"
 #include "sourcekitd/Internal.h"
 #include "sourcekitd/Logging.h"
+#include "sourcekitd/RequestResponsePrinterBase.h"
 #include "SourceKit/Support/Logging.h"
 #include "SourceKit/Support/UIdent.h"
 #include "llvm/ADT/ArrayRef.h"
@@ -32,6 +33,8 @@ using llvm::StringRef;
 using llvm::raw_ostream;
 
 
+UIdent sourcekitd::KeyVersionMajor("key.version_major");;
+UIdent sourcekitd::KeyVersionMinor("key.version_minor");;
 UIdent sourcekitd::KeyResults("key.results");
 UIdent sourcekitd::KeyRequest("key.request");
 UIdent sourcekitd::KeyCompilerArgs("key.compilerargs");
@@ -39,17 +42,26 @@ UIdent sourcekitd::KeyOffset("key.offset");
 UIdent sourcekitd::KeySourceFile("key.sourcefile");
 UIdent sourcekitd::KeySourceText("key.sourcetext");
 UIdent sourcekitd::KeyModuleName("key.modulename");
+UIdent sourcekitd::KeyGroupName("key.groupname");
+UIdent sourcekitd::KeyActionName("key.actionname");
+UIdent sourcekitd::KeySynthesizedExtension("key.synthesizedextensions");
 UIdent sourcekitd::KeyNotification("key.notification");
 UIdent sourcekitd::KeyKeyword("key.keyword");
 UIdent sourcekitd::KeyName("key.name");
+UIdent sourcekitd::KeyNames("key.names");
+UIdent sourcekitd::KeyUIDs("key.uids");
 UIdent sourcekitd::KeyEnableSyntaxMap("key.enablesyntaxmap");
 UIdent sourcekitd::KeyEnableDiagnostics("key.enablediagnostics");
 UIdent sourcekitd::KeySyntacticOnly("key.syntactic_only");
 UIdent sourcekitd::KeyLength("key.length");
+UIdent sourcekitd::KeyActionable("key.actionable");
 UIdent sourcekitd::KeyKind("key.kind");
 UIdent sourcekitd::KeyAccessibility("key.accessibility");
 UIdent sourcekitd::KeySetterAccessibility("key.setter_accessibility");
 UIdent sourcekitd::KeyUSR("key.usr");
+UIdent sourcekitd::KeyOriginalUSR("key.original_usr");
+UIdent sourcekitd::KeyDefaultImplementationOf("key.default_implementation_of");
+UIdent sourcekitd::KeyInterestedUSR("key.interested_usr");
 UIdent sourcekitd::KeyLine("key.line");
 UIdent sourcekitd::KeyColumn("key.column");
 UIdent sourcekitd::KeyReceiverUSR("key.receiver_usr");
@@ -66,6 +78,7 @@ UIdent sourcekitd::KeyDocFullAsXML("key.doc.full_as_xml");
 UIdent sourcekitd::KeyGenericParams("key.generic_params");
 UIdent sourcekitd::KeyGenericRequirements("key.generic_requirements");
 UIdent sourcekitd::KeyAnnotatedDecl("key.annotated_decl");
+UIdent sourcekitd::KeyFullyAnnotatedDecl("key.fully_annotated_decl");
 UIdent sourcekitd::KeyRelatedDecls("key.related_decls");
 UIdent sourcekitd::KeyContext("key.context");
 UIdent sourcekitd::KeyModuleImportDepth("key.moduleimportdepth");
@@ -103,12 +116,17 @@ UIdent sourcekitd::KeyAttribute("key.attribute");
 UIdent sourcekitd::KeyInheritedTypes("key.inheritedtypes");
 UIdent sourcekitd::KeyFormatOptions("key.editor.format.options");
 UIdent sourcekitd::KeyCodeCompleteOptions("key.codecomplete.options");
+UIdent sourcekitd::KeyFilterRules("key.codecomplete.filterrules");
 UIdent sourcekitd::KeyNextRequestStart("key.nextrequeststart");
 UIdent sourcekitd::KeyPopular("key.popular");
 UIdent sourcekitd::KeyUnpopular("key.unpopular");
+UIdent sourcekitd::KeyHide("key.hide");
+UIdent sourcekitd::KeySimplified("key.simplified");
+UIdent sourcekitd::KeyRangeContent("key.rangecontent");
 
 UIdent sourcekitd::KeyIsDeprecated("key.is_deprecated");
 UIdent sourcekitd::KeyIsUnavailable("key.is_unavailable");
+UIdent sourcekitd::KeyIsOptional("key.is_optional");
 UIdent sourcekitd::KeyPlatform("key.platform");
 UIdent sourcekitd::KeyMessage("key.message");
 UIdent sourcekitd::KeyIntroduced("key.introduced");
@@ -116,10 +134,21 @@ UIdent sourcekitd::KeyDeprecated("key.deprecated");
 UIdent sourcekitd::KeyObsoleted("key.obsoleted");
 UIdent sourcekitd::KeyRemoveCache("key.removecache");
 UIdent sourcekitd::KeyTypeInterface("key.typeinterface");
+UIdent sourcekitd::KeyTypeUsr("key.typeusr");
+UIdent sourcekitd::KeyContainerTypeUsr("key.containertypeusr");
+UIdent sourcekitd::KeyModuleGroups("key.modulegroups");
+
+UIdent sourcekitd::KeyBaseName("key.basename");
+UIdent sourcekitd::KeyArgNames("key.argnames");
+UIdent sourcekitd::KeySelectorPieces("key.selectorpieces");
+UIdent sourcekitd::KeyNameKind("key.namekind");
+UIdent sourcekitd::KeyLocalizationKey("key.localization_key");
 
 /// \brief Order for the keys to use when emitting the debug description of
 /// dictionaries.
 static UIdent *OrderedKeys[] = {
+  &KeyVersionMajor,
+  &KeyVersionMinor,
   &KeyResults,
   &KeyRequest,
   &KeyNotification,
@@ -129,6 +158,9 @@ static UIdent *OrderedKeys[] = {
   &KeyKeyword,
   &KeyName,
   &KeyUSR,
+  &KeyOriginalUSR,
+  &KeyDefaultImplementationOf,
+  &KeyInterestedUSR,
   &KeyGenericParams,
   &KeyGenericRequirements,
   &KeyDocFullAsXML,
@@ -152,6 +184,7 @@ static UIdent *OrderedKeys[] = {
   &KeyRuntimeName,
   &KeySelectorName,
   &KeyAnnotatedDecl,
+  &KeyFullyAnnotatedDecl,
   &KeyDocBrief,
   &KeyContext,
   &KeyModuleImportDepth,
@@ -184,16 +217,32 @@ static UIdent *OrderedKeys[] = {
   &KeyDiagnostics,
   &KeyFormatOptions,
   &KeyCodeCompleteOptions,
+  &KeyFilterRules,
   &KeyNextRequestStart,
+  &KeyPopular,
+  &KeyUnpopular,
+  &KeyHide,
 
   &KeyPlatform,
   &KeyIsDeprecated,
   &KeyIsUnavailable,
+  &KeyIsOptional,
   &KeyMessage,
   &KeyIntroduced,
   &KeyDeprecated,
   &KeyObsoleted,
-  &KeyRemoveCache
+  &KeyRemoveCache,
+
+  &KeyTypeInterface,
+  &KeyTypeUsr,
+  &KeyContainerTypeUsr,
+  &KeyModuleGroups,
+
+  &KeyBaseName,
+  &KeyArgNames,
+  &KeySelectorPieces,
+  &KeyNameKind,
+
 };
 
 static unsigned findPrintOrderForDictKey(UIdent Key) {
@@ -272,65 +321,37 @@ public:
   }
 };
 
-class VariantPrinter : public VariantVisitor<VariantPrinter> {
-  raw_ostream &OS;
-  unsigned Indent;
+class VariantPrinter : public VariantVisitor<VariantPrinter>,
+                       public RequestResponsePrinterBase<VariantPrinter,
+                                                         sourcekitd_variant_t> {
 public:
-  VariantPrinter(raw_ostream &OS, unsigned Indent = 0)
-    : OS(OS), Indent(Indent) { }
-
-  void visitNull() {
-    OS << "<<NULL>>";
-  }
-
-  void visitDictionary(const DictMap &Map) {
-    OS << "{\n";
-    Indent += 2;
-    for (unsigned i = 0, e = Map.size(); i != e; ++i) {
-      auto &Pair = Map[i];
-      OS.indent(Indent);
-      OSColor(OS, DictKeyColor) << Pair.first.getName();
-      OS << ": ";
-      VariantPrinter(OS, Indent).visit(Pair.second);
-      if (i < e-1)
-        OS << ',';
-      OS << '\n';
-    }
-    Indent -= 2;
-    OS.indent(Indent) << '}';
-  }
-
-  void visitArray(ArrayRef<sourcekitd_variant_t> Arr) {
-    OS << "[\n";
-    Indent += 2;
-    for (unsigned i = 0, e = Arr.size(); i != e; ++i) {
-      auto Obj = Arr[i];
-      OS.indent(Indent);
-      VariantPrinter(OS, Indent).visit(Obj);
-      if (i < e-1)
-        OS << ',';
-      OS << '\n';
-    }
-    Indent -= 2;
-    OS.indent(Indent) << ']';
-  }
-
-  void visitInt64(int64_t Val) {
-    OS << Val;
-  }
-
-  void visitBool(bool Val) {
-    OS << Val;
-  }
-
-  void visitString(StringRef Str) {
-    OS << '\"' << Str << '\"';
-  }
-
-  void visitUID(StringRef UID) {
-    OSColor(OS, UIDColor) << UID;
-  }
+  VariantPrinter(raw_ostream &OS, unsigned Indent = 0, bool PrintAsJSON = false)
+    : RequestResponsePrinterBase(OS, Indent, PrintAsJSON) { }
 };
+}
+
+void sourcekitd::writeEscaped(llvm::StringRef Str, llvm::raw_ostream &OS) {
+  for (unsigned i = 0, e = Str.size(); i != e; ++i) {
+    unsigned char c = Str[i];
+
+    switch (c) {
+    case '\\':
+      OS << '\\' << '\\';
+      break;
+    case '\t':
+      OS << '\\' << 't';
+      break;
+    case '\n':
+      OS << '\\' << 'n';
+      break;
+    case '"':
+      OS << '\\' << '"';
+      break;
+    default:
+      OS << c;
+      break;
+    }
+  }
 }
 
 static void printError(sourcekitd_response_t Err, raw_ostream &OS) {
@@ -449,6 +470,47 @@ sourcekitd_response_description_copy(sourcekitd_response_t resp) {
   llvm::SmallString<128> Desc;
   llvm::raw_svector_ostream OS(Desc);
   printResponse(resp, OS);
+  return strdup(Desc.c_str());
+}
+
+
+sourcekitd_uid_t
+sourcekitd_uid_get_from_cstr(const char *string) {
+  return SKDUIDFromUIdent(UIdent(string));
+}
+
+sourcekitd_uid_t
+sourcekitd_uid_get_from_buf(const char *buf, size_t length) {
+  return SKDUIDFromUIdent(UIdent(llvm::StringRef(buf, length)));
+}
+
+size_t
+sourcekitd_uid_get_length(sourcekitd_uid_t uid) {
+  UIdent UID = UIdentFromSKDUID(uid);
+  return UID.getName().size();
+}
+
+const char *
+sourcekitd_uid_get_string_ptr(sourcekitd_uid_t uid) {
+  UIdent UID = UIdentFromSKDUID(uid);
+  return UID.getName().begin();
+}
+
+void
+sourcekitd_request_description_dump(sourcekitd_object_t obj) {
+  // Avoid colors here, we don't properly detect that the debug window inside
+  // Xcode doesn't support colors.
+  llvm::SmallString<128> Desc;
+  llvm::raw_svector_ostream OS(Desc);
+  printRequestObject(obj, OS);
+  llvm::errs() << OS.str() << '\n';
+}
+
+char *
+sourcekitd_request_description_copy(sourcekitd_object_t obj) {
+  llvm::SmallString<128> Desc;
+  llvm::raw_svector_ostream OS(Desc);
+  printRequestObject(obj, OS);
   return strdup(Desc.c_str());
 }
 
@@ -724,6 +786,16 @@ sourcekitd_variant_description_copy(sourcekitd_variant_t obj) {
   return strdup(Desc.c_str());
 }
 
+char *
+sourcekitd_variant_json_description_copy(sourcekitd_variant_t obj) {
+  llvm::SmallString<128> Desc;
+  {
+    llvm::raw_svector_ostream OS(Desc);
+    VariantPrinter(OS, /*Indent=*/0, /*PrintAsJSON=*/true).visit(obj);
+  }
+  return strdup(Desc.c_str());
+}
+
 namespace {
 class YAMLRequestParser {
 public:
@@ -748,7 +820,7 @@ private:
     return true;
   }
 };
-} // anonymous namespace.
+} // anonymous namespace
 
 sourcekitd_object_t
 sourcekitd_request_create_from_yaml(const char *yaml, char **error) {
@@ -776,20 +848,7 @@ sourcekitd_object_t YAMLRequestParser::parse(StringRef YAMLStr,
     return nullptr;
   }
 
-  auto Object = dyn_cast<llvm::yaml::MappingNode>(Root);
-  if (Object == nullptr) {
-    Error = "Expected dictionary";
-    return nullptr;
-  }
-
-  sourcekitd_object_t Req =
-      sourcekitd_request_dictionary_create(nullptr, nullptr, 0);
-  if (parseDict(Req, Object, Error)) {
-    sourcekitd_request_release(Req);
-    return nullptr;
-  }
-
-  return Req;
+  return createObjFromNode(Root, Error);
 }
 
 sourcekitd_object_t YAMLRequestParser::createObjFromNode(

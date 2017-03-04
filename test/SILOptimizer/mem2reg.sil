@@ -1,4 +1,4 @@
-// RUN: %target-sil-opt -enable-sil-verify-all %s -mem2reg | FileCheck %s
+// RUN: %target-sil-opt -assume-parsing-unqualified-ownership-sil -enable-sil-verify-all %s -mem2reg | %FileCheck %s
 
 import Builtin
 import Swift
@@ -53,23 +53,24 @@ sil @multiple_store_vals2 : $@convention(thin) (Int64) -> Int64 {
 bb0(%0 : $Int64):
   %1 = alloc_stack $Int64, var, name "c"               // users: %19, %2
   store %0 to %1 : $*Int64                      // id: %2
-  %3 = alloc_box $Int64, var, name "x"                 // users: %16, %11, %6
+  %3 = alloc_box $<τ_0_0> { var τ_0_0 } <Int64>, var, name "x"                 // users: %16, %11, %6
+  %3a = project_box %3 : $<τ_0_0> { var τ_0_0 } <Int64>, 0
   %4 = integer_literal $Builtin.Int64, 2          // users: %9, %5
   %5 = struct $Int64 (%4 : $Builtin.Int64)        // users: %12, %6
-  store %5 to %3#1 : $*Int64                      // id: %6
+  store %5 to %3a : $*Int64                      // id: %6
   %8 = struct_extract %0 : $Int64, #Int64._value   // user: %9
   %9 = builtin "cmp_sgt_Int64"(%8 : $Builtin.Int64, %4 : $Builtin.Int64) : $Builtin.Int1 // users: %15, %10
   cond_br %9, bb1, bb2                            // id: %10
 
 bb1:                                              // Preds: bb0
-  strong_release %3#0 : $@box Int64    // id: %11
+  strong_release %3 : $<τ_0_0> { var τ_0_0 } <Int64>    // id: %11
   br bb3(%5 : $Int64)                             // id: %12
 
 bb2:                                              // Preds: bb0
   %13 = integer_literal $Builtin.Int64, 5         // user: %14
   %14 = struct $Int64 (%13 : $Builtin.Int64)      // user: %17
   cond_fail %9 : $Builtin.Int1                    // id: %15
-  strong_release %3#0 : $@box Int64    // id: %16
+  strong_release %3 : $<τ_0_0> { var τ_0_0 } <Int64>    // id: %16
   br bb3(%14 : $Int64)                            // id: %17
 
 bb3(%18 : $Int64):                                // Preds: bb2 bb1
@@ -83,23 +84,24 @@ sil @with_loads : $@convention(thin) (Int64) -> Int64 {
 bb0(%0 : $Int64):
   %1 = alloc_stack $Int64, var, name "c"               // users: %19, %2, (%20)
   store %0 to %1 : $*Int64                      // id: %2
-  %3 = alloc_box $Int64, var, name "x"                 // users: %16, %11, %6
+  %3 = alloc_box $<τ_0_0> { var τ_0_0 } <Int64>, var, name "x"                 // users: %16, %11, %6
+  %3a = project_box %3 : $<τ_0_0> { var τ_0_0 } <Int64>, 0
   %4 = integer_literal $Builtin.Int64, 2          // users: %9, %5
   %5 = struct $Int64 (%4 : $Builtin.Int64)        // users: %12, %6
-  store %5 to %3#1 : $*Int64                      // id: %6
+  store %5 to %3a : $*Int64                      // id: %6
   %8 = struct_extract %0 : $Int64, #Int64._value   // user: %9
   %9 = builtin "cmp_sgt_Int64"(%8 : $Builtin.Int64, %4 : $Builtin.Int64) : $Builtin.Int1 // users: %15, %10
   cond_br %9, bb1, bb2                            // id: %10
 
 bb1:                                              // Preds: bb0
-  strong_release %3#0 : $@box Int64    // id: %11
+  strong_release %3 : $<τ_0_0> { var τ_0_0 } <Int64>    // id: %11
   br bb3(%5 : $Int64)                             // id: %12
 
 bb2:                                              // Preds: bb0
   %13 = integer_literal $Builtin.Int64, 5         // user: %14
   %14 = struct $Int64 (%13 : $Builtin.Int64)      // user: %17
   cond_fail %9 : $Builtin.Int1                    // id: %15
-  strong_release %3#0 : $@box Int64    // id: %16
+  strong_release %3 : $<τ_0_0> { var τ_0_0 } <Int64>    // id: %16
   br bb3(%14 : $Int64)                            // id: %17
 
 //CHECK: bb3([[RET:%[0-9]+]] : $Int64):
@@ -293,4 +295,64 @@ bb4:
   dealloc_stack %1 : $*@callee_owned () -> Int
 // CHECK: return [[RESULT]]
   return %15 : $Int
+}
+
+// Test cases where the only use is a debug_value_addr
+// CHECK-LABEL: sil @no_real_uses
+sil @no_real_uses : $@convention(thin) () -> () {
+// CHECK: bb0
+bb0:
+  // CHECK-NOT: alloc_stack
+  %0 = alloc_stack $Builtin.Int32
+  // CHECK-NOT: debug_value_addr
+  debug_value_addr %0 : $*Builtin.Int32, let, name "x", argno 1
+  // CHECK-NOT: dealloc_stack
+  dealloc_stack %0 : $*Builtin.Int32
+  // CHECK: [[VAL:%.*]] = tuple ()
+  %1 = tuple ()
+  // CHECK: return [[VAL]]
+  return %1 : $()
+}
+
+// CHECK-LABEL: sil @keep_release
+// CHECK: strong_release %0
+// CHECK: return
+sil @keep_release : $@convention(thin) (@owned AnyObject) -> () {
+bb0(%0 : $AnyObject):
+  %1 = alloc_stack $AnyObject
+  store %0 to %1 : $*AnyObject
+  destroy_addr %1 : $*AnyObject
+  dealloc_stack %1 : $*AnyObject
+  %7 = tuple ()
+  return %7 : $()
+}
+
+// Test cases where there are dead address instructions.
+// CHECK-LABEL: sil @dead_use
+// CHECK-NOT: alloc_stack
+sil @dead_use : $@convention(thin) () -> () {
+  %0 = alloc_stack $Int64
+  %1 = struct_element_addr %0 : $*Int64, #Int64._value
+  dealloc_stack %0 : $*Int64
+  %2 = alloc_stack $(Int64, Int64)
+  %3 = tuple_element_addr %2 : $*(Int64, Int64), 0
+  dealloc_stack %2 : $*(Int64, Int64)
+  // CHECK: [[VAL:%.*]] = tuple ()
+  %4 = tuple ()
+  // CHECK: return [[VAL]]
+  return %4 : $()
+}
+
+// CHECK-LABEL: sil @dont_crash_on_dead_arg_use
+// CHECK: bb0{{.*}}:
+// CHECK-NEXT: tuple ()
+// CHECK-NEXT: return
+sil @dont_crash_on_dead_arg_use : $@convention(thin) (@inout Int64) -> () {
+bb0(%0 : $*Int64):
+  %2 = alloc_stack $Int64
+  %1 = struct_element_addr %0 : $*Int64, #Int64._value
+  %3 = struct_element_addr %2 : $*Int64, #Int64._value
+  dealloc_stack %2 : $*Int64
+  %4 = tuple ()
+  return %4 : $()
 }

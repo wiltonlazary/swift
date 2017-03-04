@@ -2,11 +2,11 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2016 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 
@@ -156,22 +156,22 @@ T RaceTest_ExpectEqual(std::function<T()> code)
 }
 
 /// Some unique global pointers.
-char Global1 = 0;
-char Global2 = 0;
-char Global3 = 0;
+uint32_t Global1 = 0;
+uint32_t Global2 = 0;
+uint32_t Global3 = 0;
 
 /// The general structure of a generic metadata.
-template <unsigned NumFields>
+template <typename Instance>
 struct GenericMetadataTest {
   GenericMetadata Header;
-  void *Fields[NumFields];
+  Instance Template;
 };
 
-GenericMetadataTest<3> MetadataTest1 = {
+GenericMetadataTest<StructMetadata> MetadataTest1 = {
   // Header
   {
     // allocation function
-    [](GenericMetadata *pattern, const void *args) {
+    [](GenericMetadata *pattern, const void *args) -> Metadata * {
       auto metadata = swift_allocateGenericValueMetadata(pattern, args);
       auto metadataWords = reinterpret_cast<const void**>(metadata);
       auto argsWords = reinterpret_cast<const void* const*>(args);
@@ -186,8 +186,8 @@ GenericMetadataTest<3> MetadataTest1 = {
 
   // Fields
   {
-    (void*) MetadataKind::Struct,
-    &Global1,
+    MetadataKind::Struct,
+    reinterpret_cast<const NominalTypeDescriptor*>(&Global1),
     nullptr
   }
 };
@@ -215,22 +215,40 @@ TEST(Concurrent, ConcurrentList) {
   EXPECT_EQ(ListLen, results.size() * numElem);
 }
 
-TEST(MetadataAllocator, alloc_firstAllocationMoreThanPageSized) {
-  using swift::MetadataAllocator;
-  MetadataAllocator allocator;
 
-  // rdar://problem/21659505 -- if the first allocation from a metadata
-  // allocator was greater than page sized, a typo caused us to incorrectly
-  // flag an error.
-  uintptr_t pagesize = sysconf(_SC_PAGESIZE);
-  void *page = allocator.alloc(pagesize);
-  EXPECT_NE(page, nullptr);
-  EXPECT_NE(page, MAP_FAILED);
-  EXPECT_EQ(uintptr_t(page) & uintptr_t(pagesize-1), uintptr_t(0));
+TEST(Concurrent, ConcurrentMap) {
+  const int numElem = 100;
 
-  // Don't leak the page the allocator allocates.
-  munmap(page, pagesize);
+  struct Entry {
+    size_t Key;
+    Entry(size_t key) : Key(key) {}
+    int compareWithKey(size_t key) const {
+      return (key == Key ? 0 : (key < Key ? -1 : 1));
+    }
+    static size_t getExtraAllocationSize(size_t key) { return 0; }
+    size_t getExtraAllocationSize() const { return 0; }
+  };
+
+  ConcurrentMap<Entry> Map;
+
+  // Add a bunch of numbers to the map concurrently.
+   auto results = RaceTest<int*>(
+    [&]() -> int* {
+      for (int i = 0; i < numElem; i++) {
+        size_t hash = (i * 123512) % 0xFFFF ;
+        Map.getOrInsert(hash);
+      }
+      return nullptr;
+    }
+  );
+
+  // Check that all of the values that we inserted are in the map.
+  for (int i=0; i < numElem; i++) {
+    size_t hash = (i * 123512) % 0xFFFF ;
+    EXPECT_TRUE(Map.find(hash));
+  }
 }
+
 
 TEST(MetadataTest, getGenericMetadata) {
   auto metadataTemplate = (GenericMetadata*) &MetadataTest1;
@@ -239,11 +257,15 @@ TEST(MetadataTest, getGenericMetadata) {
 
   auto result1 = RaceTest_ExpectEqual<const Metadata *>(
     [&]() -> const Metadata * {
-      auto inst = swift_getGenericMetadata(metadataTemplate, args);
+      auto inst = static_cast<const StructMetadata*>
+        (swift_getGenericMetadata(metadataTemplate, args));
 
       auto fields = reinterpret_cast<void * const *>(inst);
-      EXPECT_EQ((void*) MetadataKind::Struct, fields[0]);
-      EXPECT_EQ(&Global1, fields[1]);
+
+      EXPECT_EQ(MetadataKind::Struct, inst->getKind());
+      EXPECT_EQ((const NominalTypeDescriptor*)&Global1,
+                inst->Description.get());
+
       EXPECT_EQ(&Global2, fields[2]);
 
       return inst;
@@ -253,12 +275,15 @@ TEST(MetadataTest, getGenericMetadata) {
 
   RaceTest_ExpectEqual<const Metadata *>(
     [&]() -> const Metadata * {
-      auto inst = swift_getGenericMetadata(metadataTemplate, args);
+      auto inst = static_cast<const StructMetadata*>
+        (swift_getGenericMetadata(metadataTemplate, args));
       EXPECT_NE(inst, result1);
 
       auto fields = reinterpret_cast<void * const *>(inst);
-      EXPECT_EQ((void*) MetadataKind::Struct, fields[0]);
-      EXPECT_EQ(&Global1, fields[1]);
+      EXPECT_EQ(MetadataKind::Struct, inst->getKind());
+      EXPECT_EQ((const NominalTypeDescriptor*)&Global1,
+                inst->Description.get());
+
       EXPECT_EQ(&Global3, fields[2]);
 
       return inst;
@@ -266,14 +291,15 @@ TEST(MetadataTest, getGenericMetadata) {
 }
 
 FullMetadata<ClassMetadata> MetadataTest2 = {
-  { { nullptr }, { &_TWVBo } },
-  { { { MetadataKind::Class } }, nullptr, 0, ClassFlags(), nullptr, nullptr, 0, 0, 0, 0, 0 }
+  { { nullptr }, { &VALUE_WITNESS_SYM(Bo) } },
+  { { { MetadataKind::Class } }, nullptr, /*rodata*/ 1,
+    ClassFlags(), nullptr, 0, 0, 0, 0, 0 }
 };
 
 TEST(MetadataTest, getMetatypeMetadata) {
   auto inst1 = RaceTest_ExpectEqual<const MetatypeMetadata *>(
     [&]() -> const MetatypeMetadata * {
-      auto inst = swift_getMetatypeMetadata(&_TMBi64_.base);
+      auto inst = swift_getMetatypeMetadata(&METADATA_SYM(Bi64_).base);
 
       EXPECT_EQ(sizeof(void*), inst->getValueWitnesses()->size);
       return inst;
@@ -281,7 +307,7 @@ TEST(MetadataTest, getMetatypeMetadata) {
 
   auto inst2 = RaceTest_ExpectEqual<const MetatypeMetadata *>(
     [&]() -> const MetatypeMetadata * {
-      auto inst = swift_getMetatypeMetadata(&_TMBi32_.base);
+      auto inst = swift_getMetatypeMetadata(&METADATA_SYM(Bi32_).base);
 
       EXPECT_EQ(sizeof(void*), inst->getValueWitnesses()->size);
       return inst;
@@ -310,8 +336,8 @@ TEST(MetadataTest, getMetatypeMetadata) {
     });
 
   // After all this, the instance type fields should still be valid.
-  ASSERT_EQ(&_TMBi64_.base, inst1->InstanceType);
-  ASSERT_EQ(&_TMBi32_.base, inst2->InstanceType);
+  ASSERT_EQ(&METADATA_SYM(Bi64_).base, inst1->InstanceType);
+  ASSERT_EQ(&METADATA_SYM(Bi32_).base, inst2->InstanceType);
   ASSERT_EQ(&MetadataTest2, inst3->InstanceType);
   ASSERT_EQ(inst3, inst4->InstanceType);
   ASSERT_EQ(inst1, inst5->InstanceType);
@@ -335,14 +361,14 @@ ProtocolDescriptor ProtocolB{
     .withDispatchStrategy(ProtocolDispatchStrategy::Swift)
 };
 
-ProtocolDescriptor ProtocolErrorType{
-  "_TMp8Metadata17ProtocolErrorType",
+ProtocolDescriptor ProtocolError{
+  "_TMp8Metadata13ProtocolError",
   nullptr,
   ProtocolDescriptorFlags()
     .withSwift(true)
     .withClassConstraint(ProtocolClassConstraint::Any)
     .withDispatchStrategy(ProtocolDispatchStrategy::Swift)
-    .withSpecialProtocol(SpecialProtocol::ErrorType)
+    .withSpecialProtocol(SpecialProtocol::Error)
 };
 
 ProtocolDescriptor ProtocolClassConstrained{
@@ -477,22 +503,22 @@ TEST(MetadataTest, getExistentialMetadata) {
       return mixedWitnessTable;
     });
   
-  const ValueWitnessTable *ExpectedErrorTypeValueWitnesses;
+  const ValueWitnessTable *ExpectedErrorValueWitnesses;
 #if SWIFT_OBJC_INTEROP
-  ExpectedErrorTypeValueWitnesses = &_TWVBO;
+  ExpectedErrorValueWitnesses = &VALUE_WITNESS_SYM(BO);
 #else
-  ExpectedErrorTypeValueWitnesses = &_TWVBo;
+  ExpectedErrorValueWitnesses = &VALUE_WITNESS_SYM(Bo);
 #endif
 
   RaceTest_ExpectEqual<const ExistentialTypeMetadata *>(
     [&]() -> const ExistentialTypeMetadata * {
       auto special
-        = test_getExistentialMetadata({&ProtocolErrorType});
+        = test_getExistentialMetadata({&ProtocolError});
       EXPECT_EQ(MetadataKind::Existential, special->getKind());
       EXPECT_EQ(1U, special->Flags.getNumWitnessTables());
-      EXPECT_EQ(SpecialProtocol::ErrorType,
+      EXPECT_EQ(SpecialProtocol::Error,
                 special->Flags.getSpecialProtocol());
-      EXPECT_EQ(ExpectedErrorTypeValueWitnesses,
+      EXPECT_EQ(ExpectedErrorValueWitnesses,
                 special->getValueWitnesses());
       return special;
     });
@@ -500,34 +526,34 @@ TEST(MetadataTest, getExistentialMetadata) {
   RaceTest_ExpectEqual<const ExistentialTypeMetadata *>(
     [&]() -> const ExistentialTypeMetadata * {
       auto special
-        = test_getExistentialMetadata({&ProtocolErrorType, &ProtocolA});
+        = test_getExistentialMetadata({&ProtocolError, &ProtocolA});
       EXPECT_EQ(MetadataKind::Existential, special->getKind());
       EXPECT_EQ(2U, special->Flags.getNumWitnessTables());
       // Compositions of special protocols aren't special.
       EXPECT_EQ(SpecialProtocol::None,
                 special->Flags.getSpecialProtocol());
-      EXPECT_NE(ExpectedErrorTypeValueWitnesses,
+      EXPECT_NE(ExpectedErrorValueWitnesses,
                 special->getValueWitnesses());
       return special;
     });
 }
 
-static void destroySuperclass(HeapObject *toDestroy) {}
+static SWIFT_CC(swift) void destroySuperclass(SWIFT_CONTEXT HeapObject *toDestroy) {}
 
 struct {
   void *Prefix[4];
   FullMetadata<ClassMetadata> Metadata;
 } SuperclassWithPrefix = {
   { &Global1, &Global3, &Global2, &Global3 },
-  { { { &destroySuperclass }, { &_TWVBo } },
+  { { { &destroySuperclass }, { &VALUE_WITNESS_SYM(Bo) } },
     { { { MetadataKind::Class } }, nullptr, /*rodata*/ 1, ClassFlags(), nullptr,
-      nullptr, 0, 0, 0, sizeof(SuperclassWithPrefix),
+      0, 0, 0, sizeof(SuperclassWithPrefix),
       sizeof(SuperclassWithPrefix.Prefix) + sizeof(HeapMetadataHeader) } }
 };
 ClassMetadata * const SuperclassWithPrefix_AddressPoint =
   &SuperclassWithPrefix.Metadata;
 
-static void destroySubclass(HeapObject *toDestroy) {}
+static SWIFT_CC(swift) void destroySubclass(SWIFT_CONTEXT HeapObject *toDestroy) {}
 
 struct {
   GenericMetadata Header;
@@ -551,9 +577,9 @@ struct {
     sizeof(HeapMetadataHeader), // address point
     {} // private data
   },
-  { { { &destroySubclass }, { &_TWVBo } },
+  { { { &destroySubclass }, { &VALUE_WITNESS_SYM(Bo) } },
     { { { MetadataKind::Class } }, nullptr, /*rodata*/ 1, ClassFlags(), nullptr,
-      nullptr, 0, 0, 0,
+      0, 0, 0,
       sizeof(GenericSubclass.Pattern) + sizeof(GenericSubclass.Suffix),
       sizeof(HeapMetadataHeader) } },
   { &Global2, &Global1, &Global2 }
@@ -578,7 +604,7 @@ TEST(MetadataTest, getGenericMetadata_SuperclassWithUnexpectedPrefix) {
 
       // Assert that we copied the shared prefix data from the subclass.
       EXPECT_EQ((void*) &destroySubclass, fields[-2]);
-      EXPECT_EQ(&_TWVBo, fields[-1]);
+      EXPECT_EQ(&VALUE_WITNESS_SYM(Bo), fields[-1]);
 
       // Assert that we set the superclass field.
       EXPECT_EQ(SuperclassWithPrefix_AddressPoint, fields[1]);
@@ -715,7 +741,7 @@ static const void *DeallocatedBuffer = nullptr;
 
 namespace swift {
   void installCommonValueWitnesses(ValueWitnessTable *vwtable);
-}
+} // namespace swift
 
 
 TEST(MetadataTest, installCommonValueWitnesses_pod_indirect) {
@@ -763,4 +789,196 @@ TEST(MetadataTest, installCommonValueWitnesses_pod_indirect) {
   EXPECT_EQ(AllocatedBuffer, DeallocatedBuffer);
   EXPECT_EQ(buf1.canary, (uintptr_t)0x5A5A5A5AU);
   EXPECT_EQ(buf2.canary, (uintptr_t)0xA5A5A5A5U);
+}
+
+// We cannot construct RelativeDirectPointer instances, so define
+// a "shadow" struct for that purpose
+struct GenericWitnessTableStorage {
+  uint16_t WitnessTableSizeInWords;
+  uint16_t WitnessTablePrivateSizeInWords;
+  int32_t Protocol;
+  int32_t Pattern;
+  int32_t Instantiator;
+  void *PrivateData[swift::NumGenericMetadataPrivateDataWords];
+};
+
+template<typename T>
+static void initializeRelativePointer(int32_t *ptr, T value) {
+  *ptr = (int32_t)(value == nullptr ? 0 : (uintptr_t) value - (uintptr_t) ptr);
+}
+
+// Tests for resilient witness table instantiation, with runtime-provided
+// default requirements
+
+static void witnessTableInstantiator(WitnessTable *instantiatedTable,
+                                     const Metadata *type,
+                                     void * const *instantiationArgs) {
+  EXPECT_EQ(type, nullptr);
+  EXPECT_EQ(instantiationArgs, nullptr);
+
+  EXPECT_EQ(((void **) instantiatedTable)[0], (void*) 123);
+  EXPECT_EQ(((void **) instantiatedTable)[1], (void*) 234);
+
+  // The last witness is computed dynamically at instantiation time.
+  ((void **) instantiatedTable)[2] = (void *) 345;
+}
+
+// A mock protocol descriptor with some default witnesses at the end.
+//
+// Note: It is not standards-compliant to compare function pointers for
+// equality, so we just use fake addresses instead.
+struct TestProtocol {
+  ProtocolDescriptor descriptor;
+  const void *witnesses[2] = {
+    (void *) 996633,
+    (void *) 336699
+  };
+
+  TestProtocol()
+    : descriptor("TestProtocol",
+                 nullptr,
+                 ProtocolDescriptorFlags().withResilient(true)) {
+    descriptor.MinimumWitnessTableSizeInWords = 3;
+    descriptor.DefaultWitnessTableSizeInWords = 2;
+  }
+};
+
+// All of these have to be global to relative reference each other, and
+// the instantiator function.
+TestProtocol testProtocol;
+GenericWitnessTableStorage tableStorage1;
+GenericWitnessTableStorage tableStorage2;
+GenericWitnessTableStorage tableStorage3;
+GenericWitnessTableStorage tableStorage4;
+
+const void *witnesses[] = {
+  (void *) 123,
+  (void *) 234,
+  (void *) 0,   // filled in by instantiator function
+  (void *) 456,
+  (void *) 567
+};
+
+TEST(WitnessTableTest, getGenericWitnessTable) {
+  EXPECT_EQ(sizeof(GenericWitnessTableStorage), sizeof(GenericWitnessTable));
+
+  EXPECT_EQ(testProtocol.descriptor.getDefaultWitnesses()[0],
+            (void *) 996633);
+  EXPECT_EQ(testProtocol.descriptor.getDefaultWitnesses()[1],
+            (void *) 336699);
+
+  // Conformance provides all requirements, and we don't have an
+  // instantiator, so we can just return the pattern.
+  {
+    tableStorage1.WitnessTableSizeInWords = 5;
+    tableStorage1.WitnessTablePrivateSizeInWords = 0;
+    initializeRelativePointer(&tableStorage1.Protocol, &testProtocol.descriptor);
+    initializeRelativePointer(&tableStorage1.Pattern, witnesses);
+    initializeRelativePointer(&tableStorage1.Instantiator, nullptr);
+
+    GenericWitnessTable *table = reinterpret_cast<GenericWitnessTable *>(
+        &tableStorage1);
+
+    RaceTest_ExpectEqual<const WitnessTable *>(
+      [&]() -> const WitnessTable * {
+        const WitnessTable *instantiatedTable =
+            swift_getGenericWitnessTable(table, nullptr, nullptr);
+
+        EXPECT_EQ(instantiatedTable, table->Pattern.get());
+        return instantiatedTable;
+      });
+  }
+
+  // Conformance provides all requirements, but we have private storage
+  // and an initializer, so we must instantiate.
+  {
+    tableStorage2.WitnessTableSizeInWords = 5;
+    tableStorage2.WitnessTablePrivateSizeInWords = 1;
+    initializeRelativePointer(&tableStorage2.Protocol, &testProtocol.descriptor);
+    initializeRelativePointer(&tableStorage2.Pattern, witnesses);
+    initializeRelativePointer(&tableStorage2.Instantiator,
+                              (const void *) witnessTableInstantiator);
+
+    GenericWitnessTable *table = reinterpret_cast<GenericWitnessTable *>(
+        &tableStorage2);
+
+    RaceTest_ExpectEqual<const WitnessTable *>(
+      [&]() -> const WitnessTable * {
+        const WitnessTable *instantiatedTable =
+            swift_getGenericWitnessTable(table, nullptr, nullptr);
+
+        EXPECT_NE(instantiatedTable, table->Pattern.get());
+
+        EXPECT_EQ(((void **) instantiatedTable)[-1], (void *) 0);
+
+        EXPECT_EQ(((void **) instantiatedTable)[0], (void *) 123);
+        EXPECT_EQ(((void **) instantiatedTable)[1], (void *) 234);
+        EXPECT_EQ(((void **) instantiatedTable)[2], (void *) 345);
+        EXPECT_EQ(((void **) instantiatedTable)[3], (void *) 456);
+        EXPECT_EQ(((void **) instantiatedTable)[4], (void *) 567);
+
+        return instantiatedTable;
+      });
+  }
+
+  // Conformance needs one default requirement to be filled in
+  {
+    tableStorage3.WitnessTableSizeInWords = 4;
+    tableStorage3.WitnessTablePrivateSizeInWords = 1;
+    initializeRelativePointer(&tableStorage3.Protocol, &testProtocol.descriptor);
+    initializeRelativePointer(&tableStorage3.Pattern, witnesses);
+    initializeRelativePointer(&tableStorage3.Instantiator, witnessTableInstantiator);
+
+    GenericWitnessTable *table = reinterpret_cast<GenericWitnessTable *>(
+        &tableStorage3);
+
+    RaceTest_ExpectEqual<const WitnessTable *>(
+      [&]() -> const WitnessTable * {
+        const WitnessTable *instantiatedTable =
+            swift_getGenericWitnessTable(table, nullptr, nullptr);
+
+        EXPECT_NE(instantiatedTable, table->Pattern.get());
+
+        EXPECT_EQ(((void **) instantiatedTable)[-1], (void *) 0);
+
+        EXPECT_EQ(((void **) instantiatedTable)[0], (void *) 123);
+        EXPECT_EQ(((void **) instantiatedTable)[1], (void *) 234);
+        EXPECT_EQ(((void **) instantiatedTable)[2], (void *) 345);
+        EXPECT_EQ(((void **) instantiatedTable)[3], (void *) 456);
+        EXPECT_EQ(((void **) instantiatedTable)[4], (void *) 336699);
+
+        return instantiatedTable;
+      });
+  }
+
+  // Third case: conformance needs both default requirements
+  // to be filled in
+  {
+    tableStorage4.WitnessTableSizeInWords = 3;
+    tableStorage4.WitnessTablePrivateSizeInWords = 1;
+    initializeRelativePointer(&tableStorage4.Protocol, &testProtocol.descriptor);
+    initializeRelativePointer(&tableStorage4.Pattern, witnesses);
+    initializeRelativePointer(&tableStorage4.Instantiator, witnessTableInstantiator);
+
+    GenericWitnessTable *table = reinterpret_cast<GenericWitnessTable *>(
+        &tableStorage4);
+
+    RaceTest_ExpectEqual<const WitnessTable *>(
+      [&]() -> const WitnessTable * {
+        const WitnessTable *instantiatedTable =
+            swift_getGenericWitnessTable(table, nullptr, nullptr);
+
+        EXPECT_NE(instantiatedTable, table->Pattern.get());
+
+        EXPECT_EQ(((void **) instantiatedTable)[-1], (void *) 0);
+
+        EXPECT_EQ(((void **) instantiatedTable)[0], (void *) 123);
+        EXPECT_EQ(((void **) instantiatedTable)[1], (void *) 234);
+        EXPECT_EQ(((void **) instantiatedTable)[2], (void *) 345);
+        EXPECT_EQ(((void **) instantiatedTable)[3], (void *) 996633);
+        EXPECT_EQ(((void **) instantiatedTable)[4], (void *) 336699);
+
+        return instantiatedTable;
+      });
+  }
 }

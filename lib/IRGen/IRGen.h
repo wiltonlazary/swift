@@ -2,11 +2,11 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2016 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 //
@@ -19,6 +19,7 @@
 #define SWIFT_IRGEN_IRGEN_H
 
 #include "llvm/Support/DataTypes.h"
+#include "clang/AST/CharUnits.h"
 #include "swift/AST/ResilienceExpansion.h"
 #include "swift/SIL/AbstractionPattern.h"
 #include <cassert>
@@ -116,6 +117,14 @@ enum class ReferenceCounting : unsigned char {
   Error,
 };
 
+/// The atomicity of a reference counting operation to be used.
+enum class Atomicity : bool {
+  /// Atomic reference counting operations should be used.
+  Atomic,
+  /// Non-atomic reference counting operations can be used.
+  NonAtomic,
+};
+
 /// Whether or not an object should be emitted on the heap.
 enum OnHeap_t : unsigned char {
   NotOnHeap,
@@ -141,6 +150,55 @@ enum class ExtraData : unsigned char {
 enum IsExact_t : bool {
   IsInexact = false,
   IsExact = true
+};
+
+/// Ways in which an object can be referenced.
+///
+/// See the comment in RelativePointer.h.
+
+enum class SymbolReferenceKind : unsigned char {
+  /// An absolute reference to the object, i.e. an ordinary pointer.
+  ///
+  /// Generally well-suited for when C compatibility is a must, dynamic
+  /// initialization is the dominant case, or the runtime performance
+  /// of accesses is an overriding concern.
+  Absolute,
+
+  /// A direct relative reference to the object, i.e. the offset of the
+  /// object from the address at which the relative reference is stored.
+  ///
+  /// Generally well-suited for when the reference is always statically
+  /// initialized and will always refer to another object within the
+  /// same linkage unit.
+  Relative_Direct,
+
+  /// A direct relative reference that is guaranteed to be as wide as a
+  /// pointer.
+  ///
+  /// Generally well-suited for when the reference may be dynamically
+  /// initialized, but will only refer to objects within the linkage unit
+  /// when statically initialized.
+  Far_Relative_Direct,
+
+  /// A relative reference that may be indirect: the direct reference is
+  /// either directly to the object or to a variable holding an absolute
+  /// reference to the object.
+  ///
+  /// The low bit of the target offset is used to mark an indirect reference,
+  /// and so the low bit of the target address must be zero.  This means that,
+  /// in general, it is not possible to form this kind of reference to a
+  /// function (due to the THUMB bit) or unaligned data (such as a C string).
+  ///
+  /// Generally well-suited for when the reference is always statically
+  /// initialized but may refer to something outside of the linkage unit.
+  Relative_Indirectable,
+
+  /// An indirectable reference to the object; guaranteed to be as wide
+  /// as a pointer.
+  ///
+  /// Generally well-suited for when the reference may be dynamically
+  /// initialized but may also statically refer outside of the linkage unit.
+  Far_Relative_Indirectable,
 };
 
 /// Destructor variants.
@@ -204,6 +262,10 @@ public:
 
   constexpr Size() : Value(0) {}
   explicit constexpr Size(int_type Value) : Value(Value) {}
+  
+  static constexpr Size forBits(int_type bitSize) {
+    return Size((bitSize + 7U) / 8U);
+  }
 
   /// An "invalid" size, equal to the maximum possible size.
   static constexpr Size invalid() { return Size(~int_type(0)); }
@@ -266,6 +328,10 @@ public:
 
   unsigned log2() const {
     return llvm::Log2_64(Value);
+  }
+
+  clang::CharUnits asCharUnits() const {
+    return clang::CharUnits::fromQuantity(getValue());
   }
 
   friend bool operator< (Size L, Size R) { return L.Value <  R.Value; }

@@ -2,11 +2,11 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2016 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 //
@@ -16,13 +16,14 @@
 //===----------------------------------------------------------------------===//
 
 #define DEBUG_TYPE "sil-speculative-devirtualizer"
+
 #include "swift/Basic/DemangleWrappers.h"
-#include "swift/Basic/Fallthrough.h"
 #include "swift/SIL/SILArgument.h"
 #include "swift/SIL/SILBuilder.h"
 #include "swift/SIL/SILFunction.h"
 #include "swift/SIL/SILInstruction.h"
 #include "swift/SIL/SILModule.h"
+#include "swift/SIL/InstructionUtils.h"
 #include "swift/SILOptimizer/Analysis/ClassHierarchyAnalysis.h"
 #include "swift/SILOptimizer/Utils/Generics.h"
 #include "swift/SILOptimizer/PassManager/Passes.h"
@@ -37,6 +38,7 @@
 #include "llvm/ADT/StringSet.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/CommandLine.h"
+
 using namespace swift;
 
 // This is the limit for the number of subclasses (jump targets) that the
@@ -49,6 +51,7 @@ STATISTIC(NumTargetsPredicted, "Number of monomorphic functions predicted");
 static FullApplySite CloneApply(FullApplySite AI, SILBuilder &Builder) {
   // Clone the Apply.
   Builder.setCurrentDebugScope(AI.getDebugScope());
+  Builder.addOpenedArchetypeOperands(AI.getInstruction());
   auto Args = AI.getArguments();
   SmallVector<SILValue, 8> Ret(Args.size());
   for (unsigned i = 0, e = Args.size(); i != e; ++i)
@@ -93,6 +96,9 @@ static FullApplySite speculateMonomorphicTarget(FullApplySite AI,
   if (!canDevirtualizeClassMethod(AI, SubType))
     return FullApplySite();
 
+  if (SubType.getSwiftRValueType()->hasDynamicSelfType())
+    return FullApplySite();
+
   // Create a diamond shaped control flow and a checked_cast_branch
   // instruction that checks the exact type of the object.
   // This cast selects between two paths: one that calls the slow dynamic
@@ -105,9 +111,9 @@ static FullApplySite speculateMonomorphicTarget(FullApplySite AI,
   SILBasicBlock *Iden = F->createBasicBlock();
   // Virt is the block containing the slow virtual call.
   SILBasicBlock *Virt = F->createBasicBlock();
-  Iden->createBBArg(SubType);
+  Iden->createPHIArgument(SubType, ValueOwnershipKind::Owned);
 
-  SILBasicBlock *Continue = Entry->splitBasicBlock(It);
+  SILBasicBlock *Continue = Entry->split(It);
 
   SILBuilderWithScope Builder(Entry, AI.getInstruction());
   // Create the checked_cast_branch instruction that checks at runtime if the
@@ -123,7 +129,7 @@ static FullApplySite speculateMonomorphicTarget(FullApplySite AI,
   SILBuilderWithScope VirtBuilder(Virt, AI.getInstruction());
   SILBuilderWithScope IdenBuilder(Iden, AI.getInstruction());
   // This is the class reference downcasted into subclass SubType.
-  SILValue DownCastedClassInstance = Iden->getBBArg(0);
+  SILValue DownCastedClassInstance = Iden->getArgument(0);
 
   // Copy the two apply instructions into the two blocks.
   FullApplySite IdenAI = CloneApply(AI, IdenBuilder);
@@ -131,19 +137,22 @@ static FullApplySite speculateMonomorphicTarget(FullApplySite AI,
 
   // See if Continue has a release on self as the instruction right after the
   // apply. If it exists, move it into position in the diamond.
-  if (auto *Release =
-          dyn_cast<StrongReleaseInst>(std::next(Continue->begin()))) {
-    if (Release->getOperand() == CMI->getOperand()) {
-      VirtBuilder.createStrongRelease(Release->getLoc(), CMI->getOperand());
-      IdenBuilder.createStrongRelease(Release->getLoc(),
-                                      DownCastedClassInstance);
-      Release->eraseFromParent();
-    }
+  SILBasicBlock::iterator next =
+      next_or_end(Continue->begin(), Continue->end());
+  auto *Release =
+      (next == Continue->end()) ? nullptr : dyn_cast<StrongReleaseInst>(next);
+  if (Release && Release->getOperand() == CMI->getOperand()) {
+    VirtBuilder.createStrongRelease(Release->getLoc(), CMI->getOperand(),
+                                    Release->getAtomicity());
+    IdenBuilder.createStrongRelease(Release->getLoc(), DownCastedClassInstance,
+                                    Release->getAtomicity());
+    Release->eraseFromParent();
   }
 
   // Create a PHInode for returning the return value from both apply
   // instructions.
-  SILArgument *Arg = Continue->createBBArg(AI.getType());
+  SILArgument *Arg =
+      Continue->createPHIArgument(AI.getType(), ValueOwnershipKind::Owned);
   if (!isa<TryApplyInst>(AI)) {
     IdenBuilder.createBranch(AI.getLoc(), Continue,
                              ArrayRef<SILValue>(IdenAI.getInstruction()));
@@ -152,12 +161,19 @@ static FullApplySite speculateMonomorphicTarget(FullApplySite AI,
   }
 
   // Remove the old Apply instruction.
-  if (!isa<TryApplyInst>(AI))
+  assert(AI.getInstruction() == &Continue->front() &&
+         "AI should be the first instruction in the split Continue block");
+  if (!isa<TryApplyInst>(AI)) {
     AI.getInstruction()->replaceAllUsesWith(Arg);
-  auto *OriginalBB = AI.getParent();
-  AI.getInstruction()->eraseFromParent();
-  if (OriginalBB->empty())
-    OriginalBB->removeFromParent();
+    AI.getInstruction()->eraseFromParent();
+    assert(!Continue->empty() &&
+           "There should be at least a terminator after AI");
+  } else {
+    AI.getInstruction()->eraseFromParent();
+    assert(Continue->empty() &&
+           "There should not be an instruction after try_apply");
+    Continue->eraseFromParent();
+  }
 
   // Update the stats.
   NumTargetsPredicted++;
@@ -170,16 +186,18 @@ static FullApplySite speculateMonomorphicTarget(FullApplySite AI,
   // Split critical edges resulting from VirtAI.
   if (auto *TAI = dyn_cast<TryApplyInst>(VirtAI)) {
     auto *ErrorBB = TAI->getFunction()->createBasicBlock();
-    ErrorBB->createBBArg(TAI->getErrorBB()->getBBArg(0)->getType());
+    ErrorBB->createPHIArgument(TAI->getErrorBB()->getArgument(0)->getType(),
+                               ValueOwnershipKind::Owned);
     Builder.setInsertionPoint(ErrorBB);
     Builder.createBranch(TAI->getLoc(), TAI->getErrorBB(),
-                         {ErrorBB->getBBArg(0)});
+                         {ErrorBB->getArgument(0)});
 
     auto *NormalBB = TAI->getFunction()->createBasicBlock();
-    NormalBB->createBBArg(TAI->getNormalBB()->getBBArg(0)->getType());
+    NormalBB->createPHIArgument(TAI->getNormalBB()->getArgument(0)->getType(),
+                                ValueOwnershipKind::Owned);
     Builder.setInsertionPoint(NormalBB);
     Builder.createBranch(TAI->getLoc(), TAI->getNormalBB(),
-                        {NormalBB->getBBArg(0) });
+                         {NormalBB->getArgument(0)});
 
     Builder.setInsertionPoint(VirtAI.getInstruction());
     SmallVector<SILValue, 4> Args;
@@ -216,6 +234,12 @@ static bool isDefaultCaseKnown(ClassHierarchyAnalysis *CHA,
   if (CD->isFinal())
     return true;
 
+  // If the class has an @objc ancestry it can be dynamically subclassed and we
+  // can't therefore statically know the default case.
+  auto Ancestry = CD->checkObjCAncestry();
+  if (Ancestry != ObjCClassKind::NonObjC)
+    return false;
+
   // Without an associated context we cannot perform any
   // access-based optimizations.
   if (!DC)
@@ -230,12 +254,14 @@ static bool isDefaultCaseKnown(ClassHierarchyAnalysis *CHA,
 
   // Only consider 'private' members, unless we are in whole-module compilation.
   switch (CD->getEffectiveAccess()) {
-  case Accessibility::Public:
+  case Accessibility::Open:
     return false;
+  case Accessibility::Public:
   case Accessibility::Internal:
     if (!AI.getModule().isWholeModule())
       return false;
     break;
+  case Accessibility::FilePrivate:
   case Accessibility::Private:
     break;
   }
@@ -306,13 +332,13 @@ static bool tryToSpeculateTarget(FullApplySite AI,
   // Strip any upcasts off of our 'self' value, potentially leaving us
   // with a value whose type is closer (in the class hierarchy) to the
   // actual dynamic type.
-  auto SubTypeValue = CMI->getOperand().stripUpCasts();
-  SILType SubType = SubTypeValue.getType();
+  auto SubTypeValue = stripUpCasts(CMI->getOperand());
+  SILType SubType = SubTypeValue->getType();
 
   // Bail if any generic types parameters of the class instance type are
   // unbound.
   // We cannot devirtualize unbound generic calls yet.
-  if (isNominalTypeWithUnboundGenericParameters(SubType, AI.getModule()))
+  if (SubType.getSwiftRValueType()->hasArchetype())
     return false;
 
   auto &M = CMI->getModule();
@@ -357,7 +383,7 @@ static bool tryToSpeculateTarget(FullApplySite AI,
   Subs.append(IndirectSubs.begin(), IndirectSubs.end());
 
   if (isa<BoundGenericClassType>(ClassType.getSwiftRValueType())) {
-    // Filter out any subclassses that do not inherit from this
+    // Filter out any subclasses that do not inherit from this
     // specific bound class.
     auto RemovedIt = std::remove_if(Subs.begin(),
         Subs.end(),
@@ -371,18 +397,21 @@ static bool tryToSpeculateTarget(FullApplySite AI,
             return false;
           // Handle the usual case here: the class in question
           // should be a real subclass of a bound generic class.
-          return !ClassType.isSuperclassOf(
+          return !ClassType.isBindableToSuperclassOf(
               SILType::getPrimitiveObjectType(SubCanTy));
         });
     Subs.erase(RemovedIt, Subs.end());
   }
 
+  // Number of subclasses which cannot be handled by checked_cast_br checks.
+  int NotHandledSubsNum = 0;
   if (Subs.size() > MaxNumSpeculativeTargets) {
     DEBUG(llvm::dbgs() << "Class " << CD->getName() << " has too many ("
                        << Subs.size() << ") subclasses. Performing speculative "
                          "devirtualization only for the first "
                        << MaxNumSpeculativeTargets << " of them.\n");
 
+    NotHandledSubsNum += (Subs.size() - MaxNumSpeculativeTargets);
     Subs.erase(&Subs[MaxNumSpeculativeTargets], Subs.end());
   }
 
@@ -391,6 +420,15 @@ static bool tryToSpeculateTarget(FullApplySite AI,
 
   // Try to devirtualize the static class of instance
   // if it is possible.
+  if (auto F = getTargetClassMethod(M, SubType, CMI)) {
+    // Do not devirtualize if a method in the base class is marked
+    // as non-optimizable. This way it is easy to disable the
+    // devirtualization of this method in the base class and
+    // any classes derived from it.
+    if (!F->shouldOptimize())
+      return false;
+  }
+
   auto FirstAI = speculateMonomorphicTarget(AI, SubType, LastCCBI);
   if (FirstAI) {
     Changed = true;
@@ -433,9 +471,6 @@ static bool tryToSpeculateTarget(FullApplySite AI,
 
   // TODO: The ordering of checks may benefit from using a PGO, because
   // the most probable alternatives could be checked first.
-
-  // Number of subclasses which cannot be handled by checked_cast_br checks.
-  int NotHandledSubsNum = 0;
 
   for (auto S : Subs) {
     DEBUG(llvm::dbgs() << "Inserting a speculative call for class "
@@ -494,10 +529,11 @@ static bool tryToSpeculateTarget(FullApplySite AI,
     return true;
   }
   auto NewInstPair = tryDevirtualizeClassMethod(AI, SubTypeValue);
-  assert(NewInstPair.first && "Expected to be able to devirtualize apply!");
-  replaceDeadApply(AI, NewInstPair.first);
-
-  return true;
+  if (NewInstPair.first) {
+    replaceDeadApply(AI, NewInstPair.first);
+    return true;
+  }
+  return Changed;
 }
 
 namespace {
@@ -505,7 +541,7 @@ namespace {
   /// class is at the bottom of the class hierarchy.
   class SpeculativeDevirtualization : public SILFunctionTransform {
   public:
-    virtual ~SpeculativeDevirtualization() {}
+    ~SpeculativeDevirtualization() override {}
 
     void run() override {
       ClassHierarchyAnalysis *CHA = PM->getAnalysis<ClassHierarchyAnalysis>();

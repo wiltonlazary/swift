@@ -2,11 +2,11 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2016 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 
@@ -35,6 +35,9 @@ public:
   /// Equivalent to Clang's -mcpu=.
   std::string TargetCPU;
 
+  // The bridging header or PCH that will be imported.
+  std::string BridgingHeader;
+
   /// \see Mode
   enum class Modes {
     /// Set up Clang for importing modules into Swift and generating IR from
@@ -61,18 +64,19 @@ public:
   /// instead of dropped altogether when possible.
   bool ImportForwardDeclarations = false;
 
-  /// If true, remove words from imported names that are redundant
-  /// with the type information of the corresponding parameter or
-  /// property.
-  bool OmitNeedlessWords = false;
+  /// Whether to use the import as member inference system
+  ///
+  /// When importing a global, try to infer whether we can import it as a
+  /// member of some type instead. This includes inits, computed properties,
+  /// and methods.
+  bool InferImportAsMember = false;
 
-  // If true, infer default arguments for nullable pointers (nil) and
-  // option sets ([]).
-  bool InferDefaultArguments = false;
+  /// If true ignore the swift bridged attribute.
+  bool DisableSwiftBridgeAttr = false;
 
-  /// If true, we should use the Swift name lookup tables rather than
-  /// Clang's name lookup facilities.
-  bool UseSwiftLookupTables = false;
+  /// When set, don't validate module system headers. If a header is modified
+  /// and this is not set, clang will rebuild the module.
+  bool DisableModulesValidateSystemHeaders = false;
 };
 
 } // end namespace swift

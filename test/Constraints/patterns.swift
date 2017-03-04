@@ -1,11 +1,11 @@
-// RUN: %target-parse-verify-swift
+// RUN: %target-typecheck-verify-swift
 
 // Leaf expression patterns are matched to corresponding pieces of a switch
 // subject (TODO: or ~= expression) using ~= overload resolution.
 switch (1, 2.5, "three") {
 case (1, _, _):
   ()
-// Double is IntegerLiteralConvertible
+// Double is ExpressibleByIntegerLiteral
 case (_, 2, _),
      (_, 2.5, _),
      (_, _, "three"):
@@ -19,7 +19,7 @@ case (0..<10, _, _),
 }
 
 switch (1, 2) {
-case (let a, a): // expected-error {{use of unresolved identifier 'a'}}
+case (var a, a): // expected-error {{use of unresolved identifier 'a'}}
   ()
 }
 
@@ -27,17 +27,17 @@ case (let a, a): // expected-error {{use of unresolved identifier 'a'}}
 
 protocol P { func p() }
 
-class B : P {
-  init() {}
+class B : P { 
+  init() {} 
   func p() {}
   func b() {}
 }
 class D : B {
-  override init() { super.init() }
+  override init() { super.init() } 
   func d() {}
 }
 class E {
-  init() {}
+  init() {} 
   func e() {}
 }
 
@@ -114,7 +114,8 @@ case iPadHair.HairForceOne: // expected-error{{generic enum type 'iPadHair' is a
   ()
 case Watch.Edition: // TODO: should warn that cast can't succeed with currently known conformances
   ()
-case .HairForceOne: // expected-error{{enum case 'HairForceOne' not found in type 'HairType'}}
+// TODO: Bad error message
+case .HairForceOne: // expected-error{{cannot convert}}
   ()
 default:
   break
@@ -123,15 +124,31 @@ default:
 
 // <rdar://problem/19382878> Introduce new x? pattern
 switch Optional(42) {
-case let x?: break
+case let x?: break // expected-warning{{immutable value 'x' was never used; consider replacing with '_' or removing it}}
 case nil: break
+}
+
+func SR2066(x: Int?) {
+    // nil literals should still work when wrapped in parentheses
+    switch x {
+    case (nil): break
+    case _?: break
+    }
+    switch x {
+    case ((nil)): break
+    case _?: break
+    }
+    switch (x, x) {
+    case ((nil), _): break
+    case (_?, _): break
+    }
 }
 
 // Test x???? patterns.
 switch (nil as Int???) {
 case let x???: print(x, terminator: "")
-case let x??: print(x, terminator: "")
-case let x?: print(x, terminator: "")
+case let x??: print(x as Any, terminator: "")
+case let x?: print(x as Any, terminator: "")
 case 4???: break
 case nil??: break
 case nil?: break
@@ -146,7 +163,7 @@ default: break
 
 
 // Test some value patterns.
-let x : Int? = nil
+let x : Int?
 
 extension Int {
   func method() -> Int { return 42 }
@@ -165,12 +182,9 @@ case x ?? 42: break // match value
 default: break
 }
 
-// FIXME: rdar://problem/23378003
-// These will eventually become errors.
-for (var x) in 0...100 {} // expected-warning {{Use of 'var' binding here is deprecated and will be removed in a future version of Swift}} {{6-9=}}
-for var x in 0...100 {}  // expected-warning {{Use of 'var' binding here is deprecated and will be removed in a future version of Swift}} {{5-9=}}
-
-for (let x) in 0...100 {} // expected-error {{'let' pattern is already in an immutable context}}
+for (var x) in 0...100 {} // expected-warning{{variable 'x' was never used; consider replacing with '_' or removing it}}
+for var x in 0...100 {}  // rdar://20167543 expected-warning{{variable 'x' was never used; consider replacing with '_' or removing it}}
+for (let x) in 0...100 { _ = x} // expected-error {{'let' pattern cannot appear nested in an already immutable context}}
 
 var (let y) = 42  // expected-error {{'let' cannot appear nested inside another 'var' or 'let' pattern}}
 let (var z) = 42  // expected-error {{'var' cannot appear nested inside another 'var' or 'let' pattern}}
@@ -181,7 +195,7 @@ let (var z) = 42  // expected-error {{'var' cannot appear nested inside another 
 // at least we don't crash anymore.
 
 protocol PP {
-  typealias E
+  associatedtype E
 }
 
 struct A<T> : PP {
@@ -189,7 +203,7 @@ struct A<T> : PP {
 }
 
 extension PP {
-  func map<T>(f: Self.E -> T) -> T {}
+  func map<T>(_ f: (Self.E) -> T) -> T {}
 }
 
 enum EE {
@@ -197,7 +211,7 @@ enum EE {
   case B
 }
 
-func good(a: A<EE>) -> Int {
+func good(_ a: A<EE>) -> Int {
   return a.map {
     switch $0 {
     case .A:
@@ -208,17 +222,15 @@ func good(a: A<EE>) -> Int {
   }
 }
 
-func bad(a: A<EE>) {
-  a.map { // expected-error {{cannot invoke 'map' with an argument list of type '((EE) -> _)'}}
-  // expected-note@-1 {{expected an argument list of type '(EE -> T)'}}
+func bad(_ a: A<EE>) {
+  a.map { // expected-error {{unable to infer complex closure return type; add explicit type to disambiguate}} {{10-10= () -> Int in }}
     let _: EE = $0
     return 1
   }
 }
 
-func ugly(a: A<EE>) {
-  a.map { // expected-error {{cannot invoke 'map' with an argument list of type '((EE) -> _)'}}
-  // expected-note@-1 {{expected an argument list of type '(EE -> T)'}}
+func ugly(_ a: A<EE>) {
+  a.map { // expected-error {{unable to infer complex closure return type; add explicit type to disambiguate}} {{10-10= () -> Int in }}
     switch $0 {
     case .A:
       return 1
@@ -227,3 +239,69 @@ func ugly(a: A<EE>) {
     }
   }
 }
+
+// SR-2057
+
+enum SR2057 {
+  case foo
+}
+
+let sr2057: SR2057?
+if case .foo = sr2057 { } // expected-error{{enum case 'foo' not found in type 'SR2057?'}}
+
+
+// Invalid 'is' pattern
+class SomeClass {}
+if case let doesNotExist as SomeClass:AlsoDoesNotExist {}
+// expected-error@-1 {{use of undeclared type 'AlsoDoesNotExist'}}
+// expected-error@-2 {{variable binding in a condition requires an initializer}}
+
+// `.foo` and `.bar(...)` pattern syntax should also be able to match
+// static members as expr patterns
+
+struct StaticMembers: Equatable {
+  init() {}
+  init(_: Int) {}
+  init?(opt: Int) {}
+  static var prop = StaticMembers()
+  static var optProp: Optional = StaticMembers()
+
+  static func method(_: Int) -> StaticMembers { return prop }
+  static func method(withLabel: Int) -> StaticMembers { return prop }
+  static func optMethod(_: Int) -> StaticMembers? { return optProp }
+
+  static func ==(x: StaticMembers, y: StaticMembers) -> Bool { return true }
+}
+
+let staticMembers = StaticMembers()
+let optStaticMembers: Optional = StaticMembers()
+
+switch staticMembers {
+  case .init: break // expected-error{{cannot match values of type 'StaticMembers'}}
+  case .init(opt:): break // expected-error{{cannot match values of type 'StaticMembers'}}
+  case .init(): break
+
+  case .init(0): break
+  case .init(_): break // expected-error{{'_' can only appear in a pattern}}
+  case .init(let x): break // expected-error{{cannot appear in an expression}}
+  case .init(opt: 0): break // expected-error{{not unwrapped}}
+
+  case .prop: break
+  // TODO: repeated error message
+  case .optProp: break // expected-error* {{not unwrapped}}
+
+  case .method: break // expected-error{{cannot match}}
+  case .method(0): break
+  case .method(_): break // expected-error{{'_' can only appear in a pattern}}
+  case .method(let x): break // expected-error{{cannot appear in an expression}}
+
+  case .method(withLabel:): break // expected-error{{cannot match}}
+  case .method(withLabel: 0): break
+  case .method(withLabel: _): break // expected-error{{'_' can only appear in a pattern}}
+  case .method(withLabel: let x): break // expected-error{{cannot appear in an expression}}
+
+  case .optMethod: break // expected-error{{cannot match}}
+  case .optMethod(0): break // expected-error{{not unwrapped}}
+}
+
+_ = 0

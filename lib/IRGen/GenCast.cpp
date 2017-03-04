@@ -2,11 +2,11 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2016 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 //
@@ -17,15 +17,17 @@
 #include "GenCast.h"
 
 #include "Explosion.h"
+#include "GenEnum.h"
+#include "GenExistential.h"
 #include "GenMeta.h"
 #include "GenProto.h"
+#include "IRGenDebugInfo.h"
 #include "IRGenFunction.h"
 #include "IRGenModule.h"
 #include "TypeInfo.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/Module.h"
 
-#include "swift/Basic/Fallthrough.h"
 #include "swift/SIL/SILInstruction.h"
 #include "swift/SIL/SILModule.h"
 #include "swift/SIL/TypeLowering.h"
@@ -91,7 +93,7 @@ FailableCastResult irgen::emitClassIdenticalCast(IRGenFunction &IGF,
     auto metaType = cast<MetatypeType>(toType.getSwiftRValueType());
     assert(metaType->getRepresentation() != MetatypeRepresentation::ObjC &&
            "not implemented");
-    toType = IGF.IGM.SILMod->Types.getLoweredType(metaType.getInstanceType());
+    toType = IGF.IGM.getLoweredType(metaType.getInstanceType());
   }
   // Emit a reference to the heap metadata for the target type.
   const bool allowConservative = true;
@@ -103,8 +105,9 @@ FailableCastResult irgen::emitClassIdenticalCast(IRGenFunction &IGF,
   // TODO: use ObjC class references
   llvm::Value *targetMetadata;
   if (allowConservative &&
-      (targetMetadata = tryEmitConstantTypeMetadataRef(IGF.IGM,
-                                          toType.getSwiftRValueType()))) {
+      (targetMetadata =
+        tryEmitConstantHeapMetadataRef(IGF.IGM, toType.getSwiftRValueType(),
+                                       /*allowUninitialized*/ true))) {
     // ok
   } else {
     targetMetadata
@@ -142,12 +145,18 @@ llvm::Value *irgen::emitClassDowncast(IRGenFunction &IGF, llvm::Value *from,
   llvm::Constant *castFn;
 
   // Get the best known type information about the destination type.
-  auto destClass = toType.getSwiftRValueType().getClassBound();
-  assert(destClass || toType.is<ArchetypeType>());
+  ClassDecl *destClass = nullptr;
+  if (auto archetypeTy = toType.getAs<ArchetypeType>()) {
+    if (auto superclassTy = archetypeTy->getSuperclass())
+      destClass = superclassTy->getClassOrBoundGenericClass();
+  } else {
+    destClass = toType.getClassOrBoundGenericClass();
+    assert(destClass != nullptr);
+  }
 
   // If the destination type is known to have a Swift-compatible
   // implementation, use the most specific entrypoint.
-  if (destClass && hasKnownSwiftImplementation(IGF.IGM, destClass)) {
+  if (destClass && destClass->hasKnownSwiftImplementation()) {
     metadataRef = IGF.emitTypeMetadataRef(toType.getSwiftRValueType());
 
     switch (mode) {
@@ -159,9 +168,10 @@ llvm::Value *irgen::emitClassDowncast(IRGenFunction &IGF, llvm::Value *from,
       break;
     }
 
-  // If the destination type is a foreign class or a non-specific
+  // If the destination type is a CF type or a non-specific
   // class-bounded archetype, use the most general cast entrypoint.
-  } else if (toType.is<ArchetypeType>() || destClass->isForeign()) {
+  } else if (toType.is<ArchetypeType>() ||
+             destClass->getForeignClassKind()==ClassDecl::ForeignKind::CFType) {
     metadataRef = IGF.emitTypeMetadataRef(toType.getSwiftRValueType());
 
     switch (mode) {
@@ -191,9 +201,14 @@ llvm::Value *irgen::emitClassDowncast(IRGenFunction &IGF, llvm::Value *from,
     metadataRef = IGF.Builder.CreateBitCast(metadataRef, IGF.IGM.Int8PtrTy);
 
   // Call the (unconditional) dynamic cast.
+  auto cc = IGF.IGM.DefaultCC;
+  if (auto fun = dyn_cast<llvm::Function>(castFn))
+    cc = fun->getCallingConv();
+
   auto call
     = IGF.Builder.CreateCall(castFn, {from, metadataRef});
   // FIXME: Eventually, we may want to throw.
+  call->setCallingConv(cc);
   call->setDoesNotThrow();
 
   llvm::Type *subTy = IGF.getTypeInfo(toType).getStorageType();
@@ -247,7 +262,12 @@ void irgen::emitMetatypeDowncast(IRGenFunction &IGF,
     llvm_unreachable("not implemented");
   }
 
+  auto cc = IGF.IGM.DefaultCC;
+  if (auto fun = dyn_cast<llvm::Function>(castFn))
+    cc = fun->getCallingConv();
+
   auto call = IGF.Builder.CreateCall(castFn, {metatype, toMetadata});
+  call->setCallingConv(cc);
   call->setDoesNotThrow();
   ex.add(call);
 }
@@ -321,6 +341,8 @@ static llvm::Function *emitExistentialScalarCastFn(IRGenModule &IGM,
   fn->setAttributes(IGM.constructInitialAttributes());
   
   IRGenFunction IGF(IGM, fn);
+  if (IGM.DebugInfo)
+    IGM.DebugInfo->emitArtificialFunction(IGF, fn);
   Explosion args = IGF.collectParameters();
 
   auto value = args.claimNext();
@@ -376,15 +398,15 @@ static llvm::Function *emitExistentialScalarCastFn(IRGenModule &IGM,
   return fn;
 }
 
-void irgen::emitMetatypeToObjectDowncast(IRGenFunction &IGF,
-                                         llvm::Value *metatypeValue,
-                                         CanAnyMetatypeType type,
-                                         CheckedCastMode mode,
-                                         Explosion &ex) {
+llvm::Value *irgen::emitMetatypeToAnyObjectDowncast(IRGenFunction &IGF,
+                                                    llvm::Value *metatypeValue,
+                                                    CanAnyMetatypeType type,
+                                                    CheckedCastMode mode) {
   // If ObjC interop is enabled, casting a metatype to AnyObject succeeds
   // if the metatype is for a class.
-  auto triviallyFail = [&] {
-    ex.add(llvm::ConstantPointerNull::get(IGF.IGM.ObjCPtrTy));
+
+  auto triviallyFail = [&]() -> llvm::Value* {
+    return llvm::ConstantPointerNull::get(IGF.IGM.ObjCPtrTy);
   };
   
   if (!IGF.IGM.ObjCInterop)
@@ -393,8 +415,7 @@ void irgen::emitMetatypeToObjectDowncast(IRGenFunction &IGF,
   switch (type->getRepresentation()) {
   case MetatypeRepresentation::ObjC:
     // Metatypes that can be represented as ObjC trivially cast to AnyObject.
-    ex.add(IGF.Builder.CreateBitCast(metatypeValue, IGF.IGM.ObjCPtrTy));
-    return;
+    return IGF.Builder.CreateBitCast(metatypeValue, IGF.IGM.ObjCPtrTy);
 
   case MetatypeRepresentation::Thin:
     // Metatypes that can be thin would never be classes.
@@ -410,8 +431,7 @@ void irgen::emitMetatypeToObjectDowncast(IRGenFunction &IGF,
       // Get the ObjC metadata for the class.
       auto heapMetadata = emitClassHeapMetadataRefForMetatype(IGF,metatypeValue,
                                                               instanceTy);
-      ex.add(IGF.Builder.CreateBitCast(heapMetadata, IGF.IGM.ObjCPtrTy));
-      return;
+      return IGF.Builder.CreateBitCast(heapMetadata, IGF.IGM.ObjCPtrTy);
     }
     
     // Is the type obviously not a class?
@@ -430,12 +450,16 @@ void irgen::emitMetatypeToObjectDowncast(IRGenFunction &IGF,
       break;
     }
     
-    auto call = IGF.Builder.CreateCall(castFn, metatypeValue);
-    ex.add(call);
-    return;
-  }
-  }
+    auto cc = IGF.IGM.DefaultCC;
+    if (auto fun = dyn_cast<llvm::Function>(castFn))
+      cc = fun->getCallingConv();
 
+    auto call = IGF.Builder.CreateCall(castFn, metatypeValue);
+    call->setCallingConv(cc);
+    return call;
+  }
+  }
+  llvm_unreachable("invalid metatype representation");
 }
 
 
@@ -578,10 +602,17 @@ void irgen::emitScalarExistentialDowncast(IRGenFunction &IGF,
     }
 
     
-    objcCast = IGF.Builder.CreateCall(
+    auto cc = IGF.IGM.DefaultCC;
+    if (auto fun = dyn_cast<llvm::Function>(castFn))
+      cc = fun->getCallingConv();
+
+
+    auto call = IGF.Builder.CreateCall(
         castFn,
         {objcCastObject, IGF.IGM.getSize(Size(objcProtos.size())),
          protoRefsBuf.getAddress()});
+    call->setCallingConv(cc);
+    objcCast = call;
     resultValue = IGF.Builder.CreateBitCast(objcCast, resultType);
   }
 
@@ -677,4 +708,120 @@ void irgen::emitScalarExistentialDowncast(IRGenFunction &IGF,
       ex.add(phi);
     }
   }
+}
+
+/// Emit a checked cast of a scalar value.
+///
+/// This is not just an implementation of emitCheckedCast for scalar types;
+/// it imposes strict restrictions on the source and target types that ensure
+/// that the actual value isn't changed in any way, thus preserving its
+/// reference identity.
+///
+/// These restrictions are set by canUseScalarCheckedCastInstructions.
+/// Essentially, both the source and target types must be one of:
+///   - a (possibly generic) concrete class type,
+///   - a class-bounded archetype,
+///   - a class-bounded existential,
+///   - a concrete metatype, or
+///   - an existential metatype.
+///
+/// Furthermore, if the target type is a metatype, the source type must be
+/// a metatype.  This restriction isn't obviously necessary; it's just that
+/// the runtime support for checking that an object instance is a metatype
+/// isn't exposed.
+void irgen::emitScalarCheckedCast(IRGenFunction &IGF,
+                                  Explosion &value,
+                                  SILType sourceType,
+                                  SILType targetType,
+                                  CheckedCastMode mode,
+                                  Explosion &out) {
+  assert(sourceType.isObject());
+  assert(targetType.isObject());
+
+  if (auto sourceOptObjectType = sourceType.getAnyOptionalObjectType()) {
+
+    // Translate the value from an enum representation to a possibly-null
+    // representation.  Note that we assume that this projection is safe
+    // for the particular case of an optional class-reference or metatype
+    // value.
+    Explosion optValue;
+    auto someDecl = IGF.IGM.Context.getOptionalSomeDecl();
+    emitProjectLoadableEnum(IGF, sourceType, value, someDecl, optValue);
+
+    assert(value.empty());
+    value = std::move(optValue);
+    sourceType = sourceOptObjectType;
+  }
+
+  // If the source value is a metatype, either do a metatype-to-metatype
+  // cast or cast it to an object instance and continue.
+  if (auto sourceMetatype = sourceType.getAs<AnyMetatypeType>()) {
+    llvm::Value *metatypeVal = nullptr;
+    if (sourceMetatype->getRepresentation() != MetatypeRepresentation::Thin)
+      metatypeVal = value.claimNext();
+
+    // If the metatype is existential, there may be witness tables in the
+    // value, which we don't need.
+    // TODO: In existential-to-existential casts, we should carry over common
+    // witness tables from the source to the destination.
+    (void)value.claimAll();
+
+    SmallVector<ProtocolDecl*, 1> protocols;
+
+    // Casts to existential metatypes.
+    if (auto existential = targetType.getAs<ExistentialMetatypeType>()) {
+      emitScalarExistentialDowncast(IGF, metatypeVal, sourceType, targetType,
+                                    mode, existential->getRepresentation(),
+                                    out);
+      return;
+
+    // Casts to concrete metatypes.
+    } else if (auto destMetaType = targetType.getAs<MetatypeType>()) {
+      emitMetatypeDowncast(IGF, metatypeVal, destMetaType, mode, out);
+      return;
+    }
+
+    // Otherwise, this is a metatype-to-object cast.
+    assert(targetType.isAnyClassReferenceType());
+
+    // Convert the metatype value to AnyObject.
+    llvm::Value *object =
+      emitMetatypeToAnyObjectDowncast(IGF, metatypeVal, sourceMetatype, mode);
+
+    auto anyObjectProtocol =
+      IGF.IGM.Context.getProtocol(KnownProtocolKind::AnyObject);
+    SILType anyObjectType =
+      SILType::getPrimitiveObjectType(
+        CanType(anyObjectProtocol->getDeclaredType()));
+
+    // Continue, pretending that the source value was an (optional) value.
+    Explosion newValue;
+    newValue.add(object);
+    value = std::move(newValue);
+    sourceType = anyObjectType;
+  }
+
+  assert(!targetType.is<AnyMetatypeType>() &&
+         "scalar cast of class reference to metatype is unimplemented");
+
+  // If the source type is existential, project out the class pointer.
+  //
+  // TODO: if we're casting to an existential type, don't throw away the
+  // protocol conformance information we already have.
+  llvm::Value *instance;
+  if (sourceType.isExistentialType()) {
+    instance = emitClassExistentialProjection(IGF, value, sourceType,
+                                              CanArchetypeType());
+  } else {
+    instance = value.claimNext();
+  }
+
+  if (targetType.isExistentialType()) {
+    emitScalarExistentialDowncast(IGF, instance, sourceType, targetType,
+                                  mode, /*not a metatype*/ None, out);
+    return;
+  }
+
+  llvm::Value *result = emitClassDowncast(IGF, instance, targetType, mode);
+  out.add(result);
 }

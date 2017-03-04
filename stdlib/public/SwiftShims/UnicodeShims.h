@@ -2,11 +2,11 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2016 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 //
@@ -17,7 +17,20 @@
 #ifndef SWIFT_STDLIB_SHIMS_UNICODESHIMS_H_
 #define SWIFT_STDLIB_SHIMS_UNICODESHIMS_H_
 
-extern const __swift_uint8_t *_swift_stdlib_GraphemeClusterBreakPropertyTrie;
+#include "SwiftStdint.h"
+#include "SwiftStdbool.h"
+#include "Visibility.h"
+
+#if __has_feature(nullability)
+#pragma clang assume_nonnull begin
+#endif
+
+#ifdef __cplusplus
+namespace swift { extern "C" {
+#endif
+
+SWIFT_RUNTIME_STDLIB_INTERFACE
+const __swift_uint8_t *_swift_stdlib_GraphemeClusterBreakPropertyTrie;
 
 struct _swift_stdlib_GraphemeClusterBreakPropertyTrieMetadataTy {
   unsigned BMPFirstLevelIndexBits;
@@ -41,37 +54,67 @@ struct _swift_stdlib_GraphemeClusterBreakPropertyTrieMetadataTy {
   unsigned SuppDataBytesOffset;
 };
 
-extern const struct _swift_stdlib_GraphemeClusterBreakPropertyTrieMetadataTy
+SWIFT_RUNTIME_STDLIB_INTERFACE
+const struct _swift_stdlib_GraphemeClusterBreakPropertyTrieMetadataTy
 _swift_stdlib_GraphemeClusterBreakPropertyTrieMetadata;
 
-extern const __swift_uint16_t *
+SWIFT_RUNTIME_STDLIB_INTERFACE
+const __swift_uint16_t *
 _swift_stdlib_ExtendedGraphemeClusterNoBoundaryRulesMatrix;
 
-__swift_int32_t _swift_stdlib_unicode_compare_utf16_utf16(
-  const __swift_uint16_t *Left, __swift_int32_t LeftLength,
-  const __swift_uint16_t *Right, __swift_int32_t RightLength);
+SWIFT_RUNTIME_STDLIB_INTERFACE
+SWIFT_READONLY __swift_int32_t
+_swift_stdlib_unicode_compare_utf16_utf16(const __swift_uint16_t *Left,
+                                          __swift_int32_t LeftLength,
+                                          const __swift_uint16_t *Right,
+                                          __swift_int32_t RightLength);
 
-__swift_int32_t _swift_stdlib_unicode_compare_utf8_utf16(
-  const char *Left, __swift_int32_t LeftLength,
-  const __swift_uint16_t *Right, __swift_int32_t RightLength);
+SWIFT_RUNTIME_STDLIB_INTERFACE
+SWIFT_READONLY __swift_int32_t
+_swift_stdlib_unicode_compare_utf8_utf16(const unsigned char *Left,
+                                         __swift_int32_t LeftLength,
+                                         const __swift_uint16_t *Right,
+                                         __swift_int32_t RightLength);
 
-__swift_int32_t _swift_stdlib_unicode_compare_utf8_utf8(
-  const char *Left, __swift_int32_t LeftLength,
-  const char *Right, __swift_int32_t RightLength);
+SWIFT_RUNTIME_STDLIB_INTERFACE
+SWIFT_READONLY __swift_int32_t
+_swift_stdlib_unicode_compare_utf8_utf8(const unsigned char *Left,
+                                        __swift_int32_t LeftLength,
+                                        const unsigned char *Right,
+                                        __swift_int32_t RightLength);
 
-__swift_intptr_t _swift_stdlib_unicode_hash(
-  const __swift_uint16_t *Str, __swift_int32_t Length);
+SWIFT_RUNTIME_STDLIB_INTERFACE
+void *_swift_stdlib_unicodeCollationIterator_create(
+    const __swift_uint16_t *Str,
+    __swift_uint32_t Length);
 
-__swift_intptr_t _swift_stdlib_unicode_hash_ascii(
-  const char *Str, __swift_int32_t Length);
+SWIFT_RUNTIME_STDLIB_INTERFACE
+__swift_int32_t _swift_stdlib_unicodeCollationIterator_next(
+    void *CollationIterator, __swift_bool *HitEnd);
 
+SWIFT_RUNTIME_STDLIB_INTERFACE
+void _swift_stdlib_unicodeCollationIterator_delete(
+    void *CollationIterator);
+
+SWIFT_RUNTIME_STDLIB_INTERFACE
+const __swift_int32_t *_swift_stdlib_unicode_getASCIICollationTable();
+
+SWIFT_RUNTIME_STDLIB_INTERFACE
 __swift_int32_t _swift_stdlib_unicode_strToUpper(
   __swift_uint16_t *Destination, __swift_int32_t DestinationCapacity,
   const __swift_uint16_t *Source, __swift_int32_t SourceLength);
 
+SWIFT_RUNTIME_STDLIB_INTERFACE
 __swift_int32_t _swift_stdlib_unicode_strToLower(
   __swift_uint16_t *Destination, __swift_int32_t DestinationCapacity,
   const __swift_uint16_t *Source, __swift_int32_t SourceLength);
 
+#ifdef __cplusplus
+}} // extern "C", namespace swift
+#endif
+
+#if __has_feature(nullability)
+#pragma clang assume_nonnull end
+#endif
 
 #endif

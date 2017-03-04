@@ -2,11 +2,11 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2016 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 //
@@ -44,6 +44,12 @@
 #include "swift/Runtime/Config.h"
 #include "swift/Runtime/Metadata.h"
 #include "swift/Runtime/HeapObject.h"
+#if SWIFT_OBJC_INTEROP
+#include "swift/Runtime/ObjCBridge.h"
+#endif
+
+#include "WeakReference.h"
+
 #include <cstring>
 #include <type_traits>
 
@@ -185,6 +191,11 @@ template <class Impl, class T> struct RetainableBoxBase {
   static constexpr size_t stride = sizeof(T);
   static constexpr bool isPOD = false;
   static constexpr bool isBitwiseTakable = true;
+#ifdef SWIFT_STDLIB_USE_NONATOMIC_RC
+  static constexpr bool isAtomic = false;
+#else
+  static constexpr bool isAtomic = true;
+#endif
 
   static void destroy(T *addr) {
     Impl::release(*addr);
@@ -256,12 +267,20 @@ template <class Impl, class T> struct RetainableBoxBase {
 struct SwiftRetainableBox :
     RetainableBoxBase<SwiftRetainableBox, HeapObject*> {
   static HeapObject *retain(HeapObject *obj) {
-    swift_retain(obj);
+    if (isAtomic) {
+      swift_retain(obj);
+    } else {
+      swift_nonatomic_retain(obj);
+    }
     return obj;
   }
 
   static void release(HeapObject *obj) {
-    swift_release(obj);
+    if (isAtomic) {
+      swift_release(obj);
+    } else {
+      swift_nonatomic_release(obj);
+    }
   }
 };
 
@@ -269,12 +288,20 @@ struct SwiftRetainableBox :
 struct SwiftUnownedRetainableBox :
     RetainableBoxBase<SwiftUnownedRetainableBox, HeapObject*> {
   static HeapObject *retain(HeapObject *obj) {
-    swift_unownedRetain(obj);
+    if (isAtomic) {
+      swift_unownedRetain(obj);
+    } else {
+      swift_nonatomic_unownedRetain(obj);
+    }
     return obj;
   }
 
   static void release(HeapObject *obj) {
-    swift_unownedRelease(obj);
+    if (isAtomic) {
+      swift_unownedRelease(obj);
+    } else {
+      swift_nonatomic_unownedRelease(obj);
+    }
   }
 
 #if SWIFT_OBJC_INTEROP
@@ -373,20 +400,17 @@ struct SwiftWeakRetainableBox :
 };
 
 #if SWIFT_OBJC_INTEROP
-extern "C" void *objc_retain(void *obj);
-extern "C" void objc_release(void *obj);
-
 /// A box implementation class for Objective-C object pointers.
 struct ObjCRetainableBox : RetainableBoxBase<ObjCRetainableBox, void*> {
   static constexpr unsigned numExtraInhabitants =
     swift_getHeapObjectExtraInhabitantCount();
 
   static void *retain(void *obj) {
-    return objc_retain(obj);
+    return objc_retain((id)obj);
   }
 
   static void release(void *obj) {
-    objc_release(obj);
+    objc_release((id)obj);
   }
 };
 
@@ -465,7 +489,11 @@ struct UnknownRetainableBox : RetainableBoxBase<UnknownRetainableBox, void*> {
     swift_unknownRetain(obj);
     return obj;
 #else
-    swift_retain(static_cast<HeapObject *>(obj));
+    if (isAtomic) {
+      swift_retain(static_cast<HeapObject *>(obj));
+    } else {
+      swift_nonatomic_retain(static_cast<HeapObject *>(obj));
+    }
     return static_cast<HeapObject *>(obj);
 #endif
   }
@@ -474,7 +502,11 @@ struct UnknownRetainableBox : RetainableBoxBase<UnknownRetainableBox, void*> {
 #if SWIFT_OBJC_INTEROP
     swift_unknownRelease(obj);
 #else
-    swift_release(static_cast<HeapObject *>(obj));
+    if (isAtomic) {
+      swift_release(static_cast<HeapObject *>(obj));
+    } else {
+      swift_nonatomic_release(static_cast<HeapObject *>(obj));
+    }
 #endif
   }
 };
@@ -516,6 +548,22 @@ struct PointerPointerBox : NativeBox<void**> {
 
   static int getExtraInhabitantIndex(void ** const *src) {
     return swift_getHeapObjectExtraInhabitantIndex((HeapObject* const *) src);
+  }
+};
+
+/// A box implementation class for raw pointers.
+///
+/// Note that this is used for imported `void * _Nonnull`, which may include
+/// reinterpret_cast-ed integers, so we only get NULL as an extra inhabitant.
+struct RawPointerBox : NativeBox<void*> {
+  static constexpr unsigned numExtraInhabitants = 1;
+
+  static void storeExtraInhabitant(void **dest, int index) {
+    *dest = nullptr;
+  }
+
+  static int getExtraInhabitantIndex(void* const *src) {
+    return *src == nullptr ? 0 : -1;
   }
 };
 
@@ -627,7 +675,9 @@ struct AggregateBox {
   using Helper = AggregateBoxHelper<0, EltBoxes...>;
   static constexpr size_t size = Helper::endOffset;
   static constexpr size_t alignment = Helper::alignment;
-  static constexpr size_t stride = roundUpToAlignment(size, alignment);
+  static constexpr size_t rawStride = roundUpToAlignment(size, alignment);
+  static constexpr size_t stride = rawStride == 0 ? 1 : rawStride;
+
   static constexpr bool isPOD = Helper::isPOD;
   static constexpr bool isBitwiseTakable = Helper::isBitwiseTakable;
 
@@ -831,6 +881,7 @@ struct NonFixedBufferValueWitnesses : BufferValueWitnessesBase<Impl> {
 
   static OpaqueValue *projectBuffer(ValueBuffer *buffer, const Metadata *self) {
     auto vwtable = self->getValueWitnesses();
+    (void)vwtable;
     if (!IsKnownAllocated && vwtable->isValueInline()) {
       return reinterpret_cast<OpaqueValue*>(buffer);
     } else {
@@ -850,6 +901,7 @@ struct NonFixedBufferValueWitnesses : BufferValueWitnessesBase<Impl> {
                                                        ValueBuffer *src,
                                                        const Metadata *self) {
     auto vwtable = self->getValueWitnesses();
+    (void)vwtable;
     if (!IsKnownAllocated && !vwtable->isValueInline()) {
       return Impl::initializeWithTake(reinterpret_cast<OpaqueValue*>(dest),
                                       reinterpret_cast<OpaqueValue*>(src),

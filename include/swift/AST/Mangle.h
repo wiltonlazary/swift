@@ -2,11 +2,11 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2016 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 
@@ -38,55 +38,21 @@ enum class OperatorFixity {
 /// with the mangleXXX methods, and the final string is constructed with the
 /// `finalize` method, after which the Mangler should not be used.
 class Mangler {
-  struct ArchetypeInfo {
-    unsigned Depth;
-    unsigned Index;
-  };
-
   llvm::SmallVector<char, 128> Storage;
   llvm::raw_svector_ostream Buffer;
 
   llvm::DenseMap<const void *, unsigned> Substitutions;
-  llvm::DenseMap<const ArchetypeType *, ArchetypeInfo> Archetypes;
   CanGenericSignature CurGenericSignature;
-  unsigned ArchetypesDepth = 0;
   ModuleDecl *Mod = nullptr;
   const DeclContext *DeclCtx = nullptr;
   /// If enabled, Arche- and Alias types are mangled with context.
   bool DWARFMangling;
   /// If enabled, non-ASCII names are encoded in modified Punycode.
   bool UsePunycode;
+  /// Optimize out protocol names if a type only conforms to one protocol.
+  bool OptimizeProtocolNames;
 
 public:
-  enum BindGenerics : unsigned {
-    /// We don't intend to mangle any sort of type within this context
-    /// and so do not require its generic parameters to be bound.
-    None,
-
-    /// We are going to mangle a method declared in this context
-    /// (which must be a type context) and do not need its generic
-    /// parameters, or the parameters from its enclosing types, to be
-    /// bound because we will bind them as part of processing the
-    /// method's formal signature.
-    Enclosing,
-
-    /// We intend to mangle a type which may be dependent on the
-    /// context and so require all generic parameters to be bound.
-    All
-  };
-  
-  class ContextStack {
-    Mangler &M;
-    unsigned OldDepth;
-    ContextStack(const ContextStack &) = delete;
-    ContextStack &operator=(const ContextStack &) = delete;
-  public:
-    ContextStack(Mangler &M) : M(M), OldDepth(M.ArchetypesDepth) {
-      M.ArchetypesDepth = 0;
-    }
-    ~ContextStack() { M.ArchetypesDepth = OldDepth; }
-  };
-
   /// Finish the mangling of the symbol and return the mangled name.
   std::string finalize();
 
@@ -100,10 +66,12 @@ public:
   /// archetypes and the 'a' mangling for alias types.
   /// \param usePunycode - emit modified Punycode instead of UTF-8.
   Mangler(bool DWARFMangling = false,
-          bool usePunycode = true)
-    : Buffer(Storage), DWARFMangling(DWARFMangling), UsePunycode(usePunycode) {}
-  void mangleContextOf(const ValueDecl *decl, BindGenerics shouldBind);
-  void mangleContext(const DeclContext *ctx, BindGenerics shouldBind);
+          bool usePunycode = true,
+          bool OptimizeProtocolNames = true)
+    : Buffer(Storage), DWARFMangling(DWARFMangling), UsePunycode(usePunycode),
+      OptimizeProtocolNames(OptimizeProtocolNames) {}
+  void mangleContextOf(const ValueDecl *decl);
+  void mangleContext(const DeclContext *ctx);
   void mangleModule(const ModuleDecl *module);
   void mangleDeclName(const ValueDecl *decl);
   void mangleDeclType(const ValueDecl *decl, unsigned uncurryingLevel);
@@ -123,17 +91,16 @@ public:
                            unsigned uncurryingLevel);
   void mangleClosureEntity(const AbstractClosureExpr *closure,
                            unsigned uncurryingLevel);
-  void mangleNominalType(const NominalTypeDecl *decl,
-                         BindGenerics shouldBind,
-                         CanGenericSignature extGenericSig = nullptr,
-                         const GenericParamList *extGenericParams = nullptr);
+  void mangleNominalType(const NominalTypeDecl *decl);
+  void mangleBoundGenericType(Type type);
   void mangleProtocolDecl(const ProtocolDecl *protocol);
   void mangleType(Type type, unsigned uncurryingLevel);
+  void mangleLegacyBoxType(CanType fieldType);
   void mangleDirectness(bool isIndirect);
   void mangleProtocolName(const ProtocolDecl *protocol);
   void mangleProtocolConformance(const ProtocolConformance *conformance);
-  void bindGenericParameters(CanGenericSignature sig,
-                             const GenericParamList *genericParams);
+  void bindGenericParameters(CanGenericSignature sig);
+  void bindGenericParameters(const DeclContext *DC);
   void addSubstitution(const void *ptr);
 
   void mangleDeclTypeForDebugger(const ValueDecl *decl);
@@ -170,11 +137,17 @@ public:
   /// \param isInitFunc If true it's a globalinit_func, otherwise a
   /// globalinit_token.
   void mangleGlobalInit(const VarDecl *decl, int counter, bool isInitFunc);
+  
+  void mangleBehaviorInitThunk(const VarDecl *decl);
 
   void mangleIdentifier(StringRef ref,
                         OperatorFixity fixity = OperatorFixity::NotOperator,
                         bool isOperator=false);
-  void resetArchetypesDepth() { ArchetypesDepth = 0; }
+
+  /// This checks whether a given array of generic type parameters are in a
+  /// good order. Returns true on good order; false on malformed order.
+  static bool checkGenericParamsOrder(ArrayRef<GenericTypeParamType *> params);
+
 private:
   void mangleFunctionType(AnyFunctionType *fn, unsigned uncurryingLevel);
   void mangleProtocolList(ArrayRef<ProtocolDecl*> protocols);
@@ -200,18 +173,17 @@ private:
   void mangleGenericSignatureParts(ArrayRef<GenericTypeParamType *> params,
                                    unsigned initialParamDepth,
                                    ArrayRef<Requirement> requirements);
-  Type getDeclTypeForMangling(const ValueDecl *decl,
-                              ArrayRef<GenericTypeParamType *> &genericParams,
-                              unsigned &initialParamIndex,
-                              ArrayRef<Requirement> &requirements,
-                              SmallVectorImpl<Requirement> &requirementsBuf);
+  CanType getDeclTypeForMangling(const ValueDecl *decl,
+                                 ArrayRef<GenericTypeParamType *> &genericParams,
+                                 unsigned &initialParamIndex,
+                                 ArrayRef<Requirement> &requirements,
+                                 SmallVectorImpl<Requirement> &requirementsBuf);
 
   void mangleGenericParamIndex(GenericTypeParamType *paramTy);
   void mangleAssociatedTypeName(DependentMemberType *dmt,
                                 bool canAbbreviate);
   void mangleConstrainedType(CanType type);
-  CanGenericSignature getCanonicalSignatureOrNull(GenericSignature *sig,
-                                                  ModuleDecl &M);
+  void mangleLayoutConstraint(LayoutConstraint layout);
 };
 
 } // end namespace Mangle

@@ -2,11 +2,11 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2016 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 //
@@ -20,6 +20,7 @@
 #include "swift/Basic/LLVM.h"
 #include "llvm/ADT/FoldingSet.h"
 #include "llvm/ADT/PointerUnion.h"
+#include "llvm/Support/TrailingObjects.h"
 
 namespace llvm {
   class raw_ostream;
@@ -62,10 +63,11 @@ public:
   StringRef str() const { return Pointer; }
   
   unsigned getLength() const {
+    assert(Pointer != nullptr && "Tried getting length of empty identifier");
     return ::strlen(Pointer);
   }
   
-  bool empty() const { return Pointer == 0; }
+  bool empty() const { return Pointer == nullptr; }
   
   /// isOperator - Return true if this identifier is an operator, false if it is
   /// a normal identifier.
@@ -118,11 +120,17 @@ public:
         || (C >= 0xE0100 && C <= 0xE01EF);
   }
 
+  static bool isEditorPlaceholder(StringRef name) {
+    return name.startswith("<#");
+  }
+
   bool isEditorPlaceholder() const {
-    return !empty() && Pointer[0] == '<' && Pointer[1] == '#';
+    return !empty() && isEditorPlaceholder(str());
   }
   
-  void *getAsOpaquePointer() const { return (void *)Pointer; }
+  const void *getAsOpaquePointer() const {
+      return static_cast<const void *>(Pointer);
+  }
   
   static Identifier getFromOpaquePointer(void *P) {
     return Identifier((const char*)P);
@@ -135,7 +143,7 @@ public:
   int compare(Identifier other) const;
 
   bool operator==(Identifier RHS) const { return Pointer == RHS.Pointer; }
-  bool operator!=(Identifier RHS) const { return Pointer != RHS.Pointer; }
+  bool operator!=(Identifier RHS) const { return !(*this==RHS); }
 
   bool operator<(Identifier RHS) const { return Pointer < RHS.Pointer; }
   
@@ -200,8 +208,12 @@ namespace swift {
 class DeclName {
   friend class ASTContext;
 
-  /// Represents a compound
-  struct alignas(Identifier*) CompoundDeclName : llvm::FoldingSetNode {
+  /// Represents a compound declaration name.
+  struct alignas(Identifier) CompoundDeclName final : llvm::FoldingSetNode,
+      private llvm::TrailingObjects<CompoundDeclName, Identifier> {
+    friend TrailingObjects;
+    friend class DeclName;
+
     Identifier BaseName;
     size_t NumArgs;
     
@@ -212,10 +224,10 @@ class DeclName {
     }
     
     ArrayRef<Identifier> getArgumentNames() const {
-      return {reinterpret_cast<const Identifier*>(this + 1), NumArgs};
+      return {getTrailingObjects<Identifier>(), NumArgs};
     }
     MutableArrayRef<Identifier> getArgumentNames() {
-      return {reinterpret_cast<Identifier*>(this + 1), NumArgs};
+      return {getTrailingObjects<Identifier>(), NumArgs};
     }
       
     /// Uniquing for the ASTContext.
@@ -355,7 +367,7 @@ public:
   }
 
   friend bool operator!=(DeclName lhs, DeclName rhs) {
-    return lhs.getOpaqueValue() != rhs.getOpaqueValue();
+    return !(lhs == rhs);
   }
 
   friend bool operator<(DeclName lhs, DeclName rhs) {
@@ -363,19 +375,33 @@ public:
   }
 
   friend bool operator<=(DeclName lhs, DeclName rhs) {
-    return lhs.compare(lhs) <= 0;
+    return lhs.compare(rhs) <= 0;
   }
 
   friend bool operator>(DeclName lhs, DeclName rhs) {
-    return lhs.compare(lhs) > 0;
+    return lhs.compare(rhs) > 0;
   }
 
   friend bool operator>=(DeclName lhs, DeclName rhs) {
-    return lhs.compare(lhs) >= 0;
+    return lhs.compare(rhs) >= 0;
   }
 
   void *getOpaqueValue() const { return SimpleOrCompound.getOpaqueValue(); }
   static DeclName getFromOpaqueValue(void *p) { return DeclName(p); }
+
+  /// Get a string representation of the name,
+  ///
+  /// \param scratch Scratch space to use.
+  StringRef getString(llvm::SmallVectorImpl<char> &scratch,
+                      bool skipEmptyArgumentNames = false) const;
+
+  /// Print the representation of this declaration name to the given
+  /// stream.
+  ///
+  /// \param skipEmptyArgumentNames When true, don't print the argument labels
+  /// if they are all empty.
+  llvm::raw_ostream &print(llvm::raw_ostream &os,
+                           bool skipEmptyArgumentNames = false) const;
 
   /// Print a "pretty" representation of this declaration name to the given
   /// stream.
@@ -406,6 +432,12 @@ public:
   /// Form a selector with the given number of arguments and the given selector
   /// pieces.
   ObjCSelector(ASTContext &ctx, unsigned numArgs, ArrayRef<Identifier> pieces);
+
+  /// Construct an invalid ObjCSelector.
+  ObjCSelector() : Storage() {}
+
+  /// Convert to true if the decl name is valid.
+  explicit operator bool() const { return (bool)Storage; }
 
   /// Determine the number of arguments in the selector.
   ///
@@ -461,7 +493,7 @@ public:
   }
 
   friend bool operator!=(ObjCSelector lhs, ObjCSelector rhs) {
-    return lhs.getOpaqueValue() != rhs.getOpaqueValue();
+    return !(lhs == rhs);
   }
 
   friend bool operator<(ObjCSelector lhs, ObjCSelector rhs) {
@@ -484,6 +516,20 @@ public:
 } // end namespace swift
 
 namespace llvm {
+  // A DeclName is "pointer like".
+  template<typename T> class PointerLikeTypeTraits;
+  template<>
+  class PointerLikeTypeTraits<swift::DeclName> {
+  public:
+    static inline void *getAsVoidPointer(swift::DeclName name) {
+      return name.getOpaqueValue();
+    }
+    static inline swift::DeclName getFromVoidPointer(void *ptr) {
+      return swift::DeclName::getFromOpaqueValue(ptr);
+    }
+    enum { NumLowBitsAvailable = 0 };
+  };
+
   // DeclNames hash just like pointers.
   template<> struct DenseMapInfo<swift::DeclName> {
     static swift::DeclName getEmptyKey() {
@@ -498,7 +544,21 @@ namespace llvm {
     static bool isEqual(swift::DeclName LHS, swift::DeclName RHS) {
       return LHS.getOpaqueValue() == RHS.getOpaqueValue();
     }
-  };  
+  };
+
+  // An ObjCSelector is "pointer like".
+  template<typename T> class PointerLikeTypeTraits;
+  template<>
+  class PointerLikeTypeTraits<swift::ObjCSelector> {
+  public:
+    static inline void *getAsVoidPointer(swift::ObjCSelector name) {
+      return name.getOpaqueValue();
+    }
+    static inline swift::ObjCSelector getFromVoidPointer(void *ptr) {
+      return swift::ObjCSelector::getFromOpaqueValue(ptr);
+    }
+    enum { NumLowBitsAvailable = 0 };
+  };
 
   // ObjCSelectors hash just like pointers.
   template<> struct DenseMapInfo<swift::ObjCSelector> {

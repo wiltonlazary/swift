@@ -12,13 +12,14 @@
 // at run time.
 // RUN: mv %t/FakeUnavailableObjCFramework.framework %t/FakeUnavailableObjCFramework-MovedAside.framework
 
-// RUN: %target-run %t/UseWeaklinkedUnavailableObjCFramework | FileCheck %s
-// RUN: %target-run %t/UseWeaklinkedUnavailableObjCFramework.opt | FileCheck %s
+// RUN: %target-run %t/UseWeaklinkedUnavailableObjCFramework | %FileCheck %s
+// RUN: %target-run %t/UseWeaklinkedUnavailableObjCFramework.opt | %FileCheck %s
 
 // REQUIRES: objc_interop
 // REQUIRES: executable_test
 
 import StdlibUnittest
+
 
 import FakeUnavailableObjCFramework
 import Foundation
@@ -114,7 +115,7 @@ func useUnavailableObjCClass() {
     o.someMethod()
   }
 
-  for var i = 0; i < getInt(5); i += 1 {
+  for i in 0 ..< getInt(5) {
     if #available(OSX 1066.0, iOS 1066.0, watchOS 1066.0, tvOS 1066.0, *) {
       let o: UnavailableObjCClass = printClassMetadataViaGeneric()
       _blackHole(o)
@@ -124,19 +125,24 @@ func useUnavailableObjCClass() {
   class SomeClass { }
   let someObject: AnyObject = _opaqueIdentity(SomeClass() as AnyObject)
 
-  for var i = 0; i < getInt(5); i += 1 {
+  for i in 0 ..< getInt(5) {
     if #available(OSX 1066.0, iOS 1066.0, watchOS 1066.0, tvOS 1066.0, *) {
       let isUnavailable = someObject is UnavailableObjCClass
       _blackHole(isUnavailable)
     }
   }
 
-  for var i = 0; i < getInt(5); i += 1 {
+  for i in 0 ..< getInt(5) {
     if #available(OSX 1066.0, iOS 1066.0, watchOS 1066.0, tvOS 1066.0, *) {
       let asUnavailable = someObject as? UnavailableObjCClass
       _blackHole(asUnavailable)
     }
   }
+}
+
+@available(OSX 1066.0, iOS 1066.0, watchOS 1066.0, tvOS 1066.0, *)
+func wrapUnavailableFunction() {
+  someFunction()
 }
 
 useUnavailableObjCClass()

@@ -2,11 +2,11 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2016 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 //
@@ -95,12 +95,16 @@ public:
 
   Expr *buildPrintRefExpr(SourceLoc loc) {
     assert(!C.PrintDecls.empty());
-    return TC.buildRefExpr(C.PrintDecls, DC, loc, /*Implicit=*/true);
+    return TC.buildRefExpr(C.PrintDecls, DC, DeclNameLoc(loc),
+                           /*Implicit=*/true, /*isSpecialized=*/false,
+                           FunctionRefKind::Compound);
   }
 
   Expr *buildDebugPrintlnRefExpr(SourceLoc loc) {
     assert(!C.DebugPrintlnDecls.empty());
-    return TC.buildRefExpr(C.DebugPrintlnDecls, DC, loc, /*Implicit=*/true);
+    return TC.buildRefExpr(C.DebugPrintlnDecls, DC, DeclNameLoc(loc),
+                           /*Implicit=*/true, /*isSpecialized=*/false,
+                           FunctionRefKind::Compound);
   }
 };
 } // unnamed namespace
@@ -108,13 +112,15 @@ public:
 void StmtBuilder::printLiteralString(StringRef Str, SourceLoc Loc) {
   Expr *PrintFn = buildPrintRefExpr(Loc);
   Expr *PrintStr = new (Context) StringLiteralExpr(Str, Loc);
-  addToBody(new (Context) CallExpr(PrintFn, PrintStr, /*Implicit=*/true));
+  addToBody(CallExpr::createImplicit(Context, PrintFn, { PrintStr }, { }));
 }
 
 void StmtBuilder::printReplExpr(VarDecl *Arg, SourceLoc Loc) {
   Expr *DebugPrintlnFn = buildDebugPrintlnRefExpr(Loc);
-  Expr *ArgRef = TC.buildRefExpr(Arg, DC, Loc, /*Implicit=*/true);
-  addToBody(new (Context) CallExpr(DebugPrintlnFn, ArgRef, /*Implicit=*/true));
+  Expr *ArgRef = TC.buildRefExpr(Arg, DC, DeclNameLoc(Loc), /*Implicit=*/true,
+                                 /*isSpecialized=*/false,
+                                 FunctionRefKind::Compound);
+  addToBody(CallExpr::createImplicit(Context, DebugPrintlnFn, { ArgRef }, { }));
 }
 
 Identifier TypeChecker::getNextResponseVariableName(DeclContext *DC) {
@@ -193,7 +199,7 @@ struct PatternBindingPrintLHS : public ASTVisitor<PatternBindingPrintLHS> {
 #define REFUTABLE_PATTERN(Id, Parent) INVALID_PATTERN(Id, Parent)
 #include "swift/AST/PatternNodes.def"
 };
-} // end anonymous namespace.
+} // end anonymous namespace
 
 namespace {
   class REPLChecker : public REPLContext {
@@ -207,7 +213,7 @@ namespace {
   private:
     void generatePrintOfExpression(StringRef name, Expr *E);
   };
-}
+} // end anonymous namespace
 
 /// Emit logic to print the specified expression value with the given
 /// description of the pattern involved.
@@ -225,10 +231,11 @@ void REPLChecker::generatePrintOfExpression(StringRef NameStr, Expr *E) {
   TopLevelCodeDecl *newTopLevel = new (Context) TopLevelCodeDecl(&SF);
 
   // Build function of type T->() which prints the operand.
-  auto *Arg = new (Context) ParamDecl(/*isLet=*/true,
+  auto *Arg = new (Context) ParamDecl(/*isLet=*/true, SourceLoc(),
                                          SourceLoc(), Identifier(),
                                          Loc, Context.getIdentifier("arg"),
                                          E->getType(), /*DC*/ newTopLevel);
+  Arg->setInterfaceType(E->getType());
   auto params = ParameterList::createWithoutLoc(Arg);
 
   unsigned discriminator = TLC.claimNextClosureDiscriminator();
@@ -237,7 +244,8 @@ void REPLChecker::generatePrintOfExpression(StringRef NameStr, Expr *E) {
       new (Context) ClosureExpr(params, SourceLoc(), SourceLoc(), SourceLoc(),
                                 TypeLoc(), discriminator, newTopLevel);
 
-  CE->setType(ParameterList::getFullType(TupleType::getEmpty(Context), params));
+  CE->setType(ParameterList::getFullInterfaceType(
+      TupleType::getEmpty(Context), params, Context));
   
   // Convert the pattern to a string we can print.
   llvm::SmallString<16> PrefixString;
@@ -263,14 +271,7 @@ void REPLChecker::generatePrintOfExpression(StringRef NameStr, Expr *E) {
   CE->setBody(Body, false);
   TC.typeCheckClosureBody(CE);
 
-  // If the caller didn't wrap the argument in parentheses or make it a tuple,
-  // add the extra parentheses now.
-  Expr *TheArg = E;
-  Type Ty = ParenType::get(TC.Context, TheArg->getType());
-  TheArg = new (TC.Context) ParenExpr(SourceLoc(), TheArg, SourceLoc(), false,
-                                      Ty);
-
-  Expr *TheCall = new (Context) CallExpr(CE, TheArg, /*Implicit=*/true);
+  Expr *TheCall = CallExpr::createImplicit(Context, CE, { E }, { });
   if (TC.typeCheckExpressionShallow(TheCall, Arg->getDeclContext()))
     return ;
 
@@ -289,7 +290,7 @@ void REPLChecker::processREPLTopLevelExpr(Expr *E) {
   CanType T = E->getType()->getCanonicalType();
 
   // Don't try to print invalid expressions, module exprs, or void expressions.
-  if (isa<ErrorType>(T) || isa<ModuleType>(T) || T->isVoid())
+  if (T->hasError() || isa<ModuleType>(T) || T->isVoid())
     return;
 
   // Okay, we need to print this expression.  We generally do this by creating a
@@ -309,9 +310,10 @@ void REPLChecker::processREPLTopLevelExpr(Expr *E) {
 
   // Create the meta-variable, let the typechecker name it.
   Identifier name = TC.getNextResponseVariableName(SF.getParentModule());
-  VarDecl *vd = new (Context) VarDecl(/*static*/ false, /*IsLet*/true,
-                                      E->getStartLoc(), name,
-                                      E->getType(), &SF);
+  VarDecl *vd = new (Context) VarDecl(/*IsStatic*/false, /*IsLet*/true,
+                                      /*IsCaptureList*/false, E->getStartLoc(),
+                                      name, E->getType(), &SF);
+  vd->setInterfaceType(E->getType());
   SF.Decls.push_back(vd);
 
   // Create a PatternBindingDecl to bind the expression into the decl.
@@ -330,7 +332,8 @@ void REPLChecker::processREPLTopLevelExpr(Expr *E) {
                                   /*implicit*/true));
 
   // Finally, print the variable's value.
-  E = TC.buildCheckedRefExpr(vd, &SF, E->getStartLoc(), /*Implicit=*/true);
+  E = TC.buildCheckedRefExpr(vd, &SF, DeclNameLoc(E->getStartLoc()),
+                             /*Implicit=*/true);
   generatePrintOfExpression(vd->getName().str(), E);
 }
 
@@ -358,7 +361,8 @@ void REPLChecker::processREPLTopLevelPatternBinding(PatternBindingDecl *PBD) {
     // underlying Decl to print it.
     if (auto *NP = dyn_cast<NamedPattern>(pattern->
                                           getSemanticsProvidingPattern())) {
-      Expr *E = TC.buildCheckedRefExpr(NP->getDecl(), &SF, PBD->getStartLoc(),
+      Expr *E = TC.buildCheckedRefExpr(NP->getDecl(), &SF,
+                                       DeclNameLoc(PBD->getStartLoc()),
                                        /*Implicit=*/true);
       generatePrintOfExpression(PatternString, E);
       continue;
@@ -379,11 +383,12 @@ void REPLChecker::processREPLTopLevelPatternBinding(PatternBindingDecl *PBD) {
 
     // Create the meta-variable, let the typechecker name it.
     Identifier name = TC.getNextResponseVariableName(SF.getParentModule());
-    VarDecl *vd = new (Context) VarDecl(/*static*/ false, /*IsLet*/true,
+    VarDecl *vd = new (Context) VarDecl(/*IsStatic*/false, /*IsLet*/true,
+                                        /*IsCaptureList*/false,
                                         PBD->getStartLoc(), name,
                                         pattern->getType(), &SF);
+    vd->setInterfaceType(pattern->getType());
     SF.Decls.push_back(vd);
-    
 
     // Create a PatternBindingDecl to bind the expression into the decl.
     Pattern *metavarPat = new (Context) NamedPattern(vd);
@@ -403,14 +408,15 @@ void REPLChecker::processREPLTopLevelPatternBinding(PatternBindingDecl *PBD) {
     
     
     // Replace the initializer of PBD with a reference to our repl temporary.
-    Expr *E = TC.buildCheckedRefExpr(vd, &SF,
-                                     vd->getStartLoc(), /*Implicit=*/true);
+    Expr *E = TC.buildCheckedRefExpr(vd, &SF, DeclNameLoc(vd->getStartLoc()),
+                                     /*Implicit=*/true);
     E = TC.coerceToMaterializable(E);
     PBD->setInit(entryIdx, E);
     SF.Decls.push_back(PBTLCD);
     
     // Finally, print out the result, by referring to the repl temp.
-    E = TC.buildCheckedRefExpr(vd, &SF, vd->getStartLoc(), /*Implicit=*/true);
+    E = TC.buildCheckedRefExpr(vd, &SF, DeclNameLoc(vd->getStartLoc()),
+                               /*Implicit=*/true);
     generatePrintOfExpression(PatternString, E);
   }
 }

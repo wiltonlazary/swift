@@ -2,11 +2,11 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2016 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 
@@ -17,6 +17,8 @@
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/StringSwitch.h"
 #include "llvm/Support/Debug.h"
+#include "swift/AST/ProtocolConformance.h"
+#include "swift/SIL/FormalLinkage.h"
 #include <functional>
 
 using namespace swift;
@@ -78,33 +80,6 @@ bool SILLinkerVisitor::processFunction(SILFunction *F) {
 }
 
 /// Process Decl, recursively deserializing any thing Decl may reference.
-bool SILLinkerVisitor::processDeclRef(SILDeclRef Decl) {
-  if (Mode == LinkingMode::LinkNone)
-    return false;
-
-  // If F is a declaration, first deserialize it.
-  auto *NewFn =
-      isAvailableExternally(Decl.getLinkage(ForDefinition_t::NotForDefinition))
-          ? Loader->lookupSILFunction(Decl)
-          : nullptr;
-  if (!NewFn || NewFn->isExternalDeclaration())
-    return false;
-
-  if (!shouldImportFunction(NewFn)) {
-    return false;
-  }
-
-  ++NumFuncLinked;
-
-  // Try to transitively deserialize everything referenced by NewFn.
-  Worklist.push_back(NewFn);
-  process();
-
-  // Since we successfully processed at least one function, return true.
-  return true;
-}
-
-/// Process Decl, recursively deserializing any thing Decl may reference.
 bool SILLinkerVisitor::processFunction(StringRef Name) {
   if (Mode == LinkingMode::LinkNone)
     return false;
@@ -125,6 +100,27 @@ bool SILLinkerVisitor::processFunction(StringRef Name) {
   return true;
 }
 
+/// Process Decl, recursively deserializing any thing Decl may reference.
+SILFunction *SILLinkerVisitor::lookupFunction(StringRef Name,
+                                              SILLinkage Linkage) {
+
+  auto *NewFn = Loader->lookupSILFunction(Name, /* declarationOnly */ true,
+                                          Linkage);
+
+  if (!NewFn)
+    return nullptr;
+
+  assert(NewFn->isExternalDeclaration() &&
+         "SIL function lookup should never read function bodies");
+
+  return NewFn;
+}
+
+/// Process Decl, recursively deserializing any thing Decl may reference.
+bool SILLinkerVisitor::hasFunction(StringRef Name,
+                                   Optional<SILLinkage> Linkage) {
+  return Loader->hasSILFunction(Name, Linkage);
+}
 
 /// Deserialize the VTable mapped to C if it exists and all SIL the VTable
 /// transitively references.
@@ -145,7 +141,7 @@ SILVTable *SILLinkerVisitor::processClassDecl(const ClassDecl *C) {
   // Otherwise, add all the vtable functions in Vtbl to the function
   // processing list...
   for (auto &E : Vtbl->getEntries())
-    Worklist.push_back(E.second);
+    Worklist.push_back(E.Implementation);
 
   // And then transitively deserialize all SIL referenced by those functions.
   process();
@@ -168,9 +164,9 @@ bool SILLinkerVisitor::linkInVTable(ClassDecl *D) {
   // for processing.
   bool Result = false;
   for (auto P : Vtbl->getEntries()) {
-    if (P.second->isExternalDeclaration()) {
+    if (P.Implementation->isExternalDeclaration()) {
       Result = true;
-      addFunctionToWorklist(P.second);
+      addFunctionToWorklist(P.Implementation);
     }
   }
   return Result;
@@ -182,7 +178,7 @@ bool SILLinkerVisitor::linkInVTable(ClassDecl *D) {
 
 bool SILLinkerVisitor::visitApplyInst(ApplyInst *AI) {
   // Ok we have a function ref inst, grab the callee.
-  SILFunction *Callee = AI->getCalleeFunction();
+  SILFunction *Callee = AI->getReferencedFunction();
   if (!Callee)
     return false;
 
@@ -199,7 +195,7 @@ bool SILLinkerVisitor::visitApplyInst(ApplyInst *AI) {
 }
 
 bool SILLinkerVisitor::visitPartialApplyInst(PartialApplyInst *PAI) {
-  SILFunction *Callee = PAI->getCalleeFunction();
+  SILFunction *Callee = PAI->getReferencedFunction();
   if (!Callee)
     return false;
   if (!isLinkAll() && !Callee->isTransparent() &&
@@ -231,13 +227,13 @@ bool SILLinkerVisitor::visitProtocolConformance(
 
   // Otherwise try and lookup a witness table for C.
   auto C = ref.getConcrete();
-  SILWitnessTable *WT = Mod.lookUpWitnessTable(C).first;
+  SILWitnessTable *WT = Mod.lookUpWitnessTable(C);
 
   // If we don't find any witness table for the conformance, bail and return
   // false.
   if (!WT) {
     Mod.createWitnessTableDeclaration(
-        C, TypeConverter::getLinkageForProtocolConformance(
+        C, getLinkageForProtocolConformance(
                C->getRootNormalConformance(), NotForDefinition));
     return false;
   }

@@ -2,16 +2,16 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2016 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 
 #include "swift/Driver/DependencyGraph.h"
-#include "swift/Basic/DemangleWrappers.h"
+#include "swift/Basic/Demangle.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringSwitch.h"
@@ -408,7 +408,7 @@ void DependencyGraphImpl::MarkTracerImpl::printPath(
       if (name.front() == 'P')
         name.push_back('_');
       out << " provides type '"
-          << swift::demangle_wrappers::demangleTypeAsString(name.str())
+          << swift::Demangle::demangleTypeAsString(name.str())
           << "'\n";
 
     } else if (entry.KindMask.contains(DependencyKind::NominalTypeMember)) {
@@ -425,10 +425,15 @@ void DependencyGraphImpl::MarkTracerImpl::printPath(
       }
       StringRef memberPart = name.str().substr(splitPoint+1);
 
-      out << " provides member '" << memberPart << "' of type '"
-          << swift::demangle_wrappers::demangleTypeAsString(typePart)
-          << "'\n";
-
+      if (memberPart.empty()) {
+        out << " provides non-private members of type '"
+            << swift::Demangle::demangleTypeAsString(typePart)
+            << "'\n";
+      } else {
+        out << " provides member '" << memberPart << "' of type '"
+            << swift::Demangle::demangleTypeAsString(typePart)
+            << "'\n";
+      }
     } else if (entry.KindMask.contains(DependencyKind::DynamicLookupName)) {
       out << " provides AnyObject member '" << entry.Name << "'\n";
 

@@ -1,4 +1,4 @@
-// RUN: %target-swift-frontend -sil-verify-all -O %s -emit-sil | FileCheck %s
+// RUN: %target-swift-frontend -Xllvm -new-mangling-for-tests -sil-verify-all -O %s -emit-sil | %FileCheck %s
 
 // This file consists of tests for making sure that protocol conformances and
 // inherited conformances work well together when applied to each other. The
@@ -10,7 +10,7 @@
 // *NOTE* If something like templated protocols is ever implemented this file
 // needs to be updated.
 
-// CHECK-LABEL: sil @_TF38devirt_specialized_inherited_interplay6driverFT_T_ : $@convention(thin) () -> () {
+// CHECK-LABEL: sil @_T038devirt_specialized_inherited_interplay6driveryyF : $@convention(thin) () -> () {
 // CHECK: bb0:
 // CHECK: [[A3:%[0-9]+]] = alloc_ref [stack] $A3<S>
 // CHECK: [[A4:%[0-9]+]] = alloc_ref [stack] $A4<S>
@@ -147,14 +147,14 @@ class B4<F>: B3<Array<Array<Int>>> {
   }
 }
 
-func WhatShouldIDo<T : P>(t : T) {
+func WhatShouldIDo<T : P>(_ t : T) {
   t.doSomething()
 }
-func WhatShouldIDo2(p : P) {
+func WhatShouldIDo2(_ p : P) {
   p.doSomething()
 }
 
-public func driver1<X>(x:X) {
+public func driver1<X>(_ x:X) {
   let b = B3<X>()
   WhatShouldIDo(b)
   WhatShouldIDo2(b)

@@ -1,6 +1,9 @@
-// RUN: %target-swift-frontend %s -emit-ir -g -o - | FileCheck %s
+// RUN: %target-swift-frontend -Xllvm -new-mangling-for-tests %s -emit-ir -g -o - | %FileCheck %s
 
-func markUsed<T>(t: T) {}
+// FIXME: https://bugs.swift.org/browse/SR-2808
+// XFAIL: resilient_stdlib
+
+func markUsed<T>(_ t: T) {}
 
 class Person {
     var name = "No Name"
@@ -14,14 +17,14 @@ func main() {
         markUsed("element = \(element)")
     }
     markUsed("Done with the for loop")
-// CHECK: call void @_TF4main8markUsedurFxT_
+// CHECK: call {{.*}}void @_T04main8markUsedyxlF
 // CHECK: br label
 // CHECK: <label>:
 // CHECK: , !dbg ![[LOOPHEADER_LOC:.*]]
-// CHECK: call void {{.*}}elease({{.*}}) {{#[0-9]+}}, !dbg ![[LOOPHEADER_LOC]]
-// CHECK: call void @_TF4main8markUsedurFxT_
+// CHECK: call void {{.*[rR]}}elease{{.*}} {{#[0-9]+}}, !dbg ![[LOOPHEADER_LOC]]
+// CHECK: call {{.*}}void @_T04main8markUsedyxlF
 // The cleanups should share the line number with the ret stmt.
-// CHECK:  call void {{.*}}elease({{.*}}) {{#[0-9]+}}, !dbg ![[CLEANUPS:.*]]
+// CHECK:  call void {{.*[rR]}}elease{{.*}} {{#[0-9]+}}, !dbg ![[CLEANUPS:.*]]
 // CHECK-NEXT:  !dbg ![[CLEANUPS]]
 // CHECK-NEXT:  bitcast
 // CHECK-NEXT:  llvm.lifetime.end

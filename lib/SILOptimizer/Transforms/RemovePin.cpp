@@ -1,12 +1,12 @@
-//===--- RemovePin.cpp -  StrongPin/Unpin removal ---------------*- C++ -*-===//
+//===--- RemovePin.cpp -  StrongPin/Unpin removal -------------------------===//
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2016 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 
@@ -33,7 +33,7 @@
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
 
-STATISTIC(NumPinPairsRemoved, "Num pin pairs removed");
+STATISTIC(NumPinPairsRemoved, "Number of pin pairs removed");
 
 using namespace swift;
 
@@ -101,17 +101,17 @@ public:
         if (auto *Unpin = dyn_cast<StrongUnpinInst>(CurInst)) {
           DEBUG(llvm::dbgs() << "        Found unpin!\n");
           SILValue RCId = RCIA->getRCIdentityRoot(Unpin->getOperand());
-          DEBUG(llvm::dbgs() << "        RCID Source: " << *RCId.getDef());
-          auto *PinDef = dyn_cast<StrongPinInst>(RCId.getDef());
-          if (PinDef && AvailablePins.count(PinDef)){
+          DEBUG(llvm::dbgs() << "        RCID Source: " << *RCId);
+          auto *PinDef = dyn_cast<StrongPinInst>(RCId);
+          if (PinDef && AvailablePins.count(PinDef)) {
             DEBUG(llvm::dbgs() << "        Found matching pin: " << *PinDef);
             SmallVector<MarkDependenceInst *, 8> MarkDependentInsts;
             if (areSafePinUsers(PinDef, Unpin, MarkDependentInsts)) {
               DEBUG(llvm::dbgs() << "        Pin users are safe! Removing!\n");
               Changed = true;
               auto *Enum = SILBuilder(PinDef).createOptionalSome(
-                  PinDef->getLoc(), PinDef->getOperand(), PinDef->getType(0));
-              SILValue(PinDef).replaceAllUsesWith(Enum);
+                  PinDef->getLoc(), PinDef->getOperand(), PinDef->getType());
+              PinDef->replaceAllUsesWith(Enum);
               Unpin->eraseFromParent();
               PinDef->eraseFromParent();
               // Remove this pindef from AvailablePins.
@@ -185,8 +185,8 @@ public:
       // A mark_dependence is safe if it is marking a dependence on a base that
       // is the strong_pinned value.
       if (auto *MD = dyn_cast<MarkDependenceInst>(U))
-        if (Pin == MD->getBase().getDef() ||
-            std::find(Users.begin(), Users.end(), MD->getBase().getDef()) !=
+        if (Pin == MD->getBase() ||
+            std::find(Users.begin(), Users.end(), MD->getBase()) !=
                 Users.end()) {
           MarkDeps.push_back(MD);
           continue;
@@ -313,7 +313,7 @@ public:
     return true;
   }
 };
-}
+} // end anonymous namespace
 
 SILTransform *swift::createRemovePins() {
   return new RemovePinInsts();

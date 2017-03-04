@@ -2,11 +2,11 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2016 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 
@@ -42,6 +42,14 @@ namespace {
 static bool seemsUseful(SILInstruction *I) {
   if (I->mayHaveSideEffects())
     return true;
+
+  if (auto *BI = dyn_cast<BuiltinInst>(I)) {
+    // Although the onFastPath builtin has no side-effects we don't want to
+    // remove it.
+    if (BI->getBuiltinInfo().ID == BuiltinValueKind::OnFastPath)
+      return true;
+    return false;
+  }
 
   if (isa<ReturnInst>(I) || isa<UnreachableInst>(I) || isa<ThrowInst>(I))
     return true;
@@ -104,7 +112,7 @@ class DCE : public SILFunctionTransform {
     auto* DA = PM->getAnalysis<PostDominanceAnalysis>();
     PDT = DA->get(F);
 
-    // If we have a functions that consists of nothing but a
+    // If we have a function that consists of nothing but a
     // structurally infinite loop like:
     //   while true {}
     // we'll have an empty post dominator tree.
@@ -235,7 +243,7 @@ void DCE::markLive(SILFunction &F) {
         // definition is alive.
         SILValue Op = FLI->getOperand();
         auto *OpInst = dyn_cast<SILInstruction>(Op);
-        if (OpInst && !Op.getType().isAddress()) {
+        if (OpInst && !Op->getType().isAddress()) {
           addReverseDependency(OpInst, FLI);
         } else {
           markValueLive(FLI);
@@ -283,8 +291,6 @@ void DCE::markTerminatorArgsLive(SILBasicBlock *Pred,
   switch (Term->getTermKind()) {
   case TermKind::ReturnInst:
   case TermKind::ThrowInst:
-  case TermKind::Invalid:
-    llvm_unreachable("Unexpected terminator kind!");
 
   case TermKind::UnreachableInst:
   case TermKind::SwitchValueInst:
@@ -305,7 +311,7 @@ void DCE::markTerminatorArgsLive(SILBasicBlock *Pred,
     break;
 
   case TermKind::BranchInst:
-    markValueLive(cast<BranchInst>(Term)->getArg(ArgIndex).getDef());
+    markValueLive(cast<BranchInst>(Term)->getArg(ArgIndex));
     break;
 
   case TermKind::CondBranchInst: {
@@ -313,12 +319,12 @@ void DCE::markTerminatorArgsLive(SILBasicBlock *Pred,
 
     if (CondBr->getTrueBB() == Succ) {
       auto TrueArgs = CondBr->getTrueArgs();
-      markValueLive(TrueArgs[ArgIndex].getDef());
+      markValueLive(TrueArgs[ArgIndex]);
     }
 
     if (CondBr->getFalseBB() == Succ) {
       auto FalseArgs = CondBr->getFalseArgs();
-      markValueLive(FalseArgs[ArgIndex].getDef());
+      markValueLive(FalseArgs[ArgIndex]);
     }
 
     break;
@@ -336,16 +342,16 @@ void DCE::propagateLiveBlockArgument(SILArgument *Arg) {
   // Conceptually, the dependency from a debug instruction to its definition
   // is in reverse direction: Only if its definition (the Arg) is alive, also
   // the debug_value instruction is alive.
-  for (Operand *DU : getDebugUses(*Arg))
+  for (Operand *DU : getDebugUses(Arg))
     markValueLive(DU->getUser());
 
-  if (Arg->isFunctionArg())
+  if (isa<SILFunctionArgument>(Arg))
     return;
 
   auto *Block = Arg->getParent();
   auto ArgIndex = Arg->getIndex();
 
-  for (auto Pred : Block->getPreds())
+  for (auto Pred : Block->getPredecessorBlocks())
     markTerminatorArgsLive(Pred, Block, ArgIndex);
 }
 
@@ -354,12 +360,12 @@ void DCE::propagateLiveBlockArgument(SILArgument *Arg) {
 void DCE::propagateLiveness(SILInstruction *I) {
   if (!isa<TermInst>(I)) {
     for (auto &O : I->getAllOperands())
-      markValueLive(O.get().getDef());
+      markValueLive(O.get());
 
     // Conceptually, the dependency from a debug instruction to its definition
     // is in reverse direction: Only if its definition is alive, also the
     // debug_value instruction is alive.
-    for (Operand *DU : getDebugUses(*I))
+    for (Operand *DU : getDebugUses(I))
       markValueLive(DU->getUser());
 
     // Handle all other reverse-dependency instructions, like cond_fail and
@@ -371,9 +377,6 @@ void DCE::propagateLiveness(SILInstruction *I) {
   }
 
   switch (ValueKindAsTermKind(I->getKind())) {
-  case TermKind::Invalid:
-    llvm_unreachable("Unexpected terminator instruction!");
-
   case TermKind::BranchInst:
   case TermKind::UnreachableInst:
     return;
@@ -385,18 +388,18 @@ void DCE::propagateLiveness(SILInstruction *I) {
   case TermKind::SwitchEnumAddrInst:
   case TermKind::DynamicMethodBranchInst:
   case TermKind::CheckedCastBranchInst:
-    markValueLive(I->getOperand(0).getDef());
+    markValueLive(I->getOperand(0));
     return;
 
   case TermKind::TryApplyInst:
   case TermKind::SwitchValueInst:
     for (auto &O : I->getAllOperands())
-      markValueLive(O.get().getDef());
+      markValueLive(O.get());
     return;
 
   case TermKind::CheckedCastAddrBranchInst:
-    markValueLive(I->getOperand(0).getDef());
-    markValueLive(I->getOperand(1).getDef());
+    markValueLive(I->getOperand(0));
+    markValueLive(I->getOperand(1));
     return;
   }
   llvm_unreachable("corrupt instruction!");
@@ -427,10 +430,10 @@ void DCE::replaceBranchWithJump(SILInstruction *Inst, SILBasicBlock *Block) {
          "Unexpected dead terminator kind!");
 
   SILInstruction *Branch;
-  if (!Block->bbarg_empty()) {
+  if (!Block->args_empty()) {
     std::vector<SILValue> Args;
-    auto E = Block->bbarg_end();
-    for (auto A = Block->bbarg_begin(); A != E; ++A) {
+    auto E = Block->args_end();
+    for (auto A = Block->args_begin(); A != E; ++A) {
       assert(!LiveValues.count(*A) && "Unexpected live block argument!");
       Args.push_back(SILUndef::get((*A)->getType(), (*A)->getModule()));
     }
@@ -449,7 +452,7 @@ bool DCE::removeDead(SILFunction &F) {
   bool Changed = false;
 
   for (auto &BB : F) {
-    for (auto I = BB.bbarg_begin(), E = BB.bbarg_end(); I != E; ) {
+    for (auto I = BB.args_begin(), E = BB.args_end(); I != E;) {
       auto Inst = *I++;
       if (LiveValues.count(Inst))
         continue;
@@ -457,9 +460,9 @@ bool DCE::removeDead(SILFunction &F) {
       DEBUG(llvm::dbgs() << "Removing dead argument:\n");
       DEBUG(Inst->dump());
 
-      for (unsigned i = 0, e = Inst->getNumTypes(); i != e; ++i) {
-        auto *Undef = SILUndef::get(Inst->getType(i), Inst->getModule());
-        SILValue(Inst, i).replaceAllUsesWith(Undef);
+      if (Inst->hasValue()) {
+        auto *Undef = SILUndef::get(Inst->getType(), Inst->getModule());
+        Inst->replaceAllUsesWith(Undef);
       }
 
       Changed = true;
@@ -487,9 +490,9 @@ bool DCE::removeDead(SILFunction &F) {
       DEBUG(llvm::dbgs() << "Removing dead instruction:\n");
       DEBUG(Inst->dump());
 
-      for (unsigned i = 0, e = Inst->getNumTypes(); i != e; ++i) {
-        auto *Undef = SILUndef::get(Inst->getType(i), Inst->getModule());
-        SILValue(Inst, i).replaceAllUsesWith(Undef);
+      if (Inst->hasValue()) {
+        auto *Undef = SILUndef::get(Inst->getType(), Inst->getModule());
+        Inst->replaceAllUsesWith(Undef);
       }
 
 
@@ -579,7 +582,7 @@ void DCE::computePredecessorDependence(SILFunction &F) {
     assert(ControllingInfoMap.find(&BB) != ControllingInfoMap.end()
            && "Expected to already have a map entry for block!");
 
-    for (auto Pred : BB.getPreds())
+    for (auto Pred : BB.getPredecessorBlocks())
       if (!PDT->properlyDominates(&BB, Pred)) {
         assert(ControllingInfoMap.find(Pred) != ControllingInfoMap.end() &&
                "Expected to already have a map entry for block!");
