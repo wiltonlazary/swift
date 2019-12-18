@@ -18,13 +18,13 @@
 namespace swift {
 class ModuleDecl;
 class SourceFile;
+class DeclContext;
 
 namespace index {
 
-void indexSourceFile(SourceFile *SF, StringRef hash,
-                     IndexDataConsumer &consumer);
-void indexModule(ModuleDecl *module, StringRef hash,
-                 IndexDataConsumer &consumer);
+void indexDeclContext(DeclContext *DC, IndexDataConsumer &consumer);
+void indexSourceFile(SourceFile *SF, IndexDataConsumer &consumer);
+void indexModule(ModuleDecl *module, IndexDataConsumer &consumer);
 
 } // end namespace index
 } // end namespace swift

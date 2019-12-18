@@ -24,6 +24,8 @@
 #==============================================================================#
 cscope.files
 cscope.out
+.vimrc
+tags
 
 #==============================================================================#
 # Directories to ignore (do not add trailing '/'s, they skip symlinks).
@@ -33,6 +35,9 @@ docs/_build
 
 # Finder metadata
 .DS_Store
+
+# Visual Studio metadata
+.vs
 
 #==============================================================================#
 # Ignore CMake temporary files
@@ -51,3 +56,6 @@ compile_commands.json
 8
 4
 SortedCFDatabase.def
+htmlcov
+.coverage
+/benchmark/scripts/Benchmark_Driverc

@@ -1,8 +1,8 @@
-// RUN: rm -rf %t && mkdir -p %t
+// RUN: %empty-directory(%t)
 // RUN: %build-clang-importer-objc-overlays
 
-// RUN: %target-swift-frontend(mock-sdk: %clang-importer-sdk-nosource -I %t) -I %S/Inputs/custom-modules -typecheck %s -verify -verify-ignore-unknown
-// RUN: %target-swift-frontend(mock-sdk: %clang-importer-sdk-nosource -I %t) -Xllvm -new-mangling-for-tests -I %S/Inputs/custom-modules -emit-ir %s -D IRGEN | %FileCheck %s
+// RUN: %target-swift-frontend(mock-sdk: %clang-importer-sdk-nosource -I %t) -I %S/Inputs/custom-modules -typecheck %s -verify
+// RUN: %target-swift-frontend(mock-sdk: %clang-importer-sdk-nosource -I %t) -I %S/Inputs/custom-modules -emit-ir %s -D IRGEN | %FileCheck %s
 
 // RUN: %target-swift-ide-test(mock-sdk: %clang-importer-sdk-nosource -I %t) -I %S/Inputs/custom-modules -print-module -source-filename="%s" -module-to-print SwiftPrivateAttr > %t.txt
 // RUN: %FileCheck -check-prefix=GENERATED-NEGATIVE %s < %t.txt
@@ -53,6 +53,15 @@ public func testInitializers() {
   _ = Bar(__: 1)
 }
 
+// CHECK-LABEL: define linkonce_odr hidden {{.+}} @"$sSo3BarC8__noArgsABSgyt_tcfcTO"
+// CHECK: @"\01L_selector(initWithNoArgs)"
+// CHECK-LABEL: define linkonce_odr hidden {{.+}} @"$sSo3BarC8__oneArgABSgs5Int32V_tcfcTO"
+// CHECK: @"\01L_selector(initWithOneArg:)"
+// CHECK-LABEL: define linkonce_odr hidden {{.+}} @"$sSo3BarC9__twoArgs5otherABSgs5Int32V_AGtcfcTO"
+// CHECK: @"\01L_selector(initWithTwoArgs:other:)"
+// CHECK-LABEL: define linkonce_odr hidden {{.+}} @"$sSo3BarC2__ABSgs5Int32V_tcfcTO"
+// CHECK: @"\01L_selector(init:)"
+
 // CHECK-LABEL: define{{( protected)?}} swiftcc void @{{.+}}18testFactoryMethods
 public func testFactoryMethods() {
   // CHECK: @"\01L_selector(fooWithOneArg:)"
@@ -65,8 +74,8 @@ public func testFactoryMethods() {
 
 #if !IRGEN
 public func testSubscript(_ foo: Foo) {
-  _ = foo[foo] // expected-error {{type 'Foo' has no subscript members}}
-  _ = foo[1] // expected-error {{type 'Foo' has no subscript members}}
+  _ = foo[foo] // expected-error {{value of type 'Foo' has no subscripts}}
+  _ = foo[1] // expected-error {{value of type 'Foo' has no subscripts}}
 }
 #endif
 
@@ -90,19 +99,6 @@ public func testTopLevel() {
   PrivS1() // expected-error {{use of unresolved identifier}}
 #endif
 }
-
-// CHECK-LABEL: define linkonce_odr hidden %swift.type* @_T0So12__PrivFooSubCMa{{.*}} {
-// CHECK: %objc_class** @"OBJC_CLASS_REF_$_PrivFooSub"
-// CHECK: }
-
-// CHECK-LABEL: define linkonce_odr hidden {{.+}} @_T0So3BarCSQyABGs5Int32V2___tcfcTO
-// CHECK: @"\01L_selector(init:)"
-// CHECK-LABEL: define linkonce_odr hidden {{.+}} @_T0So3BarCSQyABGs5Int32V9__twoArgs_AD5othertcfcTO
-// CHECK: @"\01L_selector(initWithTwoArgs:other:)"
-// CHECK-LABEL: define linkonce_odr hidden {{.+}} @_T0So3BarCSQyABGs5Int32V8__oneArg_tcfcTO
-// CHECK: @"\01L_selector(initWithOneArg:)"
-// CHECK-LABEL: define linkonce_odr hidden {{.+}} @_T0So3BarCSQyABGyt8__noArgs_tcfcTO
-// CHECK: @"\01L_selector(initWithNoArgs)"
 
 _ = __PrivAnonymousA
 _ = __E0PrivA
@@ -139,9 +135,3 @@ func testRawNames() {
   let _ = Foo.__foo // expected-error{{'__foo' has been replaced by 'init(__:)'}}
 }
 #endif
-
-// FIXME: Remove -verify-ignore-unknown.
-// <unknown>:0: error: unexpected note produced: '__PrivCFTypeRef' was obsoleted in Swift 3
-// <unknown>:0: error: unexpected note produced: '__PrivCFSubRef' was obsoleted in Swift 3
-// <unknown>:0: error: unexpected note produced: '__fooWithOneArg' has been explicitly marked unavailable here
-// <unknown>:0: error: unexpected note produced: '__foo' has been explicitly marked unavailable here

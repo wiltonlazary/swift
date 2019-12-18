@@ -1,4 +1,4 @@
-// RUN: %target-sil-opt  -assume-parsing-unqualified-ownership-sil -guaranteed-arc-opts %s | %FileCheck %s
+// RUN: %target-sil-opt  -guaranteed-arc-opts %s | %FileCheck %s
 
 sil_stage raw
 
@@ -134,6 +134,51 @@ bb0(%0 : $*Builtin.NativeObject, %1 : $*Builtin.NativeObject):
 sil @copyaddr_test3 : $@convention(thin) (@in Builtin.NativeObject) -> () {
 bb0(%0 : $*Builtin.NativeObject):
   destroy_addr %0 : $*Builtin.NativeObject
+  %9999 = tuple()
+  return %9999 : $()
+}
+
+class C {
+  var val: Builtin.Int32
+  init(i: Builtin.Int32)
+  deinit
+}
+
+// CHECK-LABEL: sil @access_test : $@convention(thin) (@owned C, Builtin.Int32) -> ()
+// CHECK-NOT: strong_retain
+// CHECK-NOT: strong_release
+sil @access_test : $@convention(thin) (@owned C, Builtin.Int32) -> () {
+bb0(%0 : $C, %1 : $Builtin.Int32):
+  strong_retain %0 : $C
+  %valadr = ref_element_addr %0 : $C, #C.val
+  %access = begin_access [modify] [dynamic] %valadr : $*Builtin.Int32
+  store %1 to %access : $*Builtin.Int32
+  end_access %access : $*Builtin.Int32
+  strong_release %0 : $C
+  %9999 = tuple()
+  return %9999 : $()
+}
+
+// CHECK-LABEL: sil @mixed_test_1 : $@convention(thin) (Builtin.NativeObject, Builtin.NativeObject) -> () {
+// CHECK-NOT: retain
+// CHECK-NOT: release
+// CHECK: } // end sil function 'mixed_test_1'
+sil @mixed_test_1 : $@convention(thin) (Builtin.NativeObject, Builtin.NativeObject) -> () {
+bb0(%0 : $Builtin.NativeObject, %1 : $Builtin.NativeObject):
+  strong_retain %0 : $Builtin.NativeObject
+  release_value %0 : $Builtin.NativeObject
+  %9999 = tuple()
+  return %9999 : $()
+}
+
+// CHECK-LABEL: sil @mixed_test_2 : $@convention(thin) (Builtin.NativeObject, Builtin.NativeObject) -> () {
+// CHECK-NOT: retain
+// CHECK-NOT: release
+// CHECK: } // end sil function 'mixed_test_2'
+sil @mixed_test_2 : $@convention(thin) (Builtin.NativeObject, Builtin.NativeObject) -> () {
+bb0(%0 : $Builtin.NativeObject, %1 : $Builtin.NativeObject):
+  retain_value %0 : $Builtin.NativeObject
+  strong_release %0 : $Builtin.NativeObject
   %9999 = tuple()
   return %9999 : $()
 }

@@ -11,15 +11,16 @@
 //===----------------------------------------------------------------------===//
 ///
 /// \file
-/// \brief A simple module loader that loads .swift source files.
+/// A simple module loader that loads .swift source files.
 ///
 //===----------------------------------------------------------------------===//
 
 #include "swift/Sema/SourceLoader.h"
 #include "swift/Subsystems.h"
-#include "swift/AST/AST.h"
+#include "swift/AST/ASTContext.h"
 #include "swift/AST/DiagnosticsSema.h"
-#include "swift/Parse/DelayedParsingCallbacks.h"
+#include "swift/AST/Module.h"
+#include "swift/AST/SourceFile.h"
 #include "swift/Parse/PersistentParserState.h"
 #include "swift/Basic/SourceManager.h"
 #include "llvm/ADT/SmallString.h"
@@ -42,7 +43,7 @@ static FileOrError findModule(ASTContext &ctx, StringRef moduleID,
     llvm::sys::path::append(inputFilename, moduleID);
     inputFilename.append(".swift");
     llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> FileBufOrErr =
-      llvm::MemoryBuffer::getFile(inputFilename.str());
+      ctx.SourceMgr.getFileSystem()->getBufferForFile(inputFilename.str());
 
     // Return if we loaded a file
     if (FileBufOrErr)
@@ -56,19 +57,10 @@ static FileOrError findModule(ASTContext &ctx, StringRef moduleID,
   return make_error_code(std::errc::no_such_file_or_directory);
 }
 
-namespace {
-
-/// Don't parse any function bodies except those that are transparent.
-class SkipNonTransparentFunctions : public DelayedParsingCallbacks {
-  bool shouldDelayFunctionBodyParsing(Parser &TheParser,
-                                      AbstractFunctionDecl *AFD,
-                                      const DeclAttributes &Attrs,
-                                      SourceRange BodyRange) override {
-    return Attrs.hasAttribute<TransparentAttr>();
-  }
-};
-
-} // unnamed namespace
+void SourceLoader::collectVisibleTopLevelModuleNames(
+    SmallVectorImpl<Identifier> &names) const {
+  // TODO: Implement?
+}
 
 bool SourceLoader::canImportModule(std::pair<Identifier, SourceLoc> ID) {
   // Search the memory buffers to see if we can find this file on disk.
@@ -109,11 +101,13 @@ ModuleDecl *SourceLoader::loadModule(SourceLoc importLoc,
   std::unique_ptr<llvm::MemoryBuffer> inputFile =
     std::move(inputFileOrError.get());
 
-  addDependency(inputFile->getBufferIdentifier());
+  if (dependencyTracker)
+    dependencyTracker->addDependency(inputFile->getBufferIdentifier(),
+                                     /*isSystem=*/false);
 
   // Turn off debugging while parsing other modules.
-  llvm::SaveAndRestore<bool> turnOffDebug(Ctx.LangOpts.DebugConstraintSolver,
-                                          false);
+  llvm::SaveAndRestore<bool>
+      turnOffDebug(Ctx.TypeCheckerOpts.DebugConstraintSolver, false);
 
   unsigned bufferID;
   if (auto BufID =
@@ -123,7 +117,7 @@ ModuleDecl *SourceLoader::loadModule(SourceLoc importLoc,
     bufferID = Ctx.SourceMgr.addNewSourceBuffer(std::move(inputFile));
 
   auto *importMod = ModuleDecl::create(moduleID.first, Ctx);
-  if (EnableResilience)
+  if (EnableLibraryEvolution)
     importMod->setResilienceStrategy(ResilienceStrategy::Resilient);
   Ctx.LoadedModules[moduleID.first] = importMod;
 
@@ -132,27 +126,18 @@ ModuleDecl *SourceLoader::loadModule(SourceLoc importLoc,
     implicitImportKind = SourceFile::ImplicitModuleImportKind::None;
 
   auto *importFile = new (Ctx) SourceFile(*importMod, SourceFileKind::Library,
-                                          bufferID, implicitImportKind);
+                                          bufferID, implicitImportKind,
+                                          Ctx.LangOpts.CollectParsedToken,
+                                          Ctx.LangOpts.BuildSyntaxTree);
   importMod->addFile(*importFile);
 
   bool done;
-  PersistentParserState persistentState;
-  SkipNonTransparentFunctions delayCallbacks;
-  parseIntoSourceFile(*importFile, bufferID, &done, nullptr, &persistentState,
-                      SkipBodies ? &delayCallbacks : nullptr);
+  parseIntoSourceFile(*importFile, bufferID, &done, nullptr, nullptr);
   assert(done && "Parser returned early?");
   (void)done;
 
-  if (SkipBodies)
-    performDelayedParsing(importMod, persistentState, nullptr);
-
-  // FIXME: Support recursive definitions in immediate modes by making type
-  // checking even lazier.
-  if (SkipBodies)
-    performNameBinding(*importFile);
-  else
-    performTypeChecking(*importFile, persistentState.getTopLevelContext(),
-                        None);
+  performNameBinding(*importFile);
+  importMod->setHasResolvedImports();
   return importMod;
 }
 

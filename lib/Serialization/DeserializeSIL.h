@@ -11,8 +11,8 @@
 //===----------------------------------------------------------------------===//
 
 #include "SILFormat.h"
+#include "ModuleFile.h"
 #include "swift/SIL/SILModule.h"
-#include "swift/Serialization/ModuleFile.h"
 #include "swift/Serialization/SerializedSILLoader.h"
 
 #include "llvm/ADT/DenseMap.h"
@@ -24,9 +24,11 @@ namespace llvm {
 
 namespace swift {
   class SILDeserializer {
+    using TypeID = serialization::TypeID;
+    
     ModuleFile *MF;
     SILModule &SILMod;
-    SerializedSILLoader::Callback *Callback;
+    DeserializationNotificationHandlerSet *Callback;
 
     /// The cursor used to lazily load SILFunctions.
     llvm::BitstreamCursor SILCursor;
@@ -37,21 +39,24 @@ namespace swift {
       llvm::OnDiskIterableChainedHashTable<FuncTableInfo>;
 
     std::unique_ptr<SerializedFuncTable> FuncTable;
-    std::vector<ModuleFile::PartiallySerialized<SILFunction*>> Funcs;
+    MutableArrayRef<ModuleFile::PartiallySerialized<SILFunction*>> Funcs;
 
     std::unique_ptr<SerializedFuncTable> VTableList;
-    std::vector<ModuleFile::Serialized<SILVTable*>> VTables;
+    MutableArrayRef<ModuleFile::Serialized<SILVTable*>> VTables;
 
     std::unique_ptr<SerializedFuncTable> GlobalVarList;
-    std::vector<ModuleFile::Serialized<SILGlobalVariable*>> GlobalVars;
+    MutableArrayRef<ModuleFile::Serialized<SILGlobalVariable*>> GlobalVars;
 
     std::unique_ptr<SerializedFuncTable> WitnessTableList;
-    std::vector<ModuleFile::PartiallySerialized<SILWitnessTable *>>
+    MutableArrayRef<ModuleFile::PartiallySerialized<SILWitnessTable *>>
     WitnessTables;
 
     std::unique_ptr<SerializedFuncTable> DefaultWitnessTableList;
-    std::vector<ModuleFile::PartiallySerialized<SILDefaultWitnessTable *>>
+    MutableArrayRef<ModuleFile::PartiallySerialized<SILDefaultWitnessTable *>>
     DefaultWitnessTables;
+
+    MutableArrayRef<ModuleFile::PartiallySerialized<SILProperty *>>
+    Properties;
 
     /// A declaration will only
     llvm::DenseMap<NormalProtocolConformance *, SILWitnessTable *>
@@ -60,7 +65,9 @@ namespace swift {
     /// Data structures used to perform name lookup for local values.
     llvm::DenseMap<uint32_t, ValueBase*> LocalValues;
     llvm::DenseMap<uint32_t, ValueBase*> ForwardLocalValues;
-    serialization::ValueID LastValueID = 0;
+
+    /// The first two local values are reserved for SILUndef.
+    serialization::ValueID LastValueID = 1;
 
     /// Data structures used to perform lookup of basic blocks.
     llvm::DenseMap<unsigned, SILBasicBlock*> BlocksByID;
@@ -76,6 +83,12 @@ namespace swift {
     SILFunction *readSILFunction(serialization::DeclID, SILFunction *InFunc,
                                  StringRef Name, bool declarationOnly,
                                  bool errorIfEmptyBody = true);
+    /// Read a SIL function.
+    llvm::Expected<SILFunction *>
+    readSILFunctionChecked(serialization::DeclID, SILFunction *InFunc,
+                           StringRef Name, bool declarationOnly,
+                           bool errorIfEmptyBody = true);
+
     /// Read a SIL basic block within a given SIL function.
     SILBasicBlock *readSILBasicBlock(SILFunction *Fn,
                                      SILBasicBlock *Prev,
@@ -97,6 +110,9 @@ namespace swift {
     SILValue getLocalValue(serialization::ValueID Id,
                            SILType Type);
 
+    SILType getSILType(Type ty, SILValueCategory category,
+                       SILFunction *inContext);
+
     SILFunction *getFuncForReference(StringRef Name, SILType Ty);
     SILFunction *getFuncForReference(StringRef Name);
     SILVTable *readVTable(serialization::DeclID);
@@ -104,10 +120,19 @@ namespace swift {
     SILGlobalVariable *readGlobalVar(StringRef Name);
     SILWitnessTable *readWitnessTable(serialization::DeclID,
                                       SILWitnessTable *existingWt);
+    void readWitnessTableEntries(
+           llvm::BitstreamEntry &entry,
+           std::vector<SILWitnessTable::Entry> &witnessEntries,
+           std::vector<SILWitnessTable::ConditionalConformance>
+             &conditionalConformances);
+    SILProperty *readProperty(serialization::DeclID);
     SILDefaultWitnessTable *
     readDefaultWitnessTable(serialization::DeclID,
                             SILDefaultWitnessTable *existingWt);
 
+    Optional<KeyPathPatternComponent>
+    readKeyPathComponent(ArrayRef<uint64_t> ListOfValues, unsigned &nextValue);
+    
 public:
     Identifier getModuleIdentifier() const {
       return MF->getAssociatedModule()->getName();
@@ -115,11 +140,11 @@ public:
     FileUnit *getFile() const {
       return MF->getFile();
     }
-    SILFunction *lookupSILFunction(SILFunction *InFunc);
+    SILFunction *lookupSILFunction(SILFunction *InFunc, bool onlyUpdateLinkage);
     SILFunction *lookupSILFunction(StringRef Name,
                                    bool declarationOnly = false);
     bool hasSILFunction(StringRef Name, Optional<SILLinkage> Linkage = None);
-    SILVTable *lookupVTable(Identifier Name);
+    SILVTable *lookupVTable(StringRef MangledClassName);
     SILWitnessTable *lookupWitnessTable(SILWitnessTable *wt);
     SILDefaultWitnessTable *
     lookupDefaultWitnessTable(SILDefaultWitnessTable *wt);
@@ -135,7 +160,8 @@ public:
     ///
     /// TODO: Globals.
     void getAll(bool UseCallback = true) {
-      llvm::SaveAndRestore<SerializedSILLoader::Callback *> SaveCB(Callback);
+      llvm::SaveAndRestore<DeserializationNotificationHandlerSet *> SaveCB(
+          Callback);
 
       if (!UseCallback)
         Callback = nullptr;
@@ -145,6 +171,7 @@ public:
       getAllVTables();
       getAllWitnessTables();
       getAllDefaultWitnessTables();
+      getAllProperties();
     }
 
     /// Deserialize all SILFunctions inside the module and add them to SILMod.
@@ -164,8 +191,12 @@ public:
     /// to SILMod.
     void getAllDefaultWitnessTables();
 
+    /// Deserialize all Property descriptors inside the module and add them
+    /// to SILMod.
+    void getAllProperties();
+
     SILDeserializer(ModuleFile *MF, SILModule &M,
-                    SerializedSILLoader::Callback *callback);
+                    DeserializationNotificationHandlerSet *callback);
 
     // Out of line to avoid instantiation OnDiskChainedHashTable here.
     ~SILDeserializer();

@@ -1,8 +1,8 @@
-// RUN: %target-typecheck-verify-swift
+// RUN: %target-typecheck-verify-swift -enable-objc-interop
 protocol EmptyProtocol { }
 
 protocol DefinitionsInProtocols {
-  init() {} // expected-error {{protocol initializers may not have bodies}}
+  init() {} // expected-error {{protocol initializers must not have bodies}}
   deinit {} // expected-error {{deinitializers may only be declared within a class}}
 }
 
@@ -14,18 +14,23 @@ protocol Test {
   var creator: String { get }
   var major : Int { get }
   var minor : Int { get }
-  var subminor : Int  // expected-error {{property in protocol must have explicit { get } or { get set } specifier}}
-  static var staticProperty: Int // expected-error{{property in protocol must have explicit { get } or { get set } specifier}}
+  var subminor : Int  // expected-error {{property in protocol must have explicit { get } or { get set } specifier}} {{21-21= { get <#set#> \}}}
+  static var staticProperty: Int // expected-error{{property in protocol must have explicit { get } or { get set } specifier}} {{33-33= { get <#set#> \}}}
+
+  let bugfix // expected-error {{type annotation missing in pattern}} expected-error {{immutable property requirement must be declared as 'var' with a '{ get }' specifier}}
+  var comment // expected-error {{type annotation missing in pattern}} expected-error {{property in protocol must have explicit { get } or { get set } specifier}}
 }
 
 protocol Test2 {
   var property: Int { get }
 
-  var title: String = "The Art of War" { get } // expected-error{{initial value is not allowed here}} expected-error {{property in protocol must have explicit { get } or { get set } specifier}}
-  static var title2: String = "The Art of War" // expected-error{{initial value is not allowed here}} expected-error {{property in protocol must have explicit { get } or { get set } specifier}}
+  var title: String = "The Art of War" { get } // expected-error{{initial value is not allowed here}} expected-error {{property in protocol must have explicit { get } or { get set } specifier}} {{20-20= { get <#set#> \}}}
+  static var title2: String = "The Art of War" // expected-error{{initial value is not allowed here}} expected-error {{property in protocol must have explicit { get } or { get set } specifier}} {{28-28= { get <#set#> \}}}
 
   associatedtype mytype
   associatedtype mybadtype = Int
+
+  associatedtype V : Test = // expected-error {{expected type in associated type declaration}} {{28-28= <#type#>}}
 }
 
 func test1() {
@@ -36,7 +41,9 @@ func test1() {
   v1.creator = "Me"                   // expected-error {{cannot assign to property: 'creator' is a get-only property}}
 }
 
-protocol Bogus : Int {} // expected-error{{inheritance from non-protocol, non-class type 'Int'}}
+protocol Bogus : Int {}
+// expected-error@-1{{inheritance from non-protocol, non-class type 'Int'}}
+// expected-error@-2{{type 'Self' constrained to non-protocol, non-class type 'Int'}}
 
 // Explicit conformance checks (successful).
 
@@ -70,20 +77,37 @@ class NotPrintableC : CustomStringConvertible, Any {} // expected-error{{type 'N
 enum NotPrintableO : Any, CustomStringConvertible {} // expected-error{{type 'NotPrintableO' does not conform to protocol 'CustomStringConvertible'}}
 
 struct NotFormattedPrintable : FormattedPrintable { // expected-error{{type 'NotFormattedPrintable' does not conform to protocol 'CustomStringConvertible'}}
-  func print(format: TestFormat) {} // expected-note{{candidate has non-matching type '(TestFormat) -> ()'}}
+  func print(format: TestFormat) {} 
+}
+
+// Protocol compositions in inheritance clauses
+protocol Left {
+  func l() // expected-note {{protocol requires function 'l()' with type '() -> ()'; do you want to add a stub?}}
+}
+protocol Right {
+  func r() // expected-note {{protocol requires function 'r()' with type '() -> ()'; do you want to add a stub?}}
+}
+typealias Both = Left & Right
+
+protocol Up : Both {
+  func u()
+}
+
+struct DoesNotConform : Up {
+  // expected-error@-1 {{type 'DoesNotConform' does not conform to protocol 'Left'}}
+  // expected-error@-2 {{type 'DoesNotConform' does not conform to protocol 'Right'}}
+  func u() {}
 }
 
 // Circular protocols
 
-protocol CircleMiddle : CircleStart { func circle_middle() } // expected-error 2 {{circular protocol inheritance CircleMiddle}}
-// expected-error@-1{{circular protocol inheritance 'CircleMiddle' -> 'CircleStart' -> 'CircleEnd' -> 'CircleMiddle'}}
-// expected-error @+1 {{circular protocol inheritance CircleStart}}
-protocol CircleStart : CircleEnd { func circle_start() } // expected-error 2{{circular protocol inheritance CircleStart}}
-// expected-note@-1{{protocol 'CircleStart' declared here}}
-protocol CircleEnd : CircleMiddle { func circle_end()} // expected-note{{protocol 'CircleEnd' declared here}}
+protocol CircleMiddle : CircleStart { func circle_middle() } // expected-error 3 {{protocol 'CircleMiddle' refines itself}}
+protocol CircleStart : CircleEnd { func circle_start() }
+// expected-note@-1 3 {{protocol 'CircleStart' declared here}}
+protocol CircleEnd : CircleMiddle { func circle_end()} // expected-note 3 {{protocol 'CircleEnd' declared here}}
 
 protocol CircleEntry : CircleTrivial { }
-protocol CircleTrivial : CircleTrivial { } // expected-error 3{{circular protocol inheritance CircleTrivial}}
+protocol CircleTrivial : CircleTrivial { } // expected-error {{protocol 'CircleTrivial' refines itself}}
 
 struct Circle {
   func circle_start() {}
@@ -186,6 +210,12 @@ struct IntStringGetter : GetATuple {
   func getATuple() -> Tuple {}
 }
 
+protocol ClassConstrainedAssocType {
+  associatedtype T : class
+  // expected-error@-1 {{'class' constraint can only appear on protocol declarations}}
+  // expected-note@-2 {{did you mean to write an 'AnyObject' constraint?}}{{22-27=AnyObject}}
+}
+
 //===----------------------------------------------------------------------===//
 // Default arguments
 //===----------------------------------------------------------------------===//
@@ -237,8 +267,7 @@ struct WrongIsEqual : IsEqualComparable { // expected-error{{type 'WrongIsEqual'
 //===----------------------------------------------------------------------===//
 
 func existentialSequence(_ e: Sequence) { // expected-error{{has Self or associated type requirements}}
-	// FIXME: Weird diagnostic
-  var x = e.makeIterator() // expected-error{{'Sequence' is not convertible to 'Sequence.Iterator'}}
+  var x = e.makeIterator() // expected-error{{member 'makeIterator' cannot be used on value of protocol type 'Sequence'; use a generic constraint instead}}
   x.next()
   x.nonexistent()
 }
@@ -345,8 +374,8 @@ final class ClassNode : IntrusiveListNode {
 }
 
 struct StructNode : IntrusiveListNode { // expected-error{{non-class type 'StructNode' cannot conform to class protocol 'IntrusiveListNode'}}
-  // expected-error@-1{{value type 'StructNode' cannot have a stored property that references itself}}
-  var next : StructNode
+  var next : StructNode  // expected-error {{value type 'StructNode' cannot have a stored property that recursively contains it}}
+
 }
 
 final class ClassNodeByExtension { }
@@ -375,8 +404,7 @@ final class GenericClassNode<T> : IntrusiveListNode {
 }
 
 struct GenericStructNode<T> : IntrusiveListNode { // expected-error{{non-class type 'GenericStructNode<T>' cannot conform to class protocol 'IntrusiveListNode'}}
-  // expected-error@-1{{value type 'GenericStructNode<T>' cannot have a stored property that references itself}}
-  var next : GenericStructNode<T>
+  var next : GenericStructNode<T> // expected-error {{value type 'GenericStructNode<T>' cannot have a stored property that recursively contains it}}
 }
 
 // Refined protocols inherit class-ness
@@ -391,8 +419,7 @@ final class ClassDNode : IntrusiveDListNode {
 
 struct StructDNode : IntrusiveDListNode { // expected-error{{non-class type 'StructDNode' cannot conform to class protocol 'IntrusiveDListNode'}}
   // expected-error@-1{{non-class type 'StructDNode' cannot conform to class protocol 'IntrusiveListNode'}}
-  // expected-error@-2{{value type 'StructDNode' cannot have a stored property that references itself}}
-  var prev : StructDNode
+  var prev : StructDNode // expected-error {{value type 'StructDNode' cannot have a stored property that recursively contains it}}
   var next : StructDNode
 }
 
@@ -427,18 +454,20 @@ struct X4 : P1 { // expected-error{{type 'X4' does not conform to protocol 'P1'}
 
 protocol ShouldntCrash {
   // rdar://16109996
-  let fullName: String { get }  // expected-error {{'let' declarations cannot be computed properties}}
+  let fullName: String { get }  // expected-error {{'let' declarations cannot be computed properties}} {{3-6=var}}
   
   // <rdar://problem/17200672> Let in protocol causes unclear errors and crashes
-  let fullName2: String  // expected-error {{immutable property requirement must be declared as 'var' with a '{ get }' specifier}}
+  let fullName2: String  // expected-error {{immutable property requirement must be declared as 'var' with a '{ get }' specifier}} {{3-6=var}} {{24-24= { get \}}}
 
   // <rdar://problem/16789886> Assert on protocol property requirement without a type
-  var propertyWithoutType { get } // expected-error {{type annotation missing in pattern}} expected-error {{computed property must have an explicit type}}
+  var propertyWithoutType { get } // expected-error {{type annotation missing in pattern}}
+  // expected-error@-1 {{computed property must have an explicit type}} {{26-26=: <# Type #>}}
 }
 
 // rdar://problem/18168866
 protocol FirstProtocol {
-    weak var delegate : SecondProtocol? { get } // expected-error{{'weak' may only be applied to class and class-bound protocol types, not 'SecondProtocol'}}
+    // expected-warning@+1 {{'weak' should not be applied to a property declaration in a protocol and will be disallowed in future versions}}
+    weak var delegate : SecondProtocol? { get } // expected-error{{'weak' must not be applied to non-class-bound 'SecondProtocol'; consider adding a protocol conformance that has a class bound}}
 }
 
 protocol SecondProtocol {
@@ -460,7 +489,17 @@ class C3 : P1 {} // expected-error{{type 'C3' does not conform to protocol 'P1'}
 func h<T : C3>(_ x : T) {
   _ = x as P1 // expected-error{{protocol 'P1' can only be used as a generic constraint because it has Self or associated type requirements}}
 }
-
+func i<T : C3>(_ x : T?) -> Bool {
+  return x is P1 // expected-error{{protocol 'P1' can only be used as a generic constraint because it has Self or associated type requirements}}
+  // FIXME: Bogus diagnostic.  See SR-11920.
+  // expected-warning@-2 {{checking a value with optional type 'T?' against dynamic type 'P1' succeeds whenever the value is non-nil; did you mean to use '!= nil'?}}
+}
+func j(_ x : C1) -> Bool {
+  return x is P1 // expected-error{{protocol 'P1' can only be used as a generic constraint because it has Self or associated type requirements}}
+}
+func k(_ x : C1?) -> Bool {
+  return x is P1 // expected-error{{protocol 'P1' can only be used as a generic constraint because it has Self or associated type requirements}}
+}
 
 
 protocol P4 {
@@ -469,4 +508,84 @@ protocol P4 {
 
 class C4 : P4 { // expected-error {{type 'C4' does not conform to protocol 'P4'}}
   associatedtype T = Int  // expected-error {{associated types can only be defined in a protocol; define a type or introduce a 'typealias' to satisfy an associated type requirement}} {{3-17=typealias}}
+}
+
+// <rdar://problem/25185722> Crash with invalid 'let' property in protocol
+protocol LetThereBeCrash {
+  let x: Int
+  // expected-error@-1 {{immutable property requirement must be declared as 'var' with a '{ get }' specifier}} {{13-13= { get \}}}
+  // expected-note@-2 {{declared here}}
+}
+
+extension LetThereBeCrash {
+  init() { x = 1 }
+  // expected-error@-1 {{'let' property 'x' may not be initialized directly; use "self.init(...)" or "self = ..." instead}}
+}
+
+// SR-11412
+// Offer fix-it to conform type of context to the missing protocols
+
+protocol SR_11412_P1 {}
+protocol SR_11412_P2 {}
+protocol SR_11412_P3 {}
+protocol SR_11412_P4: AnyObject {}
+
+class SR_11412_C0 {
+  var foo1: SR_11412_P1?
+  var foo2: (SR_11412_P1 & SR_11412_P2)?
+  weak var foo3: SR_11412_P4?
+}
+
+// Context has no inherited types and does not conform to protocol //
+
+class SR_11412_C1 {
+  let c0 = SR_11412_C0()
+
+  func conform() {
+    c0.foo1 = self // expected-error {{cannot assign value of type 'SR_11412_C1' to type 'SR_11412_P1?'}}
+    // expected-note@-1 {{add missing conformance to 'SR_11412_P1' to class 'SR_11412_C1'}}{{18-18=: SR_11412_P1}}
+  }
+}
+
+// Context has no inherited types and does not conform to protocol composition //
+
+class SR_11412_C2 {
+  let c0 = SR_11412_C0()
+
+  func conform() {
+    c0.foo2 = self // expected-error {{cannot assign value of type 'SR_11412_C2' to type '(SR_11412_P1 & SR_11412_P2)?'}}
+    // expected-note@-1 {{add missing conformance to 'SR_11412_P1 & SR_11412_P2' to class 'SR_11412_C2'}}{{18-18=: SR_11412_P1 & SR_11412_P2}}
+  }
+}
+
+// Context already has an inherited type, but does not conform to protocol //
+
+class SR_11412_C3: SR_11412_P3 {
+  let c0 = SR_11412_C0()
+
+  func conform() {
+    c0.foo1 = self // expected-error {{cannot assign value of type 'SR_11412_C3' to type 'SR_11412_P1?'}}
+    // expected-note@-1 {{add missing conformance to 'SR_11412_P1' to class 'SR_11412_C3'}}{{31-31=, SR_11412_P1}}
+  }
+}
+
+// Context conforms to only one protocol in the protocol composition //
+
+class SR_11412_C4: SR_11412_P1 {
+  let c0 = SR_11412_C0()
+
+  func conform() {
+    c0.foo2 = self // expected-error {{cannot assign value of type 'SR_11412_C4' to type '(SR_11412_P1 & SR_11412_P2)?'}}
+    // expected-note@-1 {{add missing conformance to 'SR_11412_P1 & SR_11412_P2' to class 'SR_11412_C4'}}{{31-31=, SR_11412_P2}}
+  }
+}
+
+// Context is a value type, but protocol requires class //
+
+struct SR_11412_S0 {
+  let c0 = SR_11412_C0()
+
+  func conform() {
+    c0.foo3 = self // expected-error {{cannot assign value of type 'SR_11412_S0' to type 'SR_11412_P4?'}}
+  }
 }

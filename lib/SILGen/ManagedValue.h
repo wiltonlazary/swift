@@ -31,6 +31,7 @@ enum class CastConsumptionKind : unsigned char;
 
 namespace Lowering {
 
+class Initialization;
 class SILGenFunction;
 
 /// ManagedValue - represents a singular SIL value and an optional cleanup.
@@ -76,6 +77,10 @@ public:
   ManagedValue(SILValue value, CleanupHandle cleanup)
     : valueAndFlag(value, false), cleanup(cleanup) {
     assert(value && "No value specified?!");
+    assert((!getType().isObject() ||
+            value.getOwnershipKind() != ValueOwnershipKind::None ||
+            !hasCleanup()) &&
+           "Objects with trivial ownership should never have a cleanup");
   }
 
   /// Create a managed value for a +0 rvalue.
@@ -93,7 +98,7 @@ public:
     assert(value && "No value specified");
     assert(value->getType().isObject() &&
            "Expected borrowed rvalues to be objects");
-    assert(value.getOwnershipKind() != ValueOwnershipKind::Trivial);
+    assert(value.getOwnershipKind() != ValueOwnershipKind::None);
     return ManagedValue(value, false, cleanup);
   }
 
@@ -104,8 +109,8 @@ public:
                                             CleanupHandle cleanup) {
     assert(value && "No value specified");
     assert(value->getType().isAddress() && "Expected value to be an address");
-    assert(value.getOwnershipKind() == ValueOwnershipKind::Trivial &&
-           "Addresses always have trivial ownership");
+    assert(value.getOwnershipKind() == ValueOwnershipKind::None &&
+           "Addresses always have any ownership");
     return ManagedValue(value, false, cleanup);
   }
 
@@ -122,7 +127,7 @@ public:
     assert(value && "No value specified");
     assert(value->getType().isObject() &&
            "Expected borrowed rvalues to be objects");
-    assert(value.getOwnershipKind() != ValueOwnershipKind::Trivial);
+    assert(value.getOwnershipKind() != ValueOwnershipKind::None);
     return ManagedValue(value, false, CleanupHandle::invalid());
   }
 
@@ -131,7 +136,7 @@ public:
   forBorrowedAddressRValue(SILValue value) {
     assert(value && "No value specified");
     assert(value->getType().isAddress() && "Expected value to be an address");
-    assert(value.getOwnershipKind() == ValueOwnershipKind::Trivial &&
+    assert(value.getOwnershipKind() == ValueOwnershipKind::None &&
            "Addresses always have trivial ownership");
     return ManagedValue(value, false, CleanupHandle::invalid());
   }
@@ -147,14 +152,14 @@ public:
   /// Create a managed value for a +0 trivial object rvalue.
   static ManagedValue forTrivialObjectRValue(SILValue value) {
     assert(value->getType().isObject() && "Expected an object");
-    assert(value.getOwnershipKind() == ValueOwnershipKind::Trivial);
+    assert(value.getOwnershipKind() == ValueOwnershipKind::None);
     return ManagedValue(value, false, CleanupHandle::invalid());
   }
 
   /// Create a managed value for a +0 trivial address rvalue.
   static ManagedValue forTrivialAddressRValue(SILValue value) {
     assert(value->getType().isAddress() && "Expected an address");
-    assert(value.getOwnershipKind() == ValueOwnershipKind::Trivial);
+    assert(value.getOwnershipKind() == ValueOwnershipKind::None);
     return ManagedValue(value, false, CleanupHandle::invalid());
   }
 
@@ -196,7 +201,33 @@ public:
     // either +0 or trivial (in which case +0 vs +1 doesn't matter).
     return !hasCleanup();
   }
-  
+
+  /// Returns true if this is an managed value that can be used safely as a +1
+  /// managed value.
+  ///
+  /// This returns true iff:
+  ///
+  /// 1. All sub-values are trivially typed.
+  /// 2. There exists at least one non-trivial typed sub-value and all such
+  /// sub-values all have cleanups.
+  ///
+  /// *NOTE* Due to 1. isPlusOne and isPlusZero both return true for managed
+  /// values consisting of only trivial values.
+  bool isPlusOne(SILGenFunction &SGF) const;
+
+  /// Returns true if this is an ManagedValue that can be used safely as a +0
+  /// ManagedValue.
+  ///
+  /// Specifically, we return true if:
+  ///
+  /// 1. All sub-values are trivially typed.
+  /// 2. At least 1 subvalue is non-trivial and all such non-trivial values do
+  /// not have a cleanup.
+  ///
+  /// *NOTE* Due to 1. isPlusOne and isPlusZero both return true for
+  /// ManagedValues consisting of only trivial values.
+  bool isPlusZero() const;
+
   SILValue getLValueAddress() const {
     assert(isLValue() && "This isn't an lvalue");
     return getValue();
@@ -231,23 +262,19 @@ public:
   }
 
   /// Emit a copy of this value with independent ownership.
-  ManagedValue copy(SILGenFunction &gen, SILLocation loc);
+  ManagedValue copy(SILGenFunction &SGF, SILLocation loc) const;
 
   /// Emit a copy of this value with independent ownership into the current
   /// formal evaluation scope.
-  ManagedValue formalAccessCopy(SILGenFunction &gen, SILLocation loc);
-
-  /// Store a copy of this value with independent ownership into the given
-  /// uninitialized address.
-  void copyInto(SILGenFunction &gen, SILValue dest, SILLocation loc);
+  ManagedValue formalAccessCopy(SILGenFunction &SGF, SILLocation loc);
 
   /// This is the same operation as 'copy', but works on +0 values that don't
   /// have cleanups.  It returns a +1 value with one.
-  ManagedValue copyUnmanaged(SILGenFunction &gen, SILLocation loc);
+  ManagedValue copyUnmanaged(SILGenFunction &SGF, SILLocation loc);
 
   /// This is the same operation as 'formalAccessCopy', but works on +0 values
   /// that don't have cleanups.  It returns a +1 value with one.
-  ManagedValue formalAccessCopyUnmanaged(SILGenFunction &gen, SILLocation loc);
+  ManagedValue formalAccessCopyUnmanaged(SILGenFunction &SGF, SILLocation loc);
 
   bool hasCleanup() const { return cleanup.isValid(); }
   CleanupHandle getCleanup() const { return cleanup; }
@@ -257,41 +284,68 @@ public:
   /// An l-value is borrowed as itself.  A +1 r-value is borrowed as a
   /// +0 r-value, with the assumption that the original ManagedValue
   /// will not be forwarded until the borrowed value is fully used.
-  ManagedValue borrow(SILGenFunction &gen, SILLocation loc) const;
+  ManagedValue borrow(SILGenFunction &SGF, SILLocation loc) const;
 
   /// Return a formally evaluated "borrowed" version of this value.
-  ManagedValue formalAccessBorrow(SILGenFunction &gen, SILLocation loc) const;
+  ManagedValue formalAccessBorrow(SILGenFunction &SGF, SILLocation loc) const;
 
   ManagedValue unmanagedBorrow() const {
     return isLValue() ? *this : ManagedValue::forUnmanaged(getValue());
   }
 
+  /// If this managed value is a plus one value, return *this. If this is a plus
+  /// zero value, return a copy instead.
+  ManagedValue ensurePlusOne(SILGenFunction &SGF, SILLocation loc) const;
+
+  /// Given a scalar value, materialize it into memory with the
+  /// exact same level of cleanup it had before.
+  ManagedValue materialize(SILGenFunction &SGF, SILLocation loc) const;
+
   /// Disable the cleanup for this value.
-  void forwardCleanup(SILGenFunction &gen) const;
+  void forwardCleanup(SILGenFunction &SGF) const;
   
   /// Forward this value, deactivating the cleanup and returning the
   /// underlying value.
-  SILValue forward(SILGenFunction &gen) const;
+  SILValue forward(SILGenFunction &SGF) const;
   
   /// Forward this value into memory by storing it to the given address.
   ///
-  /// \param gen - The SILGenFunction.
+  /// \param SGF - The SILGenFunction.
   /// \param loc - the AST location to associate with emitted instructions.
   /// \param address - the address to assign to.
-  void forwardInto(SILGenFunction &gen, SILLocation loc, SILValue address);
+  void forwardInto(SILGenFunction &SGF, SILLocation loc, SILValue address);
+
+  /// Forward this value into the given initialization.
+  ///
+  /// \param SGF - The SILGenFunction.
+  /// \param loc - the AST location to associate with emitted instructions.
+  /// \param dest - the destination to forward into
+  void forwardInto(SILGenFunction &SGF, SILLocation loc, Initialization *dest);
   
   /// Assign this value into memory, destroying the existing
   /// value at the destination address.
   ///
-  /// \param gen - The SILGenFunction.
+  /// \param SGF - The SILGenFunction.
   /// \param loc - the AST location to associate with emitted instructions.
   /// \param address - the address to assign to.
-  void assignInto(SILGenFunction &gen, SILLocation loc, SILValue address);
-  
+  void assignInto(SILGenFunction &SGF, SILLocation loc, SILValue address);
+
+  /// Store a copy of this value with independent ownership into the given
+  /// uninitialized address.
+  void copyInto(SILGenFunction &SGF, SILLocation loc, SILValue dest);
+
+  /// Store a copy of this value with independent ownership into the given
+  /// initialization \p dest.
+  void copyInto(SILGenFunction &SGF, SILLocation loc, Initialization *dest);
+
   explicit operator bool() const {
     // "InContext" is not considered false.
     return bool(getValue()) || valueAndFlag.getInt();
   }
+
+  void dump() const;
+  void dump(raw_ostream &os, unsigned indent = 0) const;
+  void print(raw_ostream &os) const;
 };
 
 /// A ManagedValue which may not be intended to be consumed.
@@ -317,7 +371,14 @@ public:
   /// Create a CMV with a specific value and consumption rule.
   /*implicit*/ ConsumableManagedValue(ManagedValue value,
                                       CastConsumptionKind finalConsumption)
-    : Value(value), FinalConsumption(finalConsumption) {}
+      : Value(value), FinalConsumption(finalConsumption) {
+    assert((value.getType().isObject() ||
+            finalConsumption != CastConsumptionKind::BorrowAlways) &&
+           "Can not borrow always a value");
+    assert((value.getType().isAddress() ||
+            finalConsumption != CastConsumptionKind::CopyOnSuccess) &&
+           "Can not copy on success a value.");
+  }
 
   /// Create a CMV for a value of trivial type.
   static ConsumableManagedValue forUnmanaged(SILValue value) {
@@ -344,6 +405,9 @@ public:
 
   SILType getType() const { return Value.getType(); }
   SILValue getValue() const { return Value.getValue(); }
+  ValueOwnershipKind getOwnershipKind() const {
+    return Value.getOwnershipKind();
+  }
 
   /// Return a managed value appropriate for the final use of this CMV.
   ManagedValue getFinalManagedValue() const { return Value; }
@@ -362,8 +426,18 @@ public:
 
   /// Return a managed value that's appropriate for borrowing this
   /// value and promising not to consume it.
-  ConsumableManagedValue asBorrowedOperand() const {
-    return { asUnmanagedValue(), CastConsumptionKind::CopyOnSuccess };
+  ConsumableManagedValue asBorrowedOperand(SILGenFunction &SGF,
+                                           SILLocation loc) const {
+    if (getType().isAddress())
+      return {asUnmanagedValue(), CastConsumptionKind::CopyOnSuccess};
+    return {asUnmanagedValue().borrow(SGF, loc),
+            CastConsumptionKind::BorrowAlways};
+  }
+
+  /// Return a managed value that's appropriate for copying this value and
+  /// always consuming it.
+  ConsumableManagedValue copy(SILGenFunction &SGF, SILLocation loc) const {
+    return ConsumableManagedValue::forOwned(asUnmanagedValue().copy(SGF, loc));
   }
 };
 

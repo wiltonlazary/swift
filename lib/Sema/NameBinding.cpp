@@ -14,20 +14,23 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "swift/Subsystems.h"
-#include "swift/AST/NameLookup.h"
-#include "swift/AST/AST.h"
-#include "swift/AST/DiagnosticsSema.h"
 #include "swift/AST/ASTWalker.h"
+#include "swift/AST/DiagnosticsSema.h"
 #include "swift/AST/ModuleLoader.h"
-#include "swift/Parse/Parser.h"
+#include "swift/AST/ModuleNameLookup.h"
+#include "swift/AST/NameLookup.h"
+#include "swift/AST/SourceFile.h"
+#include "swift/AST/SubstitutionMap.h"
+#include "swift/Basic/Statistic.h"
 #include "swift/ClangImporter/ClangModule.h"
+#include "swift/Parse/Parser.h"
+#include "swift/Subsystems.h"
 #include "clang/Basic/Module.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/TinyPtrVector.h"
 #include "llvm/ADT/Twine.h"
-#include "llvm/Support/SaveAndRestore.h"
 #include "llvm/Support/Path.h"
+#include "llvm/Support/SaveAndRestore.h"
 #include <algorithm>
 #include <system_error>
 using namespace swift;
@@ -51,10 +54,9 @@ namespace {
     InFlightDiagnostic diagnose(ArgTypes &&...Args) {
       return Context.Diags.diagnose(std::forward<ArgTypes>(Args)...);
     }
-    
-    void addImport(
-        SmallVectorImpl<std::pair<ImportedModule, ImportOptions>> &imports,
-        ImportDecl *ID);
+
+    void addImport(SmallVectorImpl<SourceFile::ImportedModuleDesc> &imports,
+                   ImportDecl *ID);
 
     /// Load a module referenced by an import statement.
     ///
@@ -116,6 +118,23 @@ static bool isCompatibleImportKind(ImportKind expected, ImportKind actual) {
   llvm_unreachable("Unhandled ImportKind in switch.");
 }
 
+static bool isNominalImportKind(ImportKind kind) {
+  switch (kind) {
+  case ImportKind::Module:
+    llvm_unreachable("module imports do not bring in decls");
+  case ImportKind::Struct:
+  case ImportKind::Class:
+  case ImportKind::Enum:
+  case ImportKind::Protocol:
+    return true;
+  case ImportKind::Type:
+  case ImportKind::Var:
+  case ImportKind::Func:
+    return false;
+  }
+  llvm_unreachable("unhandled kind");
+}
+
 static const char *getImportKindString(ImportKind kind) {
   switch (kind) {
   case ImportKind::Module:
@@ -150,8 +169,7 @@ static bool shouldImportSelfImportClang(const ImportDecl *ID,
 }
 
 void NameBinder::addImport(
-    SmallVectorImpl<std::pair<ImportedModule, ImportOptions>> &imports,
-    ImportDecl *ID) {
+    SmallVectorImpl<SourceFile::ImportedModuleDesc> &imports, ImportDecl *ID) {
   if (ID->getModulePath().front().first == SF.getParentModule()->getName() &&
       ID->getModulePath().size() == 1 && !shouldImportSelfImportClang(ID, SF)) {
     // If the imported module name is the same as the current module,
@@ -198,15 +216,49 @@ void NameBinder::addImport(
     // If we imported a submodule, import the top-level module as well.
     Identifier topLevelName = ID->getModulePath().front().first;
     topLevelModule = Context.getLoadedModule(topLevelName);
-    assert(topLevelModule && "top-level module missing");
+    if (!topLevelModule) {
+      // Clang can sometimes import top-level modules as if they were
+      // submodules.
+      assert(!M->getFiles().empty() &&
+             isa<ClangModuleUnit>(M->getFiles().front()));
+      topLevelModule = M;
+    } else if (topLevelModule == SF.getParentModule()) {
+      // This can happen when compiling a mixed-source framework (or overlay)
+      // that imports a submodule of its C part.
+      topLevelModule = nullptr;
+    }
   }
 
   auto *testableAttr = ID->getAttrs().getAttribute<TestableAttr>();
-  if (testableAttr && !topLevelModule->isTestingEnabled() &&
+  if (testableAttr && topLevelModule &&
+      !topLevelModule->isTestingEnabled() &&
+      !topLevelModule->isNonSwiftModule() &&
       Context.LangOpts.EnableTestableAttrRequiresTestableModule) {
     diagnose(ID->getModulePath().front().second, diag::module_not_testable,
-             topLevelModule->getName());
+             ID->getModulePath().front().first);
     testableAttr->setInvalid();
+  }
+
+  auto *privateImportAttr = ID->getAttrs().getAttribute<PrivateImportAttr>();
+  StringRef privateImportFileName;
+  if (privateImportAttr) {
+    if (!topLevelModule || !topLevelModule->arePrivateImportsEnabled()) {
+      diagnose(ID->getModulePath().front().second,
+               diag::module_not_compiled_for_private_import,
+               ID->getModulePath().front().first);
+      privateImportAttr->setInvalid();
+    } else {
+      privateImportFileName = privateImportAttr->getSourceFile();
+    }
+  }
+
+  if (SF.getParentModule()->isResilient() && topLevelModule &&
+      !topLevelModule->isResilient() &&
+      !topLevelModule->isNonSwiftModule() &&
+      !ID->getAttrs().hasAttribute<ImplementationOnlyAttr>()) {
+    diagnose(ID->getModulePath().front().second,
+             diag::module_not_compiled_with_library_evolution,
+             topLevelModule->getName(), SF.getParentModule()->getName());
   }
 
   ImportOptions options;
@@ -214,10 +266,27 @@ void NameBinder::addImport(
     options |= SourceFile::ImportFlags::Exported;
   if (testableAttr)
     options |= SourceFile::ImportFlags::Testable;
-  imports.push_back({ { ID->getDeclPath(), M }, options });
+  if (privateImportAttr)
+    options |= SourceFile::ImportFlags::PrivateImport;
 
-  if (topLevelModule != M)
-    imports.push_back({ { ID->getDeclPath(), topLevelModule }, options });
+  auto *implementationOnlyAttr =
+      ID->getAttrs().getAttribute<ImplementationOnlyAttr>();
+  if (implementationOnlyAttr) {
+    if (options.contains(SourceFile::ImportFlags::Exported)) {
+      diagnose(ID, diag::import_implementation_cannot_be_exported,
+               topLevelModule->getName())
+        .fixItRemove(implementationOnlyAttr->getRangeWithAt());
+    } else {
+      options |= SourceFile::ImportFlags::ImplementationOnly;
+    }
+  }
+
+  imports.push_back(SourceFile::ImportedModuleDesc(
+      {ID->getDeclPath(), M}, options, privateImportFileName));
+
+  if (topLevelModule && topLevelModule != M)
+    imports.push_back(SourceFile::ImportedModuleDesc(
+        {ID->getDeclPath(), topLevelModule}, options, privateImportFileName));
 
   if (ID->getImportKind() != ImportKind::Module) {
     // If we're importing a specific decl, validate the import kind.
@@ -227,9 +296,9 @@ void NameBinder::addImport(
     // FIXME: Doesn't handle scoped testable imports correctly.
     assert(declPath.size() == 1 && "can't handle sub-decl imports");
     SmallVector<ValueDecl *, 8> decls;
-    lookupInModule(topLevelModule, declPath, declPath.front().first, decls,
+    lookupInModule(topLevelModule, declPath.front().first, decls,
                    NLKind::QualifiedLookup, ResolutionKind::Overloadable,
-                   /*resolver*/nullptr, &SF);
+                   &SF);
 
     if (decls.empty()) {
       diagnose(ID, diag::decl_does_not_exist_in_module,
@@ -252,12 +321,31 @@ void NameBinder::addImport(
         diagnose(next, diag::found_candidate);
 
     } else if (!isCompatibleImportKind(ID->getImportKind(), *actualKind)) {
-      diagnose(ID, diag::imported_decl_is_wrong_kind,
-               declPath.front().first,
-               getImportKindString(ID->getImportKind()),
-               static_cast<unsigned>(*actualKind))
-        .fixItReplace(SourceRange(ID->getKindLoc()),
-                      getImportKindString(*actualKind));
+      Optional<InFlightDiagnostic> emittedDiag;
+      if (*actualKind == ImportKind::Type &&
+          isNominalImportKind(ID->getImportKind())) {
+        assert(decls.size() == 1 &&
+               "if we start suggesting ImportKind::Type for, e.g., a mix of "
+               "structs and classes, we'll need a different message here");
+        assert(isa<TypeAliasDecl>(decls.front()) &&
+               "ImportKind::Type is only the best choice for a typealias");
+        auto *typealias = cast<TypeAliasDecl>(decls.front());
+        emittedDiag.emplace(diagnose(ID,
+            diag::imported_decl_is_wrong_kind_typealias,
+            typealias->getDescriptiveKind(),
+            TypeAliasType::get(typealias, Type(), SubstitutionMap(),
+                                typealias->getUnderlyingType()),
+            getImportKindString(ID->getImportKind())));
+      } else {
+        emittedDiag.emplace(diagnose(ID, diag::imported_decl_is_wrong_kind,
+            declPath.front().first,
+            getImportKindString(ID->getImportKind()),
+            static_cast<unsigned>(*actualKind)));
+      }
+
+      emittedDiag->fixItReplace(SourceRange(ID->getKindLoc()),
+                                getImportKindString(*actualKind));
+      emittedDiag->flush();
 
       if (decls.size() == 1)
         diagnose(decls.front(), diag::decl_declared_here,
@@ -305,10 +393,13 @@ static void insertPrecedenceGroupDecl(NameBinder &binder, SourceFile &SF,
 /// performNameBinding - Once parsing is complete, this walks the AST to
 /// resolve names and do other top-level validation.
 ///
-/// At this parsing has been performed, but we still have UnresolvedDeclRefExpr
-/// nodes for unresolved value names, and we may have unresolved type names as
-/// well.  This handles import directives and forward references.
+/// At this point parsing has been performed, but we still have
+/// UnresolvedDeclRefExpr nodes for unresolved value names, and we may have
+/// unresolved type names as well. This handles import directives and forward
+/// references.
 void swift::performNameBinding(SourceFile &SF, unsigned StartElem) {
+  FrontendStatsTracer tracer(SF.getASTContext().Stats, "Name binding");
+
   // Make sure we skip adding the standard library imports if the
   // source file is empty.
   if (SF.ASTStage == SourceFile::NameBound || SF.Decls.empty()) {
@@ -322,12 +413,12 @@ void swift::performNameBinding(SourceFile &SF, unsigned StartElem) {
 
   NameBinder Binder(SF);
 
-  SmallVector<std::pair<ImportedModule, ImportOptions>, 8> ImportedModules;
+  SmallVector<SourceFile::ImportedModuleDesc, 8> ImportedModules;
 
   // Do a prepass over the declarations to find and load the imported modules
   // and map operator decls.
   for (auto D : llvm::makeArrayRef(SF.Decls).slice(StartElem)) {
-    if (ImportDecl *ID = dyn_cast<ImportDecl>(D)) {
+    if (auto *ID = dyn_cast<ImportDecl>(D)) {
       Binder.addImport(ImportedModules, ID);
     } else if (auto *OD = dyn_cast<PrefixOperatorDecl>(D)) {
       insertOperatorDecl(Binder, SF.PrefixOperators, OD);

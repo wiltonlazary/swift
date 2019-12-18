@@ -14,26 +14,33 @@ func takesVariadicInt(_: (Int...) -> ()) { }
 func takesVariadicIntInt(_: (Int, Int...) -> ()) { }
 
 func takesVariadicGeneric<T>(_ f: (T...) -> ()) { }
-// expected-note@-1 {{in call to function 'takesVariadicGeneric'}}
 
 func variadic() {
   // These work
-  takesVariadicInt({let _ = $0})
-  takesVariadicInt({let _: [Int] = $0})
-  let _: (Int...) -> () = {let _: [Int] = $0}
 
-  // FIXME: Make the rest work
+  // FIXME: Not anymore: rdar://41416758
+  takesVariadicInt({let _ = $0})
+  // expected-error@-1 {{cannot convert value of type '(_) -> ()' to expected argument type '(Int...) -> ()'}}
+  takesVariadicInt({let _: [Int] = $0})
+  // expected-error@-1 {{cannot convert value of type '(_) -> ()' to expected argument type '(Int...) -> ()'}}
+
+  let _: (Int...) -> () = {let _: [Int] = $0}
+  // expected-error@-1 {{cannot convert value of type '(_) -> ()' to specified type '(Int...) -> ()'}}
+
   takesVariadicInt({takesIntArray($0)})
-  // expected-error@-1 {{cannot convert value of type '([Int]) -> ()' to expected argument type '(Int...) -> ()'}}
+  // expected-error@-1 {{cannot pass array of type '[Int]' as variadic arguments of type 'Int'}}
 
   let _: (Int...) -> () = {takesIntArray($0)}
-  // expected-error@-1 {{cannot convert value of type '([Int]) -> ()' to specified type '(Int...) -> ()'}}
+  // expected-error@-1 {{cannot pass array of type '[Int]' as variadic arguments of type 'Int'}}
 
   takesVariadicGeneric({takesIntArray($0)})
-  // expected-error@-1 {{cannot convert value of type '[_]' to expected argument type '[Int]'}}
+  // expected-error@-1 {{cannot pass array of type '[Int]' as variadic arguments of type 'Int'}}
+
+  // FIXME(diagnostics): Problems here are related to multi-statement closure bodies not being type-checked together with
+  // enclosing context.
 
   takesVariadicGeneric({let _: [Int] = $0})
-  // expected-error@-1 {{generic parameter 'T' could not be inferred}}
+  // expected-error@-1 {{cannot convert value of type '(_) -> ()' to expected argument type '(_...) -> ()'}}
 
   takesVariadicIntInt({_ = $0; takesIntArray($1)})
   // expected-error@-1 {{cannot convert value of type '(_, _) -> ()' to expected argument type '(Int, Int...) -> ()'}}

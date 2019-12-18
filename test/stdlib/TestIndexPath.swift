@@ -222,13 +222,25 @@ class TestIndexPath: TestIndexPathSuper {
     }
     
     func testHashing() {
-        let ip1: IndexPath = [5, 1]
-        let ip2: IndexPath = [1, 1, 1]
-        
-        expectNotEqual(ip1.hashValue, ip2.hashValue)
-        
-        let nsip1 = ip1._bridgeToObjectiveC()
-        expectEqual(nsip1.hash, ip1.hashValue)
+        guard #available(macOS 10.15, iOS 13, watchOS 6, tvOS 13, *) else { return }
+        let samples: [IndexPath] = [
+            [],
+            [1],
+            [2],
+            [Int.max],
+            [1, 1],
+            [2, 1],
+            [1, 2],
+            [1, 1, 1],
+            [2, 1, 1],
+            [1, 2, 1],
+            [1, 1, 2],
+            [Int.max, Int.max, Int.max],
+        ]
+        checkHashable(samples, equalityOracle: { $0 == $1 })
+
+        // this should not cause an overflow crash
+        _ = IndexPath(indexes: [Int.max >> 8, 2, Int.max >> 36]).hashValue 
     }
     
     func testEquality() {
@@ -708,6 +720,27 @@ class TestIndexPath: TestIndexPathSuper {
         expectNotEqual(anyHashables[0], anyHashables[1])
         expectEqual(anyHashables[1], anyHashables[2])
     }
+
+    func test_unconditionallyBridgeFromObjectiveC() {
+        expectEqual(IndexPath(), IndexPath._unconditionallyBridgeFromObjectiveC(nil))
+    }
+
+    func test_slice_1ary() {
+        let indexPath: IndexPath = [0]
+        let res = indexPath.dropFirst()
+        expectEqual(0, res.count)
+
+        let slice = indexPath[1..<1]
+        expectEqual(0, slice.count)
+    }
+
+    func test_dropFirst() {
+        var pth = IndexPath(indexes:[1,2,3,4])
+        while !pth.isEmpty {
+            // this should not crash 
+            pth = pth.dropFirst()
+        }
+    }
 }
 
 #if !FOUNDATION_XCTEST
@@ -758,5 +791,8 @@ IndexPathTests.test("testUnconditionalBridgeFromObjC") { TestIndexPath().testUnc
 IndexPathTests.test("testObjcBridgeType") { TestIndexPath().testObjcBridgeType() }
 IndexPathTests.test("test_AnyHashableContainingIndexPath") { TestIndexPath().test_AnyHashableContainingIndexPath() }
 IndexPathTests.test("test_AnyHashableCreatedFromNSIndexPath") { TestIndexPath().test_AnyHashableCreatedFromNSIndexPath() }
+IndexPathTests.test("test_unconditionallyBridgeFromObjectiveC") { TestIndexPath().test_unconditionallyBridgeFromObjectiveC() }
+IndexPathTests.test("test_slice_1ary") { TestIndexPath().test_slice_1ary() }
+IndexPathTests.test("test_dropFirst") { TestIndexPath().test_dropFirst() }
 runAllTests()
 #endif

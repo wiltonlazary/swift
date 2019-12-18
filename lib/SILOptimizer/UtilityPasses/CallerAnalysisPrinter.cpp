@@ -14,11 +14,11 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "swift/SILOptimizer/Analysis/CallerAnalysis.h"
-#include "swift/Basic/DemangleWrappers.h"
 #include "swift/SIL/SILFunction.h"
 #include "swift/SIL/SILModule.h"
+#include "swift/SILOptimizer/Analysis/CallerAnalysis.h"
 #include "swift/SILOptimizer/PassManager/Transforms.h"
+#include "llvm/Support/YAMLTraits.h"
 #include "llvm/Support/raw_ostream.h"
 
 using namespace swift;
@@ -27,20 +27,15 @@ using namespace swift;
 
 namespace {
 
+/// A pass that dumps the caller analysis state in yaml form. Intended to allow
+/// for visualizing of the caller analysis via external data visualization and
+/// analysis programs.
 class CallerAnalysisPrinterPass : public SILModuleTransform {
   /// The entry point to the transformation.
   void run() override {
     auto *CA = getAnalysis<CallerAnalysis>();
-    for (auto &F : *getModule()) {
-      const CallerAnalysis::FunctionInfo &FI = CA->getCallerInfo(&F);
-      const char *hasCaller = FI.hasCaller() ? "true" : "false";
-      llvm::outs() << "Function " << F.getName() << " has caller: "
-                   << hasCaller << ", partial applied args = "
-                   << FI.getMinPartialAppliedArgs() << "\n";
-    }
+    CA->print(llvm::outs());
   }
-
-  StringRef getName() override { return "Caller Analysis Printer"; }
 };
 
 } // end anonymous namespace

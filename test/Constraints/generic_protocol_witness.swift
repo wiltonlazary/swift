@@ -42,7 +42,7 @@ class TooTightConstraints : NeedsGenericMethods { // expected-error{{type 'TooTi
   func oneArgWithConstraint<U : Fungible>(x: U) {} // expected-note{{candidate has non-matching type '<U> (x: U) -> ()'}}
   func oneArgWithConstraints<U : Runcible & Fungible & Ansible>(x: U) {} // expected-note{{candidate has non-matching type '<U> (x: U) -> ()'}}
 
-  func twoArgsOneVar<U : Runcible>(x: U) {} // expected-note{{candidate has non-matching type '<U> (x: U) -> ()'}}
+  func twoArgsOneVar<U : Runcible>(x: U) {}
   func twoArgsTwoVars<U>(x: U, y: U) {} // expected-note{{candidate has non-matching type '<U> (x: U, y: U) -> ()'}}
 }
 func •(_ x: TooTightConstraints, y: Int) {} // expected-note {{candidate has non-matching type '(TooTightConstraints, Int) -> ()'}}
@@ -59,5 +59,5 @@ func usesAGenericMethod<U : NeedsAGenericMethod>(_ x: U) {
 struct L<T>: Sequence {} // expected-error {{type 'L<T>' does not conform to protocol 'Sequence'}}
 
 func z(_ x: L<Int>) {
-  for xx in x {}
+  for xx in x {} // expected-warning {{immutable value 'xx' was never used; consider replacing with '_' or removing it}}
 }

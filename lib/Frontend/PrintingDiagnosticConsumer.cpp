@@ -2,7 +2,7 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2019 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
 // See https://swift.org/LICENSE.txt for license information
@@ -17,6 +17,8 @@
 #include "swift/Frontend/PrintingDiagnosticConsumer.h"
 #include "swift/Basic/LLVM.h"
 #include "swift/Basic/SourceManager.h"
+#include "swift/AST/DiagnosticEngine.h"
+#include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/Twine.h"
 #include "llvm/Support/MemoryBuffer.h"
@@ -61,34 +63,48 @@ namespace {
   };
 } // end anonymous namespace
 
-llvm::SMLoc DiagnosticConsumer::getRawLoc(SourceLoc loc) {
-  return loc.Value;
+void PrintingDiagnosticConsumer::handleDiagnostic(SourceManager &SM,
+                                                  const DiagnosticInfo &Info) {
+  if (Info.IsChildNote)
+    return;
+
+  printDiagnostic(SM, Info);
+  for (auto path : Info.EducationalNotePaths) {
+    if (auto buffer = SM.getFileSystem()->getBufferForFile(path))
+      Stream << buffer->get()->getBuffer() << "\n";
+  }
+
+  for (auto ChildInfo : Info.ChildDiagnosticInfo) {
+    printDiagnostic(SM, *ChildInfo);
+  }
 }
 
-void
-PrintingDiagnosticConsumer::handleDiagnostic(SourceManager &SM, SourceLoc Loc,
-                                             DiagnosticKind Kind, 
-                                             StringRef Text,
-                                             const DiagnosticInfo &Info) {
+void PrintingDiagnosticConsumer::printDiagnostic(SourceManager &SM,
+                                                 const DiagnosticInfo &Info) {
+
   // Determine what kind of diagnostic we're emitting.
   llvm::SourceMgr::DiagKind SMKind;
-  switch (Kind) {
-    case DiagnosticKind::Error:
-      SMKind = llvm::SourceMgr::DK_Error;
-      break;
-    case DiagnosticKind::Warning: 
-      SMKind = llvm::SourceMgr::DK_Warning; 
-      break;
-      
-    case DiagnosticKind::Note: 
-      SMKind = llvm::SourceMgr::DK_Note; 
-      break;
+  switch (Info.Kind) {
+  case DiagnosticKind::Error:
+    SMKind = llvm::SourceMgr::DK_Error;
+    break;
+  case DiagnosticKind::Warning:
+    SMKind = llvm::SourceMgr::DK_Warning;
+    break;
+
+  case DiagnosticKind::Note:
+    SMKind = llvm::SourceMgr::DK_Note;
+    break;
+
+  case DiagnosticKind::Remark:
+    SMKind = llvm::SourceMgr::DK_Remark;
+    break;
   }
 
-  if (Kind == DiagnosticKind::Error) {
+  if (Info.Kind == DiagnosticKind::Error) {
     DidErrorOccur = true;
   }
-  
+
   // Translate ranges.
   SmallVector<llvm::SMRange, 2> Ranges;
   for (auto R : Info.Ranges)
@@ -103,8 +119,17 @@ PrintingDiagnosticConsumer::handleDiagnostic(SourceManager &SM, SourceLoc Loc,
   ColoredStream coloredErrs{Stream};
   raw_ostream &out = ForceColors ? coloredErrs : Stream;
   const llvm::SourceMgr &rawSM = SM.getLLVMSourceMgr();
-  auto Msg = SM.GetMessage(Loc, SMKind, Text, Ranges, FixIts);
-  rawSM.PrintMessage(out, Msg);
+  
+  // Actually substitute the diagnostic arguments into the diagnostic text.
+  llvm::SmallString<256> Text;
+  {
+    llvm::raw_svector_ostream Out(Text);
+    DiagnosticEngine::formatDiagnosticText(Out, Info.FormatString,
+                                           Info.FormatArgs);
+  }
+
+  auto Msg = SM.GetMessage(Info.Loc, SMKind, Text, Ranges, FixIts);
+  rawSM.PrintMessage(out, Msg, ForceColors);
 }
 
 llvm::SMDiagnostic
@@ -121,7 +146,7 @@ SourceManager::GetMessage(SourceLoc Loc, llvm::SourceMgr::DiagKind Kind,
   std::string LineStr;
 
   if (Loc.isValid()) {
-    BufferID = getBufferIdentifierForLoc(Loc);
+    BufferID = getDisplayNameForLoc(Loc);
     auto CurMB = LLVMSourceMgr.getMemoryBuffer(findBufferContainingLoc(Loc));
 
     // Scan backward to find the start of the line.

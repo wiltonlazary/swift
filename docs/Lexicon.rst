@@ -3,8 +3,6 @@
 .. title:: Lexicon
 .. default-role:: term
 
-.. @raise litre.TestsAreMissing
-
 This file defines several terms used by the Swift compiler and standard library
 source code, tests, and commit messages. See also the `LLVM lexicon`_.
 
@@ -26,7 +24,7 @@ source code, tests, and commit messages. See also the `LLVM lexicon`_.
       struct Foo<T> {
         var value: T
         // Foo.value has abstraction pattern <T> T
-    
+      }
       struct Bar<T, U> {
         var value: (T) -> U
         // Bar.value has abstraction pattern <T, U> (T) -> U
@@ -65,10 +63,19 @@ source code, tests, and commit messages. See also the `LLVM lexicon`_.
   bitcode
     Serialized LLVM `IR`.
 
+  build czar
+    Apple term for "the person assigned to watch CI this week".
+
   canonical SIL
     SIL after the
     `mandatory passes <mandatory passes / mandatory optimizations>` have run.
     This can be used as input to IRGen to generate LLVM IR or object files.
+
+  canonical type
+    A unique representation of a type, with any `sugar <sugared type>` removed.
+    These can usually be directly compared to test whether two types are the
+    same; the exception is when generics get involved. In this case you'll need
+    a `generic environment`. Contrast with `sugared type`.
 
   Clang importer
     The part of the compiler that reads C and Objective-C declarations and
@@ -88,12 +95,21 @@ source code, tests, and commit messages. See also the `LLVM lexicon`_.
        context. This type may contain `archetypes <archetype>` and cannot be
        used directly from outside the context. Compare with `interface type`.
 
+  customization point
+    Informal term for a protocol requirement that has a default implementation,
+    i.e. one that conforming types don't *have* to implement but have the option
+    to "customize".
+
   DI (definite initialization / definitive initialization)
     The feature that no uninitialized variables, constants, or properties will
     be read by a program, or the analysis pass that operates on SIL to
     guarantee this. This was `discussed on Apple's Swift blog`__.
 
     __ https://developer.apple.com/swift/blog/?id=28
+
+  DNM
+    "Do not merge". Placed in PR titles where discussion or analysis is still
+    ongoing.
 
   dup
     From "duplicate". As a noun, refers to another filed issue that describes
@@ -110,6 +126,20 @@ source code, tests, and commit messages. See also the `LLVM lexicon`_.
     Describes a type or function where making changes will break binary
     compatibility. See :doc:`LibraryEvolution.rst <LibraryEvolution>`.
 
+  generic environment
+    Provides context for interpreting a type that may have generic parameters
+    in it. Generic parameter types are normally just represented as "first
+    generic parameter in the outermost context" (or similar), so it's up to the
+    generic environment to note that that type must be a Collection. (Another
+    way of looking at it is that the generic environment connects
+    `interface types <interface type>` with
+    `contextual types <contextual type>`).
+
+  generic signature
+    A representation of all generic parameters and their requirements. Like
+    types, generic signatures can be `canonicalized <canonical type>` to be
+    compared directly.
+
   iff
     "`if and only if`__". This term comes from mathematics.
 
@@ -123,6 +153,14 @@ source code, tests, and commit messages. See also the `LLVM lexicon`_.
     conformances and requirements in the generic signature and not in the types
     themselves. They can be compared across declarations but cannot be used
     directly from within the context.
+
+  irrefutable pattern
+    A pattern that always matches. These patterns either bind to a variable or
+    perform structural modification, e.x.:
+
+    1. ``case _:``.
+    2. ``case let x:``.
+    3. ``case (_, _):``.
 
   IR
     1. "intermediate representation": a generic term for a format representing
@@ -284,6 +322,13 @@ source code, tests, and commit messages. See also the `LLVM lexicon`_.
     An implicit representation change that occurs when a value is used with
     a different `abstraction pattern` from its current representation.
 
+  refutable pattern
+    A pattern that may not always match. These include patterns such as:
+
+    1. Isa check, e.g. ``case let x as String:``.
+    2. Enum case check: e.g. ``case .none:``.
+    3. Expr pattern: e.g. ``case foo():``.
+
   resilient
     Describes a type or function where making certain changes will not break
     binary compatibility. See :doc:`LibraryEvolution.rst <LibraryEvolution>`.
@@ -301,16 +346,14 @@ source code, tests, and commit messages. See also the `LLVM lexicon`_.
 
   script mode
     The parsing mode that allows top-level imperative code in a source file.
+    
+  Sema
+    Short for 'Semantic Analysis', the compiler pass that performs type checking,
+    validation, and expression rewriting before SILGen.
 
   SIL
     "Swift Intermediate Language". A high-level IR used by the Swift compiler
     for flow-sensitive diagnostics, optimization, and LLVM IR generation.
-
-  -sil-serialize-all
-    A mode where all functions in a library are made available for inlining by
-    any client, regardless of access control. Also called "magic performance
-    mode" as a reminder of how this drastically changes compilation. Not
-    guaranteed to work on arbitrary code.
 
   SR
     An issue reported on `bugs.swift.org <https://bugs.swift.org>`_. A
@@ -323,6 +366,13 @@ source code, tests, and commit messages. See also the `LLVM lexicon`_.
     "Standard library". Sometimes this just means the "Swift" module (also
     known as "swiftCore"); sometimes it means everything in the stdlib/
     directory. Pronounced "stid-lib" or "ess-tee-dee-lib".
+
+  sugared type
+    A type that may have been written in a more convenient way, using special
+    language syntax or a typealias. (For example, ``Int?`` is the sugared form
+    of ``Optional<Int>``.) Sugared types preserve information about the form
+    and use of the type even though the behavior usually does not change
+    (except for things like access control). Contrast with `canonical type`.
 
   thunk
     In the Swift compiler, a synthesized function whose only purpose is to
@@ -358,6 +408,10 @@ source code, tests, and commit messages. See also the `LLVM lexicon`_.
     overridable method in the class. Unlike an Objective-C method table,
     vtable keys are just offsets, making lookup much simpler at the cost of
     dynamism and duplicated information about *non*-overridden methods.
+
+  WIP
+    "Work-in-progress". Placed in PR titles to indicate that the PR is not ready
+    for review or merging.
 
   witness
     The value or type that satisfies a protocol requirement.

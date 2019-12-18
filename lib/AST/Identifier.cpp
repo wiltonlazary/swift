@@ -18,13 +18,21 @@
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Support/ConvertUTF.h"
+#include "clang/Basic/CharInfo.h"
 using namespace swift;
 
+constexpr const Identifier::Aligner DeclBaseName::SubscriptIdentifierData{};
+constexpr const Identifier::Aligner DeclBaseName::ConstructorIdentifierData{};
+constexpr const Identifier::Aligner DeclBaseName::DestructorIdentifierData{};
 
 raw_ostream &llvm::operator<<(raw_ostream &OS, Identifier I) {
   if (I.get() == nullptr)
     return OS << "_";
   return OS << I.get();
+}
+
+raw_ostream &llvm::operator<<(raw_ostream &OS, DeclBaseName D) {
+  return OS << D.userFacingName();
 }
 
 raw_ostream &llvm::operator<<(raw_ostream &OS, DeclName I) {
@@ -37,6 +45,19 @@ raw_ostream &llvm::operator<<(raw_ostream &OS, DeclName I) {
   }
   OS << ")";
   return OS;
+}
+
+void swift::simple_display(llvm::raw_ostream &out, DeclName name) {
+  out << "'" << name << "'";
+}
+
+raw_ostream &llvm::operator<<(raw_ostream &OS, DeclNameRef I) {
+  OS << I.getFullName();
+  return OS;
+}
+
+void swift::simple_display(llvm::raw_ostream &out, DeclNameRef name) {
+  out << "'" << name << "'";
 }
 
 raw_ostream &llvm::operator<<(raw_ostream &OS, swift::ObjCSelector S) {
@@ -99,6 +120,30 @@ int DeclName::compare(DeclName other) const {
   return argNames.size() < otherArgNames.size() ? -1 : 1;
 }
 
+static bool equals(ArrayRef<Identifier> idents, ArrayRef<StringRef> strings) {
+  if (idents.size() != strings.size())
+    return false;
+  for (size_t i = 0, e = idents.size(); i != e; ++i) {
+    if (!idents[i].is(strings[i]))
+      return false;
+  }
+  return true;
+}
+
+bool DeclName::isCompoundName(DeclBaseName baseName,
+                              ArrayRef<StringRef> argNames) const {
+  return (isCompoundName() &&
+          getBaseName() == baseName &&
+          equals(getArgumentNames(), argNames));
+}
+
+bool DeclName::isCompoundName(StringRef baseName,
+                              ArrayRef<StringRef> argNames) const {
+  return (isCompoundName() &&
+          getBaseName() == baseName &&
+          equals(getArgumentNames(), argNames));
+}
+
 void DeclName::dump() const {
   llvm::errs() << *this << "\n";
 }
@@ -125,7 +170,7 @@ llvm::raw_ostream &DeclName::print(llvm::raw_ostream &os,
   if (skipEmptyArgumentNames) {
     // If there is more than one argument yet none of them have names,
     // we're done.
-    if (getArgumentNames().size() > 0) {
+    if (!getArgumentNames().empty()) {
       bool anyNonEmptyNames = false;
       for (auto c : getArgumentNames()) {
         if (!c.empty()) {
@@ -150,7 +195,25 @@ llvm::raw_ostream &DeclName::print(llvm::raw_ostream &os,
 }
 
 llvm::raw_ostream &DeclName::printPretty(llvm::raw_ostream &os) const {
-  return print(os, /*skipEmptyArgumentNames=*/true);
+  return print(os, /*skipEmptyArgumentNames=*/!isSpecial());
+}
+
+void DeclNameRef::dump() const {
+  llvm::errs() << *this << "\n";
+}
+
+StringRef DeclNameRef::getString(llvm::SmallVectorImpl<char> &scratch,
+                             bool skipEmptyArgumentNames) const {
+  return FullName.getString(scratch, skipEmptyArgumentNames);
+}
+
+llvm::raw_ostream &DeclNameRef::print(llvm::raw_ostream &os,
+                                  bool skipEmptyArgumentNames) const {
+  return FullName.print(os, skipEmptyArgumentNames);
+}
+
+llvm::raw_ostream &DeclNameRef::printPretty(llvm::raw_ostream &os) const {
+  return FullName.printPretty(os);
 }
 
 ObjCSelector::ObjCSelector(ASTContext &ctx, unsigned numArgs,
@@ -163,6 +226,30 @@ ObjCSelector::ObjCSelector(ASTContext &ctx, unsigned numArgs,
 
   assert(numArgs == pieces.size() && "Wrong number of selector pieces");
   Storage = DeclName(ctx, Identifier(), pieces);
+}
+
+ObjCSelectorFamily ObjCSelector::getSelectorFamily() const {
+  StringRef text = getSelectorPieces().front().get();
+  while (!text.empty() && text[0] == '_') text = text.substr(1);
+
+  // Does the given selector start with the given string as a prefix, in the
+  // sense of the selector naming conventions?
+  // This implementation matches the one used by
+  // clang::Selector::getMethodFamily, to make sure we behave the same as
+  // Clang ARC. We're not just calling that method here because it means
+  // allocating a clang::IdentifierInfo, which requires a Clang ASTContext.
+  auto hasPrefix = [](StringRef text, StringRef prefix) {
+    if (!text.startswith(prefix)) return false;
+    if (text.size() == prefix.size()) return true;
+    assert(text.size() > prefix.size());
+    return !clang::isLowercase(text[prefix.size()]);
+  };
+
+  if (false) /*for #define purposes*/;
+#define OBJC_SELECTOR_FAMILY(LABEL, PREFIX) \
+  else if (hasPrefix(text, PREFIX)) return ObjCSelectorFamily::LABEL;
+#include "swift/AST/ObjCSelectorFamily.def"
+  else return ObjCSelectorFamily::None;
 }
 
 StringRef ObjCSelector::getString(llvm::SmallVectorImpl<char> &scratch) const {

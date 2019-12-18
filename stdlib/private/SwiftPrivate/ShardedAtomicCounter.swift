@@ -10,6 +10,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+import Swift
 import SwiftShims
 
 public func _stdlib_getHardwareConcurrency() -> Int {
@@ -43,7 +44,7 @@ public struct _stdlib_ShardedAtomicCounter {
 
   public func `deinit`() {
     self._shardsPtr.deinitialize(count: self._shardsCount)
-    self._shardsPtr.deallocate(capacity: self._shardsCount)
+    self._shardsPtr.deallocate()
   }
 
   public func add(_ operand: Int, randomInt: Int) {
@@ -67,12 +68,12 @@ public struct _stdlib_ShardedAtomicCounter {
     var _state: Int
 
     public init() {
-      _state = Int(Int32(bitPattern: rand32()))
+      _state = Int.random(in: .min ... .max)
     }
 
     public mutating func randomInt() -> Int {
       var result = 0
-      for _ in 0..<Int._sizeInBits {
+      for _ in 0..<Int.bitWidth {
         result = (result << 1) | (_state & 1)
         _state = (_state >> 1) ^ (-(_state & 1) & Int(bitPattern: 0xD0000001))
       }

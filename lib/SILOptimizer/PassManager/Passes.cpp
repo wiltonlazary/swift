@@ -11,7 +11,7 @@
 //===----------------------------------------------------------------------===//
 ///
 ///  \file
-///  \brief This file provides implementations of a few helper functions
+///  This file provides implementations of a few helper functions
 ///  which provide abstracted entrypoints to the SILPasses stage.
 ///
 ///  \note The actual SIL passes should be implemented in per-pass source files,
@@ -28,7 +28,7 @@
 #include "swift/SILOptimizer/Analysis/Analysis.h"
 #include "swift/SILOptimizer/PassManager/PassManager.h"
 #include "swift/SILOptimizer/PassManager/Transforms.h"
-#include "swift/SILOptimizer/Utils/Local.h"
+#include "swift/SILOptimizer/Utils/InstOptUtils.h"
 #include "llvm/ADT/Statistic.h"
 #include "llvm/ADT/StringSwitch.h"
 #include "llvm/Support/CommandLine.h"
@@ -51,7 +51,7 @@ bool swift::runSILDiagnosticPasses(SILModule &Module) {
 
   auto &Ctx = Module.getASTContext();
 
-  SILPassManager PM(&Module);
+  SILPassManager PM(&Module, "", /*isMandatoryPipeline=*/ true);
   PM.executePassPipelinePlan(
       SILPassPipelinePlan::getDiagnosticPassPipeline(Module.getOptions()));
 
@@ -66,7 +66,7 @@ bool swift::runSILDiagnosticPasses(SILModule &Module) {
   if (Module.getOptions().VerifyAll)
     Module.verify();
   else {
-    DEBUG(Module.verify());
+    LLVM_DEBUG(Module.verify());
   }
 
   // If errors were produced during SIL analysis, return true.
@@ -78,9 +78,17 @@ bool swift::runSILOwnershipEliminatorPass(SILModule &Module) {
 
   SILPassManager PM(&Module);
   PM.executePassPipelinePlan(
-      SILPassPipelinePlan::getOwnershipEliminatorPassPipeline());
+      SILPassPipelinePlan::getOwnershipEliminatorPassPipeline(
+          Module.getOptions()));
 
   return Ctx.hadError();
+}
+
+// Prepare SIL for the -O pipeline.
+void swift::runSILOptPreparePasses(SILModule &Module) {
+  SILPassManager PM(&Module);
+  PM.executePassPipelinePlan(
+      SILPassPipelinePlan::getSILOptPreparePassPipeline(Module.getOptions()));
 }
 
 void swift::runSILOptimizationPasses(SILModule &Module) {
@@ -88,12 +96,27 @@ void swift::runSILOptimizationPasses(SILModule &Module) {
   if (Module.getOptions().VerifyAll)
     Module.verify();
 
-  if (Module.getOptions().DisableSILPerfOptimizations)
+  if (Module.getOptions().DisableSILPerfOptimizations) {
+    // If we are not supposed to run SIL perf optzns, we may still need to
+    // serialize. So serialize now.
+    SILPassManager PM(&Module, "" /*stage*/, true /*isMandatory*/);
+    PM.executePassPipelinePlan(
+        SILPassPipelinePlan::getSerializeSILPassPipeline(Module.getOptions()));
     return;
+  }
 
-  SILPassManager PM(&Module);
-  PM.executePassPipelinePlan(
-      SILPassPipelinePlan::getPerformancePassPipeline(Module.getOptions()));
+  {
+    SILPassManager PM(&Module);
+    PM.executePassPipelinePlan(
+        SILPassPipelinePlan::getPerformancePassPipeline(Module.getOptions()));
+  }
+
+  // Check if we actually serialized our module. If we did not, serialize now.
+  if (!Module.isSerialized()) {
+    SILPassManager PM(&Module, "" /*stage*/, true /*isMandatory*/);
+    PM.executePassPipelinePlan(
+        SILPassPipelinePlan::getSerializeSILPassPipeline(Module.getOptions()));
+  }
 
   // If we were asked to debug serialization, exit now.
   if (Module.getOptions().DebugSerialization)
@@ -103,7 +126,7 @@ void swift::runSILOptimizationPasses(SILModule &Module) {
   if (Module.getOptions().VerifyAll)
     Module.verify();
   else {
-    DEBUG(Module.verify());
+    LLVM_DEBUG(Module.verify());
   }
 }
 
@@ -112,14 +135,17 @@ void swift::runSILPassesForOnone(SILModule &Module) {
   if (Module.getOptions().VerifyAll)
     Module.verify();
 
-  SILPassManager PM(&Module, "Onone");
-  PM.executePassPipelinePlan(SILPassPipelinePlan::getOnonePassPipeline());
+  // We want to run the Onone passes also for function which have an explicit
+  // Onone attribute.
+  SILPassManager PM(&Module, "Onone", /*isMandatoryPipeline=*/ true);
+  PM.executePassPipelinePlan(
+      SILPassPipelinePlan::getOnonePassPipeline(Module.getOptions()));
 
   // Verify the module, if required.
   if (Module.getOptions().VerifyAll)
     Module.verify();
   else {
-    DEBUG(Module.verify());
+    LLVM_DEBUG(Module.verify());
   }
 }
 
@@ -127,21 +153,25 @@ void swift::runSILOptimizationPassesWithFileSpecification(SILModule &M,
                                                           StringRef Filename) {
   SILPassManager PM(&M);
   PM.executePassPipelinePlan(
-      SILPassPipelinePlan::getPassPipelineFromFile(Filename));
+      SILPassPipelinePlan::getPassPipelineFromFile(M.getOptions(), Filename));
 }
 
-PassKind swift::PassKindFromString(StringRef Name) {
-  return llvm::StringSwitch<PassKind>(Name)
-#define PASS(ID, NAME, DESCRIPTION) .Case(#ID, PassKind::ID)
+/// Get the Pass ID enum value from an ID string.
+PassKind swift::PassKindFromString(StringRef IDString) {
+  return llvm::StringSwitch<PassKind>(IDString)
+#define PASS(ID, TAG, DESCRIPTION) .Case(#ID, PassKind::ID)
 #include "swift/SILOptimizer/PassManager/Passes.def"
       .Default(PassKind::invalidPassKind);
 }
 
-StringRef swift::PassKindName(PassKind Kind) {
+/// Get an ID string for the given pass Kind.
+/// This is useful for tools that identify a pass
+/// by its type name.
+StringRef swift::PassKindID(PassKind Kind) {
   switch (Kind) {
-#define PASS(ID, NAME, DESCRIPTION)                                            \
+#define PASS(ID, TAG, DESCRIPTION)                                             \
   case PassKind::ID:                                                           \
-    return #NAME;
+    return #ID;
 #include "swift/SILOptimizer/PassManager/Passes.def"
   case PassKind::invalidPassKind:
     llvm_unreachable("Invalid pass kind?!");
@@ -150,11 +180,13 @@ StringRef swift::PassKindName(PassKind Kind) {
   llvm_unreachable("Unhandled PassKind in switch.");
 }
 
-StringRef swift::PassKindID(PassKind Kind) {
+/// Get a tag string for the given pass Kind.
+/// This format is useful for command line options.
+StringRef swift::PassKindTag(PassKind Kind) {
   switch (Kind) {
-#define PASS(ID, NAME, DESCRIPTION)                                            \
+#define PASS(ID, TAG, DESCRIPTION)                                             \
   case PassKind::ID:                                                           \
-    return #ID;
+    return TAG;
 #include "swift/SILOptimizer/PassManager/Passes.def"
   case PassKind::invalidPassKind:
     llvm_unreachable("Invalid pass kind?!");
@@ -171,8 +203,9 @@ StringRef swift::PassKindID(PassKind Kind) {
 // convert it to a module pass to ensure that the SIL input is always at the
 // same stage of lowering.
 void swift::runSILLoweringPasses(SILModule &Module) {
-  SILPassManager PM(&Module, "LoweringPasses");
-  PM.executePassPipelinePlan(SILPassPipelinePlan::getLoweringPassPipeline());
+  SILPassManager PM(&Module, "LoweringPasses", /*isMandatoryPipeline=*/ true);
+  PM.executePassPipelinePlan(
+      SILPassPipelinePlan::getLoweringPassPipeline(Module.getOptions()));
 
   assert(Module.getStage() == SILStage::Lowered);
 }

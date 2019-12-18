@@ -1,4 +1,4 @@
-// RUN: %target-typecheck-verify-swift
+// RUN: %target-typecheck-verify-swift -enable-objc-interop
 
 class B { 
   init() {} 
@@ -111,7 +111,7 @@ func protocol_concrete_casts(_ p1: P1, p2: P2, p12: P1 & P2) {
 
   _ = p1 as! P1 & P2
 
-  _ = p2 as! S1
+  _ = p2 as! S1 // expected-warning {{cast from 'P2' to unrelated type 'S1' always fails}}
 
   _ = p12 as! S1
   _ = p12 as! S2
@@ -126,7 +126,7 @@ func protocol_concrete_casts(_ p1: P1, p2: P2, p12: P1 & P2) {
 
   var _:Bool = p1 is P1 & P2
 
-  var _:Bool = p2 is S1
+  var _:Bool = p2 is S1 // expected-warning {{cast from 'P2' to unrelated type 'S1' always fails}}
 
   var _:Bool = p12 is S1
   var _:Bool = p12 is S2
@@ -208,5 +208,17 @@ _ = b1 as Int    // expected-error {{cannot convert value of type 'Bool' to type
 _ = seven as Int // expected-error {{cannot convert value of type 'Double' to type 'Int' in coercion}}
 
 func rdar29894174(v: B?) {
-  let _ = [v].flatMap { $0 as? D }
+  let _ = [v].compactMap { $0 as? D }
 }
+
+// When re-typechecking a solution with an 'is' cast applied,
+// we would fail to produce a diagnostic.
+func process(p: Any?) {
+  compare(p is String)
+  // expected-error@-1 {{missing argument for parameter #2 in call}} {{22-22=, <#Bool#>}}
+}
+
+func compare<T>(_: T, _: T) {} // expected-note {{'compare' declared here}}
+func compare<T>(_: T?, _: T?) {}
+
+_ = nil? as? Int?? // expected-error {{nil literal cannot be the source of a conditional cast}}

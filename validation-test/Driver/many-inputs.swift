@@ -1,4 +1,5 @@
-// RUN: rm -rf %t && mkdir -p %t
+// REQUIRES: shell
+// RUN: %empty-directory(%t)
 
 // This limit was chosen because multi-threaded compilation broke here on OS X
 // at one point.

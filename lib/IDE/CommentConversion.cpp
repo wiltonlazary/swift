@@ -206,7 +206,7 @@ struct CommentToXMLConverter {
         printInlinesUnder(N, S);
       S << "\"";
     }
-    S << "\\>";
+    S << "/>";
     printRawHTML(S.str());
   }
 
@@ -245,6 +245,19 @@ struct CommentToXMLConverter {
     OS << "</ThrowsDiscussion>";
   }
 
+  void printTagFields(ArrayRef<StringRef> Tags) {
+    OS << "<Tags>";
+    for (const auto Tag : Tags) {
+      if (Tag.empty()) {
+        continue;
+      }
+      OS << "<Tag>";
+      appendWithXMLEscaping(OS, Tag);
+      OS << "</Tag>";
+    }
+    OS << "</Tags>";
+  }
+
   void visitDocComment(const DocComment *DC);
   void visitCommentParts(const swift::markup::CommentParts &Parts);
 };
@@ -270,6 +283,10 @@ void CommentToXMLConverter::visitCommentParts(const swift::markup::CommentParts 
 
   if (Parts.ThrowsField.hasValue())
     printThrowsDiscussion(Parts.ThrowsField.getValue());
+
+  if (!Parts.Tags.empty()) {
+    printTagFields(llvm::makeArrayRef(Parts.Tags.begin(), Parts.Tags.end()));
+  }
 
   if (!Parts.BodyNodes.empty()) {
     OS << "<Discussion>";
@@ -300,8 +317,7 @@ void CommentToXMLConverter::visitDocComment(const DocComment *DC) {
     auto Loc = D->getLoc();
     if (Loc.isValid()) {
       const auto &SM = D->getASTContext().SourceMgr;
-      unsigned BufferID = SM.findBufferContainingLoc(Loc);
-      StringRef FileName = SM.getIdentifierForBuffer(BufferID);
+      StringRef FileName = SM.getDisplayNameForLoc(Loc);
       auto LineAndColumn = SM.getLineAndColumn(Loc);
       OS << " file=\"";
       appendWithXMLEscaping(OS, FileName);
@@ -330,7 +346,7 @@ void CommentToXMLConverter::visitDocComment(const DocComment *DC) {
     bool Failed;
     {
       llvm::raw_svector_ostream OS(SS);
-      Failed = ide::printDeclUSR(VD, OS);
+      Failed = ide::printValueDeclUSR(VD, OS);
     }
     if (!Failed && !SS.empty()) {
       OS << "<USR>" << SS << "</USR>";
@@ -339,11 +355,13 @@ void CommentToXMLConverter::visitDocComment(const DocComment *DC) {
 
   {
     PrintOptions PO = PrintOptions::printInterface();
-    PO.PrintAccessibility = false;
-    PO.AccessibilityFilter = Accessibility::Private;
+    PO.PrintAccess = false;
+    PO.AccessFilter = AccessLevel::Private;
     PO.PrintDocumentationComments = false;
     PO.TypeDefinitions = false;
     PO.VarInitializers = false;
+    PO.ShouldQualifyNestedDeclarations =
+        PrintOptions::QualifyNestedDeclarations::TypesOnly;
 
     OS << "<Declaration>";
     llvm::SmallString<32> DeclSS;
@@ -354,8 +372,10 @@ void CommentToXMLConverter::visitDocComment(const DocComment *DC) {
     appendWithXMLEscaping(OS, DeclSS);
     OS << "</Declaration>";
   }
-
+  
+  OS << "<CommentParts>";
   visitCommentParts(DC->getParts());
+  OS << "</CommentParts>";
 
   OS << RootEndTag;
 }
@@ -387,19 +407,21 @@ static void replaceObjcDeclarationsWithSwiftOnes(const Decl *D,
   std::string S;
   llvm::raw_string_ostream SS(S);
   D->print(SS, Options);
-  std::string Signature = SS.str();
   auto OI = Doc.find(Open);
   auto CI = Doc.find(Close);
-  if (StringRef::npos != OI && StringRef::npos != CI && CI > OI)
-    OS << Doc.substr(0, OI) << Open << Signature << Close <<
-      Doc.substr(CI + Close.size());
-  else
+  if (StringRef::npos != OI && StringRef::npos != CI && CI > OI) {
+    OS << Doc.substr(0, OI) << Open;
+    appendWithXMLEscaping(OS, SS.str());
+    OS << Close << Doc.substr(CI + Close.size());
+  } else {
     OS << Doc;
+  }
 }
 
-std::string ide::extractPlainTextFromComment(const StringRef Text) {
+static LineList getLineListFromComment(SourceManager &SourceMgr,
+                                       swift::markup::MarkupContext &MC,
+                                       const StringRef Text) {
   LangOptions LangOpts;
-  SourceManager SourceMgr;
   auto Tokens = swift::tokenize(LangOpts, SourceMgr,
                                 SourceMgr.addMemBufferCopy(Text));
   std::vector<SingleRawComment> Comments;
@@ -413,8 +435,13 @@ std::string ide::extractPlainTextFromComment(const StringRef Text) {
     return {};
 
   RawComment Comment(Comments);
+  return MC.getLineList(Comment);
+}
+
+std::string ide::extractPlainTextFromComment(const StringRef Text) {
+  SourceManager SourceMgr;
   swift::markup::MarkupContext MC;
-  return MC.getLineList(Comment).str();
+  return getLineListFromComment(SourceMgr, MC, Text).str();
 }
 
 bool ide::getDocumentationCommentAsXML(const Decl *D, raw_ostream &OS) {
@@ -433,11 +460,11 @@ bool ide::getDocumentationCommentAsXML(const Decl *D, raw_ostream &OS) {
 
   swift::markup::MarkupContext MC;
   auto DC = getCascadingDocComment(MC, D);
-  if (!DC.hasValue())
+  if (!DC)
     return false;
 
   CommentToXMLConverter Converter(OS);
-  Converter.visitDocComment(DC.getValue());
+  Converter.visitDocComment(DC);
 
   OS.flush();
   return true;
@@ -446,15 +473,33 @@ bool ide::getDocumentationCommentAsXML(const Decl *D, raw_ostream &OS) {
 bool ide::getLocalizationKey(const Decl *D, raw_ostream &OS) {
   swift::markup::MarkupContext MC;
   auto DC = getCascadingDocComment(MC, D);
-  if (!DC.hasValue())
+  if (!DC)
     return false;
 
-  if (const auto LKF = DC.getValue()->getLocalizationKeyField()) {
+  if (const auto LKF = DC->getLocalizationKeyField()) {
     printInlinesUnder(LKF.getValue(), OS);
     return true;
   }
 
   return false;
+}
+
+bool ide::convertMarkupToXML(StringRef Text, raw_ostream &OS) {
+  std::string Comment;
+  {
+    llvm::raw_string_ostream OS(Comment);
+    OS << "/**\n" << Text << "\n" << "*/";
+  }
+  SourceManager SourceMgr;
+  MarkupContext MC;
+  LineList LL = getLineListFromComment(SourceMgr, MC, Comment);
+  if (auto *Doc = swift::markup::parseDocument(MC, LL)) {
+    CommentToXMLConverter Converter(OS);
+    Converter.visitCommentParts(extractCommentParts(MC, Doc));
+    OS.flush();
+    return false;
+  }
+  return true;
 }
 
 //===----------------------------------------------------------------------===//
@@ -664,7 +709,7 @@ public:
         printInlinesUnder(Child, S);
       S << "\"";
     }
-    S << "\\>";
+    S << "/>";
     print(S.str());
   }
 

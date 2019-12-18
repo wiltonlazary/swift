@@ -21,7 +21,7 @@ Enabling Optimizations
 ======================
 
 The first thing one should always do is to enable optimization. Swift provides
-three different optimization levels:
+four different optimization levels:
 
 - ``-Onone``: This is meant for normal development. It performs minimal
   optimizations and preserves all debug info.
@@ -35,6 +35,8 @@ three different optimization levels:
   result in undetected memory safety issues and integer overflows. Only use this
   if you have carefully reviewed that your code is safe with respect to integer
   overflow and type casts.
+- ``-Osize``: This is a special optimization mode where the compiler prioritizes
+  code size over performance.
 
 In the Xcode UI, one can modify the current optimization level as follows:
 
@@ -80,7 +82,7 @@ in the following code snippet, ``a.aProperty``, ``a.doSomething()`` and
     dynamic doSomethingElse() { ... }
   }
 
-  class B : A {
+  class B: A {
     override var aProperty {
       get { ... }
       set { ... }
@@ -153,13 +155,13 @@ assuming ``E``, ``F`` do not have any overriding declarations in the same file:
   }
 
   class F {
-    fileprivate var myPrivateVar : Int
+    fileprivate var myPrivateVar: Int
   }
 
   func usingE(_ e: E) {
     e.doSomething() // There is no sub class in the file that declares this class.
                     // The compiler can remove virtual calls to doSomething()
-                    // and directly call A's doSomething method.
+                    // and directly call E's doSomething method.
   }
 
   func usingF(_ f: F) -> Int {
@@ -182,7 +184,7 @@ that value types cannot be included inside an NSArray. Thus when using value
 types, the optimizer can remove most of the overhead in Array that is necessary
 to handle the possibility of the array being backed an NSArray.
 
-Additionally, In contrast to reference types, value types only need reference
+Additionally, in contrast to reference types, value types only need reference
 counting if they contain, recursively, a reference type. By using value types
 without reference types, one can avoid additional retain, release traffic inside
 Array.
@@ -191,11 +193,11 @@ Array.
 
   // Don't use a class here.
   struct PhonebookEntry {
-    var name : String
-    var number : [Int]
+    var name: String
+    var number: [Int]
   }
 
-  var a : [PhonebookEntry]
+  var a: [PhonebookEntry]
 
 Keep in mind that there is a trade-off between using large value types and using
 reference types. In certain cases, the overhead of copying and moving around
@@ -275,9 +277,9 @@ safe.
 
 ::
 
-  a : [Int]
-  b : [Int]
-  c : [Int]
+  a: [Int]
+  b: [Int]
+  c: [Int]
 
   // Precondition: for all a[i], b[i]: a[i] + b[i] does not overflow!
   for i in 0 ... n {
@@ -343,49 +345,6 @@ used. *NOTE* The standard library is a special case. Definitions in
 the standard library are visible in all modules and available for
 specialization.
 
-Advice: Use @_specialize to direct the compiler to specialize generics
-----------------------------------------------------------------------
-
-The compiler only automatically specializes generic code if the call
-site and the callee function are located in the same module. However,
-the programmer can provide hints to the compiler in the form of
-@_specialize attributes. For details see
-:ref:`generics-specialization`.
-
-This attribute instructs the compiler to specialize on the specified
-concrete type list. The compiler inserts type checks and dispatches
-from the generic function to the specialized variant. In the following
-example, injecting the @_specialize attribute speeds up the code by
-about 10 times.
-
-::
-
-  /// ---------------
-  /// Framework.swift
-
-  public protocol Pingable { func ping() -> Self }
-  public protocol Playable { func play() }
-
-  extension Int : Pingable {
-    public func ping() -> Int { return self + 1 }
-  }
-
-  public class Game<T : Pingable> : Playable {
-    var t : T
-
-    public init (_ v : T) {t = v}
-
-    @_specialize(Int)
-    public func play() {
-      for _ in 0...100_000_000 { t = t.ping() }
-    }
-  }
-
-  /// -----------------
-  /// Application.swift
-
-  Game(10).play
-
 The cost of large Swift values
 ==============================
 
@@ -409,12 +368,12 @@ represented as values, so this example is somewhat realistic.
 ::
 
   protocol P {}
-  struct Node : P {
-    var left, right : P?
+  struct Node: P {
+    var left, right: P?
   }
 
   struct Tree {
-    var node : P?
+    var node: P?
     init() { ... }
   }
 
@@ -443,8 +402,8 @@ argument drops from being O(n), depending on the size of the tree to O(1).
 
 ::
 
-  struct Tree : P {
-    var node : [P?]
+  struct Tree: P {
+    var node: [P?]
     init() {
       node = [thing]
     }
@@ -476,18 +435,18 @@ construct such a data structure:
 ::
 
   final class Ref<T> {
-    var val : T
-    init(_ v : T) {val = v}
+    var val: T
+    init(_ v: T) {val = v}
   }
 
   struct Box<T> {
-      var ref : Ref<T>
-      init(_ x : T) { ref = Ref(x) }
+      var ref: Ref<T>
+      init(_ x: T) { ref = Ref(x) }
 
       var value: T {
           get { return ref.val }
           set {
-            if (!isUniquelyReferencedNonObjC(&ref)) {
+            if (!isKnownUniquelyReferenced(&ref)) {
               ref = Ref(newValue)
               return
             }
@@ -547,7 +506,7 @@ alive.
     withExtendedLifetime(Head) {
 
       // Create an Unmanaged reference.
-      var Ref : Unmanaged<Node> = Unmanaged.passUnretained(Head)
+      var Ref: Unmanaged<Node> = Unmanaged.passUnretained(Head)
 
       // Use the unmanaged reference in a call/variable access. The use of
       // _withUnsafeGuaranteedRef allows the compiler to remove the ultimate
@@ -581,11 +540,20 @@ protocols as class-only protocols to get better runtime performance.
 
 ::
 
-  protocol Pingable : class { func ping() -> Int }
+  protocol Pingable: AnyObject { func ping() -> Int }
 
 .. https://developer.apple.com/library/ios/documentation/Swift/Conceptual/Swift_Programming_Language/Protocols.html
 
 
+Unsupported Optimization Attributes
+===================================
+
+Some underscored type attributes function as optimizer directives. Developers
+are welcome to experiment with these attributes and send back bug reports and
+other feedback, including meta bug reports on the following incomplete
+documentation: :ref:`UnsupportedOptimizationAttributes`. These attributes are
+not supported language features. They have not been reviewed by Swift Evolution
+and are likely to change between compiler releases.
 
 Footnotes
 =========

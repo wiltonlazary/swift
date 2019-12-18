@@ -10,9 +10,10 @@
 //
 //===----------------------------------------------------------------------===//
 // -*- swift -*-
-// RUN: rm -rf %t ; mkdir -p %t
+// RUN: %empty-directory(%t)
 // RUN: %gyb -DCMAKE_SIZEOF_VOID_P=%target-ptrsize %s -o %t/NumericParsing.swift
 // RUN: %line-directive %t/NumericParsing.swift -- %target-build-swift %t/NumericParsing.swift -o %t/a.out
+// RUN: %target-codesign %t/a.out
 // RUN: %line-directive %t/NumericParsing.swift -- %target-run %t/a.out
 // REQUIRES: executable_test
 %{
@@ -80,7 +81,7 @@ tests.test("${Self}/success") {
   expectEqual(0, ${Self}("-00", radix: 16))
 
   // Maximum radix
-  expectEqual(${max_radix} - 1, ${Self}("z", radix: ${max_radix}))
+  expectEqual(${max_radix} - 1, ${Self}("z", radix: ${max_radix})!)
 
   // Out-of-range values
   expectEqual(nil, ${Self}("${maxValue + 1}"))
@@ -121,10 +122,19 @@ tests.test("${Self}/radixTooHigh") {
 
 % end
 
+tests.test("FixedWidthInteger/maxUInt64") {
+  func f<T : FixedWidthInteger>(_ x: T) -> String {
+    return String(x, radix: 16)
+  }
+  let x = f(UInt64.max)
+  let y = String(UInt64.max, radix: 16)
+  expectEqual(x, y)
+}
+
 % for Self in 'Float', 'Double', 'Float80':
 
 % if Self == 'Float80':
-#if arch(i386) || arch(x86_64)
+#if !os(Windows) && (arch(i386) || arch(x86_64))
 % end
 
 tests.test("${Self}/Basics") {
@@ -135,6 +145,14 @@ tests.test("${Self}/Basics") {
   expectEqual(-(.infinity), ${Self}("-Inf"))
   expectEqual(String(${Self}.nan), String(${Self}("nan")!))
   expectEqual(String(${Self}.nan), String(${Self}("NaN")!))
+
+// sNaN cannot be fully supported on i386.
+#if !arch(i386)
+  expectTrue(${Self}("sNaN")!.isSignalingNaN)
+  expectTrue(${Self}("SNAN")!.isSignalingNaN)
+  expectTrue(${Self}("+snan")!.isSignalingNaN)
+  expectTrue(${Self}("-SnAn")!.isSignalingNaN)
+#endif
 % end
 
   expectEqual(-0.0, ${Self}("-0"))

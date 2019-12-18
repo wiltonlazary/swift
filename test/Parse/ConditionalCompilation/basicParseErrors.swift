@@ -36,11 +36,11 @@ func h() {}
 // <https://twitter.com/practicalswift/status/829066902869786625>
 #if // expected-error {{incomplete condition in conditional compilation directive}}
 #if 0 == // expected-error {{incomplete condition in conditional compilation directive}}
-#if0= // expected-error {{incomplete condition in conditional compilation directive}} expected-error {{'=' must have consistent whitespace on both sides}}
+#if 0= // expected-error {{incomplete condition in conditional compilation directive}} expected-error {{'=' must have consistent whitespace on both sides}}
 class Foo {
   #if // expected-error {{incomplete condition in conditional compilation directive}}
   #if 0 == // expected-error {{incomplete condition in conditional compilation directive}}
-  #if0= // expected-error {{incomplete condition in conditional compilation directive}} expected-error {{'=' must have consistent whitespace on both sides}}
+  #if 0= // expected-error {{incomplete condition in conditional compilation directive}} expected-error {{'=' must have consistent whitespace on both sides}}
 }
 
 struct S {
@@ -114,3 +114,56 @@ undefinedFunc() // ignored.
 #else
 undefinedFunc() // expected-error {{use of unresolved identifier 'undefinedFunc'}}
 #endif
+
+/// Invalid platform condition arguments don't invalidate the whole condition.
+#if !arch(tecture) && !os(ystem) && !_endian(ness)
+// expected-warning@-1 {{unknown architecture for build configuration 'arch'}}
+// expected-note@-2 {{did you mean 'arm'?}} {{11-18=arm}}
+// expected-warning@-3 {{unknown operating system for build configuration 'os'}}
+// expected-note@-4 {{did you mean 'OSX'?}} {{27-32=OSX}}
+// expected-note@-5 {{did you mean 'PS4'?}} {{27-32=PS4}}
+// expected-warning@-6 {{unknown endianness for build configuration '_endian'}}
+// expected-note@-7 {{did you mean 'big'?}} {{46-50=big}}
+func fn_k() {}
+#endif
+fn_k()
+
+#if os(cillator) || arch(ive)
+// expected-warning@-1 {{unknown operating system for build configuration 'os'}}
+// expected-note@-2 {{did you mean 'macOS'?}} {{8-16=macOS}}
+// expected-note@-3 {{did you mean 'iOS'?}} {{8-16=iOS}}
+// expected-warning@-4 {{unknown architecture for build configuration 'arch'}}
+// expected-note@-5 {{did you mean 'arm'?}} {{26-29=arm}}
+// expected-note@-6 {{did you mean 'i386'?}} {{26-29=i386}}
+func undefinedFunc() // ignored.
+#endif
+undefinedFunc() // expected-error {{use of unresolved identifier 'undefinedFunc'}}
+
+#if os(simulator) // expected-warning {{unknown operating system for build configuration 'os'}} expected-note {{did you mean 'targetEnvironment'}} {{5-7=targetEnvironment}}
+#endif
+
+#if arch(iOS) // expected-warning {{unknown architecture for build configuration 'arch'}} expected-note {{did you mean 'os'}} {{5-9=os}}
+#endif
+
+#if _endian(arm64) // expected-warning {{unknown endianness for build configuration '_endian'}} expected-note {{did you mean 'arch'}} {{5-12=arch}}
+#endif
+
+#if targetEnvironment(_ObjC) // expected-warning {{unknown target environment for build configuration 'targetEnvironment'}} expected-note {{did you mean 'simulator'}} {{23-28=simulator}}
+#endif
+
+#if os(iOS) || os(simulator) // expected-warning {{unknown operating system for build configuration 'os'}} expected-note {{did you mean 'targetEnvironment'}} {{16-18=targetEnvironment}}
+#endif
+
+#if arch(ios) // expected-warning {{unknown architecture for build configuration 'arch'}} expected-note {{did you mean 'os'}} {{5-9=os}} expected-note {{did you mean 'iOS'}} {{10-13=iOS}}
+#endif
+
+#if FOO
+#else if BAR
+// expected-error@-1 {{unexpected 'if' keyword following '#else' conditional compilation directive; did you mean '#elseif'?}} {{1-9=#elseif}}
+#else
+#endif
+
+#if FOO
+#else
+if true {}
+#endif // OK

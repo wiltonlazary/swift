@@ -20,8 +20,6 @@ namespace {
 
 class IVInfoPrinter : public SILModuleTransform {
 
-  StringRef getName() override { return "SIL IV Information Printer"; }
-
   void dumpIV(ValueBase *Header, ValueBase *IV) {
     if (IV == Header) {
       llvm::errs() << "IV Header: ";
@@ -57,15 +55,17 @@ class IVInfoPrinter : public SILModuleTransform {
             dumpIV(Info.getInductionVariableHeader(A), A);
           }
 
-        for (auto &I : BB)
-          if (Info.isInductionVariable(&I)) {
-            if (!FoundIV)
-              llvm::errs() << "Induction variables for function: " <<
-              F.getName() << "\n";
+        for (auto &I : BB) {
+          auto value = dyn_cast<SingleValueInstruction>(&I);
+          if (!value) continue;
+          if (!Info.isInductionVariable(value)) continue;
+          if (!FoundIV)
+            llvm::errs() << "Induction variables for function: " <<
+            F.getName() << "\n";
 
-            FoundIV = true;
-            dumpIV(Info.getInductionVariableHeader(&I), &I);
-          }
+          FoundIV = true;
+          dumpIV(Info.getInductionVariableHeader(value), value);
+        }
       }
       
       if (FoundIV)

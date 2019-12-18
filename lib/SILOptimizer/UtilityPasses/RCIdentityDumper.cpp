@@ -50,8 +50,7 @@ class RCIdentityDumper : public SILFunctionTransform {
         Results.push_back({Arg, RCId->getRCIdentityRoot(Arg)});
       }
       for (auto &II : BB) {
-        if (II.hasValue()) {
-          SILValue V(&II);
+        for (auto V : II.getResults()) {
           ValueToValueIDMap[V] = ValueCount++;
           Results.push_back({V, RCId->getRCIdentityRoot(V)});
         }
@@ -73,7 +72,6 @@ class RCIdentityDumper : public SILFunctionTransform {
     llvm::outs() << "\n";
   }
 
-  StringRef getName() override { return "RC Identity Dumper"; }
 };
 
 } // end anonymous namespace

@@ -19,10 +19,15 @@
 #define SWIFT_AST_IRGENOPTIONS_H
 
 #include "swift/AST/LinkLibrary.h"
+#include "swift/Basic/PathRemapper.h"
 #include "swift/Basic/Sanitizers.h"
+#include "swift/Basic/OptionSet.h"
+#include "swift/Basic/OptimizationMode.h"
 // FIXME: This include is just for llvm::SanitizerCoverageOptions. We should
 // split the header upstream so we don't include so much.
 #include "llvm/Transforms/Instrumentation.h"
+#include "llvm/Support/raw_ostream.h"
+#include "llvm/Support/VersionTuple.h"
 #include <string>
 #include <vector>
 
@@ -45,12 +50,18 @@ enum class IRGenOutputKind : unsigned {
   ObjectFile
 };
 
-enum class IRGenDebugInfoKind : unsigned {
-  None,       /// No debug info.
-  LineTables, /// Line tables only.
-  ASTTypes,   /// Line tables + AST type references.
-  DwarfTypes, /// Line tables + AST type references + DWARF types.
-  Normal = ASTTypes /// The setting LLDB prefers.
+enum class IRGenDebugInfoLevel : unsigned {
+  None,       ///< No debug info.
+  LineTables, ///< Line tables only.
+  ASTTypes,   ///< Line tables + AST type references.
+  DwarfTypes, ///< Line tables + AST type references + DWARF types.
+  Normal = ASTTypes ///< The setting LLDB prefers.
+};
+
+enum class IRGenDebugInfoFormat : unsigned {
+  None,
+  DWARF,
+  CodeView
 };
 
 enum class IRGenEmbedMode : unsigned {
@@ -62,9 +73,6 @@ enum class IRGenEmbedMode : unsigned {
 /// The set of options supported by IR generation.
 class IRGenOptions {
 public:
-  /// The name of the first input file, used by the debug info.
-  std::string MainInputFilename;
-  std::vector<std::string> OutputFilenames;
   std::string ModuleName;
 
   /// The compilation directory for the debug info.
@@ -73,8 +81,11 @@ public:
   /// The DWARF version of debug info.
   unsigned DWARFVersion;
 
-  /// The command line string that is to be stored in the DWARF debug info.
-  std::string DWARFDebugFlags;
+  /// The command line string that is to be stored in the debug info.
+  std::string DebugFlags;
+
+  /// List of -Xcc -D macro definitions.
+  std::vector<std::string> ClangDefines;
 
   /// The libraries and frameworks specified on the command line.
   SmallVector<LinkLibrary, 4> LinkLibraries;
@@ -90,25 +101,39 @@ public:
   /// well-formed?
   unsigned Verify : 1;
 
-  /// Whether or not to run optimization passes.
-  unsigned Optimize : 1;
+  OptimizationMode OptMode;
 
   /// Which sanitizer is turned on.
-  SanitizerKind Sanitize : 2;
+  OptionSet<SanitizerKind> Sanitizers;
 
-  /// Whether we should emit debug info.
-  IRGenDebugInfoKind DebugInfoKind : 2;
+  /// Which sanitizer(s) have recovery instrumentation enabled.
+  OptionSet<SanitizerKind> SanitizersWithRecoveryInstrumentation;
 
-  /// \brief Whether we're generating IR for the JIT.
+  /// Path prefixes that should be rewritten in debug info.
+  PathRemapper DebugPrefixMap;
+
+  /// What level of debug info to generate.
+  IRGenDebugInfoLevel DebugInfoLevel : 2;
+
+  /// What type of debug info to generate.
+  IRGenDebugInfoFormat DebugInfoFormat : 2;
+
+  /// Whether to leave DWARF breadcrumbs pointing to imported Clang modules.
+  unsigned DisableClangModuleSkeletonCUs : 1;
+
+  /// Whether we're generating IR for the JIT.
   unsigned UseJIT : 1;
   
-  /// \brief Whether we should run LLVM optimizations after IRGen.
+  /// Whether we're generating code for the integrated REPL.
+  unsigned IntegratedREPL : 1;
+  
+  /// Whether we should run LLVM optimizations after IRGen.
   unsigned DisableLLVMOptzns : 1;
 
-  /// \brief Whether we should run LLVM ARC optimizations after IRGen.
-  unsigned DisableLLVMARCOpts : 1;
+  /// Whether we should run swift specific LLVM optimizations after IRGen.
+  unsigned DisableSwiftSpecificLLVMOptzns : 1;
 
-  /// \brief Whether we should run LLVM SLP vectorizer.
+  /// Whether we should run LLVM SLP vectorizer.
   unsigned DisableLLVMSLPVectorizer : 1;
 
   /// Disable frame pointer elimination?
@@ -132,9 +157,6 @@ public:
   /// Frameworks that we should not autolink against.
   SmallVector<std::string, 1> DisableAutolinkFrameworks;
 
-  /// Instrument code to generate profiling information.
-  unsigned GenerateProfile : 1;
-
   /// Print the LLVM inline tree at the end of the LLVM pass pipeline.
   unsigned PrintInlineTree : 1;
 
@@ -151,6 +173,26 @@ public:
   /// Emit names of struct stored properties and enum cases.
   unsigned EnableReflectionNames : 1;
 
+  /// Emit mangled names of anonymous context descriptors.
+  unsigned EnableAnonymousContextMangledNames : 1;
+
+  /// Force public linkage for private symbols. Used only by the LLDB
+  /// expression evaluator.
+  unsigned ForcePublicLinkage : 1;
+  
+  /// Force lazy initialization of class metadata
+  /// Used on Windows to avoid cross-module references.
+  unsigned LazyInitializeClassMetadata : 1;
+  unsigned LazyInitializeProtocolConformances : 1;
+
+  /// Normally if the -read-legacy-type-info flag is not specified, we look for
+  /// a file named "legacy-<arch>.yaml" in SearchPathOpts.RuntimeLibraryPath.
+  /// Passing this flag completely disables this behavior.
+  unsigned DisableLegacyTypeInfo : 1;
+
+  /// The path to load legacy type layouts from.
+  StringRef ReadLegacyTypeInfoPath;
+
   /// Should we try to build incrementally by not emitting an object file if it
   /// has the same IR hash as the module that we are preparing to emit?
   ///
@@ -161,41 +203,76 @@ public:
   /// Enable use of the swiftcall calling convention.
   unsigned UseSwiftCall : 1;
 
+  /// Instrument code to generate profiling information.
+  unsigned GenerateProfile : 1;
+
+  /// Enable chaining of dynamic replacements.
+  unsigned EnableDynamicReplacementChaining : 1;
+
+  /// Disable round-trip verification of mangled debug types.
+  unsigned DisableRoundTripDebugTypes : 1;
+
+  /// Whether to disable shadow copies for local variables on the stack. This is
+  /// only used for testing.
+  unsigned DisableDebuggerShadowCopies : 1;
+
+  /// Path to the profdata file to be used for PGO, or the empty string.
+  std::string UseProfile = "";
+
   /// List of backend command-line options for -embed-bitcode.
   std::vector<uint8_t> CmdArgs;
 
   /// Which sanitizer coverage is turned on.
   llvm::SanitizerCoverageOptions SanitizeCoverage;
 
+  /// The different modes for dumping IRGen type info.
+  enum class TypeInfoDumpFilter {
+    All,
+    Resilient,
+    Fragile
+  };
+
+  TypeInfoDumpFilter TypeInfoFilter;
+  
+  /// Pull in runtime compatibility shim libraries by autolinking.
+  Optional<llvm::VersionTuple> AutolinkRuntimeCompatibilityLibraryVersion;
+  Optional<llvm::VersionTuple> AutolinkRuntimeCompatibilityDynamicReplacementLibraryVersion;
+
   IRGenOptions()
       : DWARFVersion(2), OutputKind(IRGenOutputKind::LLVMAssembly),
-        Verify(true), Optimize(false), Sanitize(SanitizerKind::None),
-        DebugInfoKind(IRGenDebugInfoKind::None), UseJIT(false),
-        DisableLLVMOptzns(false), DisableLLVMARCOpts(false),
-        DisableLLVMSLPVectorizer(false), DisableFPElim(true), Playground(false),
-        EmitStackPromotionChecks(false), GenerateProfile(false),
+        Verify(true), OptMode(OptimizationMode::NotSet),
+        Sanitizers(OptionSet<SanitizerKind>()),
+        SanitizersWithRecoveryInstrumentation(OptionSet<SanitizerKind>()),
+        DebugInfoLevel(IRGenDebugInfoLevel::None),
+        DebugInfoFormat(IRGenDebugInfoFormat::None),
+        DisableClangModuleSkeletonCUs(false), UseJIT(false),
+        IntegratedREPL(false), DisableLLVMOptzns(false),
+        DisableSwiftSpecificLLVMOptzns(false), DisableLLVMSLPVectorizer(false),
+        DisableFPElim(true), Playground(false), EmitStackPromotionChecks(false),
         PrintInlineTree(false), EmbedMode(IRGenEmbedMode::None),
         HasValueNamesSetting(false), ValueNames(false),
         EnableReflectionMetadata(true), EnableReflectionNames(true),
-        UseIncrementalLLVMCodeGen(true), UseSwiftCall(false), CmdArgs(),
-        SanitizeCoverage(llvm::SanitizerCoverageOptions()) {}
+        EnableAnonymousContextMangledNames(false), ForcePublicLinkage(false),
+        LazyInitializeClassMetadata(false),
+        LazyInitializeProtocolConformances(false), DisableLegacyTypeInfo(false),
+        UseIncrementalLLVMCodeGen(true), UseSwiftCall(false),
+        GenerateProfile(false), EnableDynamicReplacementChaining(false),
+        DisableRoundTripDebugTypes(false), DisableDebuggerShadowCopies(false),
+        CmdArgs(), SanitizeCoverage(llvm::SanitizerCoverageOptions()),
+        TypeInfoFilter(TypeInfoDumpFilter::All) {}
 
-  /// Gets the name of the specified output filename.
-  /// If multiple files are specified, the last one is returned.
-  StringRef getSingleOutputFilename() const {
-    if (OutputFilenames.size() >= 1)
-      return OutputFilenames.back();
-    return StringRef();
-  }
-
-  // Get a hash of all options which influence the llvm compilation but are not
-  // reflected in the llvm module itself.
-  unsigned getLLVMCodeGenOptionsHash() {
-    unsigned Hash = 0;
-    Hash = (Hash << 1) | Optimize;
-    Hash = (Hash << 1) | DisableLLVMOptzns;
-    Hash = (Hash << 1) | DisableLLVMARCOpts;
-    return Hash;
+  /// Appends to \p os an arbitrary string representing all options which
+  /// influence the llvm compilation but are not reflected in the llvm module
+  /// itself.
+  void writeLLVMCodeGenOptionsTo(llvm::raw_ostream &os) {
+    // We put a letter between each value simply to keep them from running into
+    // one another. There might be a vague correspondence between meaning and
+    // letter, but don't sweat it.
+    os << 'O' << (unsigned)OptMode
+       << 'd' << DisableLLVMOptzns
+       << 'D' << DisableSwiftSpecificLLVMOptzns
+       << 'p' << GenerateProfile
+       << 's' << Sanitizers.toRaw();
   }
 
   /// Should LLVM IR value names be emitted and preserved?
@@ -208,6 +285,20 @@ public:
     } else {
       return OutputKind == IRGenOutputKind::LLVMAssembly;
     }
+  }
+
+  bool shouldOptimize() const {
+    return OptMode > OptimizationMode::NoOptimization;
+  }
+
+  bool optimizeForSize() const {
+    return OptMode == OptimizationMode::ForSize;
+  }
+
+  /// Return a hash code of any components from these options that should
+  /// contribute to a Swift Bridging PCH hash.
+  llvm::hash_code getPCHHashComponents() const {
+    return llvm::hash_value(0);
   }
 };
 

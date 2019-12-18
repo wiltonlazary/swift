@@ -1,4 +1,6 @@
-// RUN: %target-swift-frontend -Xllvm -new-mangling-for-tests -O -Xllvm -sil-disable-pass="Function Signature Optimization" -emit-sil %s | %FileCheck %s
+// RUN: %target-swift-frontend -O -Xllvm -sil-disable-pass=FunctionSignatureOpts -Xllvm -sil-disable-pass=PerfInliner -emit-sil %s | %FileCheck %s
+// RUN: %target-swift-frontend -O -Xllvm -sil-disable-pass=FunctionSignatureOpts -Xllvm -sil-disable-pass=PerfInliner -enable-ownership-stripping-after-serialization -emit-sil %s | %FileCheck %s
+
 // We want to check two things here:
 // - Correctness
 // - That certain "is" checks are eliminated based on static analysis at compile-time
@@ -36,7 +38,7 @@ func cast0(_ o: AnyObject) -> Bool {
   return o is CX
 }
 
-// CHECK-LABEL: sil hidden [noinline] @_T017cast_folding_objc5test0SbyF
+// CHECK-LABEL: sil hidden [noinline] @$s17cast_folding_objc5test0SbyF
 // CHECK: bb0
 // Check that cast is not eliminated even though cast0 is a conversion
 // from a class to struct, because it casts to a struct implementing
@@ -52,7 +54,7 @@ func test0() -> Bool {
 // the compiler does not statically know if this object
 // is NSNumber can be converted into Int.
 
-// CHECK-LABEL: sil [noinline] @_T017cast_folding_objc35testMayBeBridgedCastFromObjCtoSwiftSis9AnyObject_pF
+// CHECK-LABEL: sil [noinline] @$s17cast_folding_objc35testMayBeBridgedCastFromObjCtoSwiftySiyXlF
 // CHECK: unconditional_checked_cast_addr
 // CHECK: return
 @inline(never)
@@ -64,7 +66,7 @@ public func testMayBeBridgedCastFromObjCtoSwift(_ o: AnyObject) -> Int {
 // the compiler does not statically know if this object
 // is NSString can be converted into String.
 
-// CHECK-LABEL: sil [noinline] @_T017cast_folding_objc41testConditionalBridgedCastFromObjCtoSwiftSSSgs9AnyObject_pF
+// CHECK-LABEL: sil [noinline] @$s17cast_folding_objc41testConditionalBridgedCastFromObjCtoSwiftySSSgyXlF
 // CHECK: unconditional_checked_cast_addr
 // CHECK: return
 @inline(never)
@@ -77,7 +79,7 @@ public func castObjCToSwift<T>(_ t: T) -> Int {
 }
 
 // Check that compiler understands that this cast always fails
-// CHECK-LABEL: sil [noinline] @_T017cast_folding_objc37testFailingBridgedCastFromObjCtoSwiftSiSo8NSStringCF
+// CHECK-LABEL: sil [noinline] @$s17cast_folding_objc37testFailingBridgedCastFromObjCtoSwiftySiSo8NSStringCF
 // CHECK: builtin "int_trap"
 // CHECK-NEXT: unreachable
 // CHECK-NEXT: }
@@ -87,7 +89,7 @@ public func testFailingBridgedCastFromObjCtoSwift(_ ns: NSString) -> Int {
 }
 
 // Check that compiler understands that this cast always fails
-// CHECK-LABEL: sil [noinline] @_T017cast_folding_objc37testFailingBridgedCastFromSwiftToObjCSiSSF
+// CHECK-LABEL: sil [noinline] @$s17cast_folding_objc37testFailingBridgedCastFromSwiftToObjCySiSSF
 // CHECK: builtin "int_trap"
 // CHECK-NEXT: unreachable
 // CHECK-NEXT: }
@@ -196,6 +198,38 @@ public func testCastEveryToNonClassType<T>(_ o: T) -> Int.Type {
   return o as! Int.Type
 }
 
+func cast<U, V>(_ u: U.Type) -> V? {
+  return u as? V
+}
+
+public protocol P {
+}
+
+// Any casts from P.Protocol to P.Type should fail.
+@inline(never)
+public func testCastPProtocolToPType() -> ObjCP.Type? {
+  return cast(ObjCP.self)
+}
+
+@objc
+public protocol ObjCP {
+}
+
+@inline(never)
+public func testCastObjCPProtocolToObjCPType() -> ObjCP.Type? {
+  return cast(ObjCP.self)
+}
+
+@inline(never)
+public func testCastProtocolCompositionProtocolToProtocolCompositionType() -> (P & ObjCP).Type? {
+  return cast((P & ObjCP).self)
+}
+
+@inline(never)
+public func testCastProtocolCompositionProtocolToProtocolType () -> P.Type? {
+  return (P & ObjCP).self as? P.Type
+}
+
 print("test0=\(test0())")
 
 
@@ -241,7 +275,17 @@ print("test0=\(test0())")
 // CHECK-LABEL: sil [noinline] @{{.*}}testCastEveryToNonClassType
 // CHECK:         unconditional_checked_cast_addr
 
+// CHECK-LABEL: sil [noinline] @{{.*}}testCastPProtocolToPType
+// CHECK: %0 = enum $Optional{{.*}}, #Optional.none!enumelt
+// CHECK-NEXT: return %0
 
+// CHECK-LABEL: sil [noinline] @{{.*}}testCastObjCPProtocolTo{{.*}}PType
+// CHECK: %0 = enum $Optional{{.*}}, #Optional.none!enumelt
+// CHECK-NEXT: return %0
+
+// CHECK-LABEL: sil [noinline] @{{.*}}testCastProtocolComposition{{.*}}Type
+// CHECK: %0 = enum $Optional{{.*}}, #Optional.none!enumelt
+// CHECK-NEXT: return %0
 
 // Check that compiler understands that this cast always succeeds.
 // Since it is can be statically proven that NSString is bridgeable to String,
@@ -255,9 +299,9 @@ public func testBridgedCastFromObjCtoSwift(_ ns: NSString) -> String {
 
 // Check that compiler understands that this cast always succeeds
 
-// CHECK-LABEL: sil [noinline] @_T017cast_folding_objc30testBridgedCastFromSwiftToObjCSo8NSStringCSSF
+// CHECK-LABEL: sil [noinline] @$s17cast_folding_objc30testBridgedCastFromSwiftToObjCySo8NSStringCSSF
 // CHECK-NOT: {{ cast}}
-// CHECK: function_ref @_T0SS10FoundationE19_bridgeToObjectiveC{{[_0-9a-zA-Z]*}}F
+// CHECK: function_ref @$sSS10FoundationE19_bridgeToObjectiveC{{[_0-9a-zA-Z]*}}F
 // CHECK: apply
 // CHECK: return
 @inline(never)
@@ -265,3 +309,53 @@ public func testBridgedCastFromSwiftToObjC(_ s: String) -> NSString {
   return s as NSString
 }
 
+public class MyString: NSString {}
+
+// Check that the cast-optimizer bails out on a conditional downcast to a subclass of a
+// bridged ObjC class.
+// CHECK-LABEL: sil [noinline] @{{.*}}testConditionalBridgedCastFromSwiftToNSObjectDerivedClass{{.*}}
+// CHECK: bb0([[ARG:%.*]] : $String):
+// CHECK:   [[FUNC:%.*]] = function_ref @$sSS10FoundationE19_bridgeToObjectiveC{{[_0-9a-zA-Z]*}}F
+// CHECK:   [[BRIDGED_VALUE:%.*]] = apply [[FUNC]]([[ARG]])
+// CHECK-NOT: apply
+// CHECK-NOT: unconditional_checked_cast
+// CHECK: checked_cast_br [[BRIDGED_VALUE]] : $NSString to MyString, [[SUCC_BB:bb[0-9]+]], [[FAIL_BB:bb[0-9]+]]
+//
+// CHECK: [[SUCC_BB]]([[CAST_BRIDGED_VALUE:%.*]] : $MyString)
+// CHECK:   [[SOME:%.*]] = enum $Optional<MyString>, #Optional.some!enumelt.1, [[CAST_BRIDGED_VALUE]] : $MyString
+// CHECK:   br [[CONT_BB:bb[0-9]+]]([[SOME]] :
+//
+// CHECK: [[FAIL_BB]]:
+// CHECK:   strong_release [[BRIDGED_VALUE]]
+// CHECK:   [[NONE:%.*]] = enum $Optional<MyString>, #Optional.none!enumelt
+// CHECK:   br [[CONT_BB]]([[NONE]] :
+//
+// CHECK: [[CONT_BB:bb[0-9]+]]([[RESULT:%.*]] :
+// CHECK:   return [[RESULT]]
+// CHECK: } // end sil function '${{.*}}testConditionalBridgedCastFromSwiftToNSObjectDerivedClass{{.*}}'
+@inline(never)
+public func testConditionalBridgedCastFromSwiftToNSObjectDerivedClass(_ s: String) -> MyString? {
+  return s as? MyString
+}
+
+// Check that the cast-optimizer does not bail out on an unconditional downcast to a subclass of a
+// bridged ObjC class.
+// CHECK-LABEL: sil [noinline] @{{.*}}testForcedBridgedCastFromSwiftToNSObjectDerivedClass{{.*}}
+// CHECK: function_ref @$sSS10FoundationE19_bridgeToObjectiveC{{[_0-9a-zA-Z]*}}F
+// CHECK: apply
+// CHECK-NOT: apply
+// CHECK-NOT: checked_cast_br
+// CHECK: unconditional_checked_cast
+// CHECK-NOT: apply
+// CHECK-NOT: unconditional
+// CHECK-NOT: checked_cast
+// CHECK: return
+@inline(never)
+public func testForcedBridgedCastFromSwiftToNSObjectDerivedClass(_ s: String) -> MyString {
+    return s as! MyString
+}
+
+// rdar://problem/51078136
+func foo(x: CFMutableDictionary) -> [AnyHashable:AnyObject]? {
+  return x as? [AnyHashable:AnyObject]
+}

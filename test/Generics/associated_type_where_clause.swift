@@ -1,4 +1,4 @@
-// RUN: %target-typecheck-verify-swift -typecheck %s -verify -swift-version 4
+// RUN: %target-typecheck-verify-swift -swift-version 4
 
 func needsSameType<T>(_: T.Type, _: T.Type) {}
 
@@ -22,7 +22,7 @@ struct ConcreteConforms2: Conforms { typealias T = Int }
 struct ConcreteConformsNonFoo2: Conforms { typealias T = Float }
 
 protocol NestedConforms {
-    associatedtype U where U: Conforms, U.T: Foo2
+    associatedtype U where U: Conforms, U.T: Foo2 // expected-note{{protocol requires nested type 'U'; do you want to add it?}}
 
     func foo(_: U)
 }
@@ -43,7 +43,7 @@ struct BadConcreteNestedConforms: NestedConforms {
     typealias U = ConcreteConformsNonFoo2
 }
 struct BadConcreteNestedConformsInfer: NestedConforms {
-    // expected-error@-1 {{type 'ConcreteConformsNonFoo2.T' (aka 'Float') does not conform to protocol 'Foo2'}}
+    // expected-error@-1 {{type 'BadConcreteNestedConformsInfer' does not conform to protocol 'NestedConforms'}}
     func foo(_: ConcreteConformsNonFoo2) {}
 }
 
@@ -61,7 +61,7 @@ func needsNestedConformsDefault<X: NestedConformsDefault>(_: X.Type) {
 }
 
 protocol NestedSameType {
-    associatedtype U: Conforms where U.T == Int
+    associatedtype U: Conforms where U.T == Int // expected-note{{protocol requires nested type 'U'; do you want to add it?}}
 
     func foo(_: U)
 }
@@ -76,8 +76,7 @@ struct BadConcreteNestedSameType: NestedSameType {
     typealias U = ConcreteConformsNonFoo2
 }
 struct BadConcreteNestedSameTypeInfer: NestedSameType {
-    // expected-error@-1 {{'NestedSameType' requires the types 'ConcreteConformsNonFoo2.T' (aka 'Float') and 'Int' be equivalent}}
-    // expected-note@-2 {{requirement specified as 'Self.U.T' == 'Int' [with Self = BadConcreteNestedSameTypeInfer]}}
+    // expected-error@-1 {{type 'BadConcreteNestedSameTypeInfer' does not conform to protocol 'NestedSameType'}}
     func foo(_: ConcreteConformsNonFoo2) {}
 }
 
@@ -126,3 +125,79 @@ struct BadConcreteInherits: Inherits {
     typealias X = ConcreteConformsNonFoo2
 }
 */
+
+struct X { }
+
+protocol P {
+	associatedtype P1 where P1 == X
+	// expected-note@-1{{same-type constraint 'Self.P1' == 'X' written here}}
+	associatedtype P2 where P2 == P1, P2 == X
+	// expected-warning@-1{{redundant same-type constraint 'Self.P2' == 'X'}}
+}
+
+// Lookup of same-named associated types aren't ambiguous in this context.
+protocol P1 {
+  associatedtype A
+}
+
+protocol P2: P1 {
+  associatedtype A
+  associatedtype B where A == B
+}
+
+protocol P3: P1 {
+  associatedtype A
+}
+
+protocol P4 {
+  associatedtype A
+}
+
+protocol P5: P3, P4 {
+  associatedtype B where B == A?
+}
+
+// Associated type inference should account for where clauses.
+protocol P6 {
+  associatedtype A
+}
+
+struct X1 { }
+
+struct X2 { }
+
+struct Y1 : P6 {
+  typealias A = X1
+}
+
+struct Y2 : P6 {
+  typealias A = X2
+}
+
+protocol P7 {
+  associatedtype B: P6 // expected-note{{ambiguous inference of associated type 'B': 'Y1' vs. 'Y2'}}
+  associatedtype C: P6 where B.A == C.A
+
+  func getB() -> B
+  func getC() -> C
+}
+
+struct Z1 : P7 {
+  func getB() -> Y1 { return Y1() }
+  func getB() -> Y2 { return Y2() }
+
+  func getC() -> Y1 { return Y1() }
+}
+
+func testZ1(z1: Z1) {
+  let _: Z1.C = Y1()
+}
+
+
+struct Z2 : P7 { // expected-error{{type 'Z2' does not conform to protocol 'P7'}}
+  func getB() -> Y1 { return Y1() } // expected-note{{matching requirement 'getB()' to this declaration inferred associated type to 'Y1'}}
+  func getB() -> Y2 { return Y2() } // expected-note{{matching requirement 'getB()' to this declaration inferred associated type to 'Y2'}}
+
+  func getC() -> Y1 { return Y1() }
+  func getC() -> Y2 { return Y2() }
+}

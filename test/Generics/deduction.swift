@@ -7,7 +7,9 @@
 func identity<T>(_ value: T) -> T { return value }
 
 func identity2<T>(_ value: T) -> T { return value }
+// expected-note@-1 {{'identity2' produces 'Y', not the expected contextual result type 'X'}}
 func identity2<T>(_ value: T) -> Int { return 0 }
+// expected-note@-1 {{'identity2' produces 'Int', not the expected contextual result type 'X'}}
 
 struct X { }
 struct Y { }
@@ -22,8 +24,8 @@ func useIdentity(_ x: Int, y: Float, i32: Int32) {
 
   // Deduction where the result type and input type can get different results
   var xx : X, yy : Y
-  xx = identity(yy) // expected-error{{cannot convert value of type 'Y' to expected argument type 'X'}}
-  xx = identity2(yy) // expected-error{{cannot convert value of type 'Y' to expected argument type 'X'}}
+  xx = identity(yy) // expected-error{{cannot assign value of type 'Y' to type 'X'}}
+  xx = identity2(yy) // expected-error{{no exact matches in call to global function 'identity2'}}
 }
 
 // FIXME: Crummy diagnostic!
@@ -65,7 +67,7 @@ func takeTuples<T, U>(_: (T, U), _: (U, T)) {
 func useTuples(_ x: Int, y: Float, z: (Float, Int)) {
   takeTuples((x, y), (y, x))
 
-  takeTuples((x, y), (x, y)) // expected-error{{cannot convert value of type 'Int' to expected argument type 'Float'}}
+  takeTuples((x, y), (x, y)) // expected-error{{cannot convert value of type '(Int, Float)' to expected argument type '(Float, Int)'}}
 
   // FIXME: Use 'z', which requires us to fix our tuple-conversion
   // representation.
@@ -194,7 +196,7 @@ protocol IsBefore {
   func isBefore(_ other: Self) -> Bool
 }
 
-func min2<T : IsBefore>(_ x: T, _ y: T) -> T {
+func min2<T : IsBefore>(_ x: T, _ y: T) -> T { // expected-note {{where 'T' = 'Float'}}
   if y.isBefore(x) { return y }
   return x
 }
@@ -205,22 +207,23 @@ extension Int : IsBefore {
 
 func callMin(_ x: Int, y: Int, a: Float, b: Float) {
   _ = min2(x, y)
-  min2(a, b) // expected-error{{argument type 'Float' does not conform to expected type 'IsBefore'}}
+  min2(a, b) // expected-error{{global function 'min2' requires that 'Float' conform to 'IsBefore'}}
 }
 
-func rangeOfIsBefore<R : IteratorProtocol>(_ range: R) where R.Element : IsBefore {}
+func rangeOfIsBefore<R : IteratorProtocol>(_ range: R) where R.Element : IsBefore {} // expected-note {{where 'R.Element' = 'IndexingIterator<[Double]>.Element' (aka 'Double')}}
 
 func callRangeOfIsBefore(_ ia: [Int], da: [Double]) {
   rangeOfIsBefore(ia.makeIterator())
-  rangeOfIsBefore(da.makeIterator()) // expected-error{{type 'Double' does not conform to protocol 'IsBefore'}}
+  rangeOfIsBefore(da.makeIterator()) // expected-error{{global function 'rangeOfIsBefore' requires that 'IndexingIterator<[Double]>.Element' (aka 'Double') conform to 'IsBefore'}}
 }
 
 func testEqualIterElementTypes<A: IteratorProtocol, B: IteratorProtocol>(_ a: A, _ b: B) where A.Element == B.Element {}
-// expected-note@-1 {{requirement specified as 'A.Element' == 'B.Element' [with A = IndexingIterator<[Int]>, B = IndexingIterator<[Double]>]}}
+// expected-note@-1 {{where 'A.Element' = 'IndexingIterator<[Int]>.Element' (aka 'Int'), 'B.Element' = 'IndexingIterator<[Double]>.Element' (aka 'Double')}}
 func compareIterators() {
   var a: [Int] = []
   var b: [Double] = []
-  testEqualIterElementTypes(a.makeIterator(), b.makeIterator()) // expected-error {{'<A, B where A : IteratorProtocol, B : IteratorProtocol, A.Element == B.Element> (A, B) -> ()' requires the types 'Int' and 'Double' be equivalent}}
+  testEqualIterElementTypes(a.makeIterator(), b.makeIterator())
+  // expected-error@-1 {{global function 'testEqualIterElementTypes' requires the types 'IndexingIterator<[Int]>.Element' (aka 'Int') and 'IndexingIterator<[Double]>.Element' (aka 'Double') be equivalent}}
 }
 
 protocol P_GI {
@@ -233,19 +236,18 @@ class C_GI : P_GI {
 
 class GI_Diff {}
 func genericInheritsA<T>(_ x: T) where T : P_GI, T.Y : GI_Diff {}
-// expected-note@-1 {{requirement specified as 'T.Y' : 'GI_Diff' [with T = C_GI]}}
-genericInheritsA(C_GI()) // expected-error {{<T where T : P_GI, T.Y : GI_Diff> (T) -> ()' requires that 'C_GI.Y' (aka 'Double') inherit from 'GI_Diff'}}
-
+// expected-note@-1 {{where 'T.Y' = 'C_GI.Y' (aka 'Double')}}
+genericInheritsA(C_GI())
+// expected-error@-1 {{global function 'genericInheritsA' requires that 'C_GI.Y' (aka 'Double') inherit from 'GI_Diff'}}
 
 //===----------------------------------------------------------------------===//
 // Deduction for member operators
 //===----------------------------------------------------------------------===//
-protocol Addable {
+protocol Addable { // expected-note {{where 'Self' = 'U'}}
   static func +(x: Self, y: Self) -> Self
 }
 func addAddables<T : Addable, U>(_ x: T, y: T, u: U) -> T {
-  u + u // expected-error{{binary operator '+' cannot be applied to two 'U' operands}}
-  // expected-note @-1 {{overloads for '+' exist with these partially matching parameter lists: }}
+  u + u // expected-error{{protocol 'Addable' requires that 'U' conform to 'Addable'}}
   return x+y
 }
 
@@ -254,7 +256,7 @@ func addAddables<T : Addable, U>(_ x: T, y: T, u: U) -> T {
 //===----------------------------------------------------------------------===//
 struct MyVector<T> { func size() -> Int {} }
 
-func getVectorSize<T>(_ v: MyVector<T>) -> Int {
+func getVectorSize<T>(_ v: MyVector<T>) -> Int { // expected-note {{in call to function 'getVectorSize'}}
   return v.size()
 }
 
@@ -266,7 +268,8 @@ func testGetVectorSize(_ vi: MyVector<Int>, vf: MyVector<Float>) {
   i = getVectorSize(vi)
   i = getVectorSize(vf)
 
-  getVectorSize(i) // expected-error{{cannot convert value of type 'Int' to expected argument type 'MyVector<_>'}}
+  getVectorSize(i) // expected-error{{cannot convert value of type 'Int' to expected argument type 'MyVector<T>'}}
+  // expected-error@-1 {{generic parameter 'T' could not be inferred}}
 
   var x : X, y : Y
   x = ovlVector(vi)
@@ -292,7 +295,7 @@ protocol Bool_ {}
 struct False : Bool_ {}
 struct True : Bool_ {}
 
-postfix func <*> <B:Bool_>(_: Test<B>) -> Int? { return .none }
+postfix func <*> <B>(_: Test<B>) -> Int? { return .none }
 postfix func <*> (_: Test<True>) -> String? { return .none }
 
 class Test<C: Bool_> : MetaFunction {
@@ -310,11 +313,32 @@ class DeducePropertyParams {
 // SR-69
 struct A {}
 func foo() {
-    for i in min(1,2) { // expected-error{{type 'Int' does not conform to protocol 'Sequence'}}
+    for i in min(1,2) { // expected-error{{for-in loop requires 'Int' to conform to 'Sequence'}}
     }
     let j = min(Int(3), Float(2.5)) // expected-error{{cannot convert value of type 'Float' to expected argument type 'Int'}}
-    let k = min(A(), A()) // expected-error{{argument type 'A' does not conform to expected type 'Comparable'}}
+    let k = min(A(), A()) // expected-error{{global function 'min' requires that 'A' conform to 'Comparable'}}
     let oi : Int? = 5
-    let l = min(3, oi) // expected-error{{value of optional type 'Int?' not unwrapped; did you mean to use '!' or '?'?}}
+    let l = min(3, oi) // expected-error{{global function 'min' requires that 'Int?' conform to 'Comparable'}}
+  // expected-note@-1{{wrapped type 'Int' satisfies this requirement}}
 }
 
+infix operator +&
+func +&<R, S>(lhs: inout R, rhs: S) where R : RangeReplaceableCollection, S : Sequence, R.Element == S.Element {}
+// expected-note@-1 {{where 'R.Element' = 'String', 'S.Element' = 'String.Element' (aka 'Character')}}
+
+func rdar33477726_1() {
+  var arr: [String] = []
+  arr +& "hello"
+  // expected-error@-1 {{operator function '+&' requires the types 'String' and 'String.Element' (aka 'Character') be equivalent}}
+}
+
+func rdar33477726_2<R, S>(_: R, _: S) where R: Sequence, S == R.Element {}
+rdar33477726_2("answer", 42)
+// expected-error@-1 {{cannot convert value of type 'Int' to expected argument type 'String.Element' (aka 'Character')}}
+
+prefix operator +-
+prefix func +-<T>(_: T) where T: Sequence, T.Element == Int {}
+// expected-note@-1 {{where 'T.Element' = 'String.Element' (aka 'Character')}}
+
++-"hello"
+// expected-error@-1 {{operator function '+-' requires the types 'String.Element' (aka 'Character') and 'Int' be equivalent}}

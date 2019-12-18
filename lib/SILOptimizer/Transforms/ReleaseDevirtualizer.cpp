@@ -15,6 +15,8 @@
 #include "swift/SILOptimizer/PassManager/Transforms.h"
 #include "swift/SILOptimizer/Analysis/RCIdentityAnalysis.h"
 #include "swift/SIL/SILBuilder.h"
+#include "swift/AST/GenericSignature.h"
+#include "swift/AST/SubstitutionMap.h"
 #include "llvm/ADT/Statistic.h"
 
 STATISTIC(NumReleasesDevirtualized, "Number of devirtualized releases");
@@ -59,13 +61,11 @@ private:
   bool createDeallocCall(SILType AllocType, SILInstruction *ReleaseInst,
                          SILValue object);
 
-  StringRef getName() override { return "Release Devirtualizer"; }
-
   RCIdentityFunctionInfo *RCIA = nullptr;
 };
 
 void ReleaseDevirtualizer::run() {
-  DEBUG(llvm::dbgs() << "** ReleaseDevirtualizer **\n");
+  LLVM_DEBUG(llvm::dbgs() << "** ReleaseDevirtualizer **\n");
 
   SILFunction *F = getFunction();
   RCIA = PM->getAnalysis<RCIdentityAnalysis>()->get(F);
@@ -103,7 +103,7 @@ bool ReleaseDevirtualizer::
 devirtualizeReleaseOfObject(SILInstruction *ReleaseInst,
                             DeallocRefInst *DeallocInst) {
 
-  DEBUG(llvm::dbgs() << "  try to devirtualize " << *ReleaseInst);
+  LLVM_DEBUG(llvm::dbgs() << "  try to devirtualize " << *ReleaseInst);
 
   // We only do the optimization for stack promoted object, because for these
   // we know that they don't have associated objects, which are _not_ released
@@ -114,7 +114,7 @@ devirtualizeReleaseOfObject(SILInstruction *ReleaseInst,
     return false;
 
   // Is the dealloc_ref paired with an alloc_ref?
-  AllocRefInst *ARI = dyn_cast<AllocRefInst>(DeallocInst->getOperand());
+  auto *ARI = dyn_cast<AllocRefInst>(DeallocInst->getOperand());
   if (!ARI)
     return false;
 
@@ -130,7 +130,7 @@ devirtualizeReleaseOfObject(SILInstruction *ReleaseInst,
 bool ReleaseDevirtualizer::createDeallocCall(SILType AllocType,
                                             SILInstruction *ReleaseInst,
                                             SILValue object) {
-  DEBUG(llvm::dbgs() << "  create dealloc call\n");
+  LLVM_DEBUG(llvm::dbgs() << "  create dealloc call\n");
 
   ClassDecl *Cl = AllocType.getClassOrBoundGenericClass();
   assert(Cl && "no class type allocated with alloc_ref");
@@ -142,18 +142,14 @@ bool ReleaseDevirtualizer::createDeallocCall(SILType AllocType,
   SILFunction *Dealloc = M.lookUpFunction(DeallocRef);
   if (!Dealloc)
     return false;
+  TypeExpansionContext context(*ReleaseInst->getFunction());
+  CanSILFunctionType DeallocType =
+      Dealloc->getLoweredFunctionTypeInContext(context);
+  auto *NTD = AllocType.getASTType()->getAnyNominal();
+  auto AllocSubMap = AllocType.getASTType()
+    ->getContextSubstitutionMap(M.getSwiftModule(), NTD);
 
-  CanSILFunctionType DeallocType = Dealloc->getLoweredFunctionType();
-  SubstitutionList AllocSubsts = AllocType.gatherAllSubstitutions(M);
-
-  assert(!AllocSubsts.empty() == DeallocType->isPolymorphic() &&
-         "dealloc of generic class is not polymorphic or vice versa");
-
-  if (DeallocType->isPolymorphic())
-    DeallocType = DeallocType->substGenericArgs(M, AllocSubsts);
-
-  SILType ReturnType = Dealloc->getConventions().getSILResultType();
-  SILType DeallocSILType = SILType::getPrimitiveObjectType(DeallocType);
+  DeallocType = DeallocType->substGenericArgs(M, AllocSubMap, context);
 
   SILBuilder B(ReleaseInst);
   if (object->getType() != AllocType)
@@ -167,8 +163,8 @@ bool ReleaseDevirtualizer::createDeallocCall(SILType AllocType,
   // Create the call to the destructor with the allocated object as self
   // argument.
   auto *MI = B.createFunctionRef(ReleaseInst->getLoc(), Dealloc);
-  B.createApply(ReleaseInst->getLoc(), MI, DeallocSILType, ReturnType,
-                AllocSubsts, { object }, false);
+
+  B.createApply(ReleaseInst->getLoc(), MI, AllocSubMap, {object});
 
   NumReleasesDevirtualized++;
   ReleaseInst->eraseFromParent();

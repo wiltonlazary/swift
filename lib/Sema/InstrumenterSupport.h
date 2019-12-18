@@ -17,6 +17,8 @@
 
 #include "TypeChecker.h"
 
+#include "swift/AST/ASTWalker.h"
+
 namespace swift {
 namespace instrumenter_support {
 
@@ -38,11 +40,20 @@ public:
 class InstrumenterBase {
 
 protected:
-  InstrumenterBase() : CF(*this) {}
+  ASTContext &Context;
+  DeclContext *TypeCheckDC;
+  Optional<DeclNameRef> ModuleIdentifier;
+  Optional<DeclNameRef> FileIdentifier;
+
+  InstrumenterBase(ASTContext &C, DeclContext *DC);
   virtual ~InstrumenterBase() = default;
   virtual void anchor();
   virtual BraceStmt *transformBraceStmt(BraceStmt *BS,
                                         bool TopLevel = false) = 0;
+
+  /// Create an expression which retrieves a valid ModuleIdentifier or
+  /// FileIdentifier, if available.
+  Expr *buildIDArgumentExpr(Optional<DeclNameRef> name, SourceRange SR);
 
   class ClosureFinder : public ASTWalker {
   private:
@@ -59,7 +70,7 @@ protected:
       }
     }
     std::pair<bool, Expr *> walkToExprPre(Expr *E) override {
-      if (ClosureExpr *CE = dyn_cast<ClosureExpr>(E)) {
+      if (auto *CE = dyn_cast<ClosureExpr>(E)) {
         BraceStmt *B = CE->getBody();
         if (B) {
           BraceStmt *NB = I.transformBraceStmt(B);

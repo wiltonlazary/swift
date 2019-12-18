@@ -20,11 +20,11 @@
 //===----------------------------------------------------------------------===//
 
 #define DEBUG_TYPE "sil-func-extractor"
-#include "swift/Strings.h"
-#include "swift/Basic/Demangle.h"
+#include "swift/Basic/FileTypes.h"
 #include "swift/Basic/LLVM.h"
 #include "swift/Basic/LLVMInitialize.h"
-#include "swift/Basic/ManglingMacros.h"
+#include "swift/Demangling/Demangle.h"
+#include "swift/Demangling/ManglingMacros.h"
 #include "swift/Frontend/DiagnosticVerifier.h"
 #include "swift/Frontend/Frontend.h"
 #include "swift/Frontend/PrintingDiagnosticConsumer.h"
@@ -111,10 +111,10 @@ DisableASTDump("sil-disable-ast-dump", llvm::cl::Hidden,
                llvm::cl::init(false),
                llvm::cl::desc("Do not dump AST."));
 
-static llvm::cl::opt<bool> AssumeUnqualifiedOwnershipWhenParsing(
-    "assume-parsing-unqualified-ownership-sil", llvm::cl::Hidden,
-    llvm::cl::init(false),
-    llvm::cl::desc("Assume all parsed functions have unqualified ownership"));
+static llvm::cl::opt<bool>
+DisableSILLinking("disable-sil-linking",
+                  llvm::cl::init(true),
+                  llvm::cl::desc("Disable SIL linking"));
 
 // This function isn't referenced outside its translation unit, but it
 // can't use the "static" keyword because its address is used for
@@ -172,10 +172,10 @@ void removeUnwantedFunctions(SILModule *M, ArrayRef<std::string> MangledNames,
     StringRef MangledName = F.getName();
     std::string DemangledName =
         swift::Demangle::demangleSymbolAsString(MangledName);
-    DemangledName = DemangledName.substr(0, DemangledName.find(' '));
-    DEBUG(llvm::dbgs() << "Visiting New Func:\n"
-                       << "    Mangled: " << MangledName
-                       << "\n    Demangled: " << DemangledName << "\n");
+    DemangledName = DemangledName.substr(0, DemangledName.find_first_of(" <("));
+    LLVM_DEBUG(llvm::dbgs() << "Visiting New Func:\n"
+                            << "    Mangled: " << MangledName
+                            << "\n    Demangled: " << DemangledName << "\n");
 
     bool FoundMangledName = stringInSortedArray(MangledName, MangledNames,
                                                 std::less<std::string>());
@@ -186,11 +186,11 @@ void removeUnwantedFunctions(SILModule *M, ArrayRef<std::string> MangledNames,
                  str2.substr(0, str2.find(' '));
         });
     if ((FoundMangledName || FoundDemangledName) ^ InvertMatch) {
-      DEBUG(llvm::dbgs() << "    Not removing!\n");
+      LLVM_DEBUG(llvm::dbgs() << "    Not removing!\n");
       continue;
     }
 
-    DEBUG(llvm::dbgs() << "    Removing!\n");
+    LLVM_DEBUG(llvm::dbgs() << "    Removing!\n");
 
     // If F has no body, there is nothing further to do.
     if (!F.size())
@@ -220,7 +220,8 @@ void removeUnwantedFunctions(SILModule *M, ArrayRef<std::string> MangledNames,
 }
 
 int main(int argc, char **argv) {
-  INITIALIZE_LLVM(argc, argv);
+  PROGRAM_START(argc, argv);
+  INITIALIZE_LLVM();
 
   llvm::cl::ParseCommandLineOptions(argc, argv, "Swift SIL Extractor\n");
 
@@ -249,37 +250,15 @@ int main(int argc, char **argv) {
   Invocation.getLangOptions().EnableAccessControl = false;
   Invocation.getLangOptions().EnableObjCAttrRequiresFoundation = false;
 
-  // Load the input file.
+  serialization::ExtendedValidationInfo extendedInfo;
   llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> FileBufOrErr =
-      llvm::MemoryBuffer::getFileOrSTDIN(InputFilename);
+      Invocation.setUpInputForSILTool(InputFilename, ModuleName,
+                                      /*alwaysSetModuleToMain*/ true,
+                                      /*bePrimary*/ false, extendedInfo);
   if (!FileBufOrErr) {
     fprintf(stderr, "Error! Failed to open file: %s\n", InputFilename.c_str());
     exit(-1);
   }
-
-  // If it looks like we have an AST, set the source file kind to SIL and the
-  // name of the module to the file's name.
-  Invocation.addInputBuffer(FileBufOrErr.get().get());
-
-  serialization::ExtendedValidationInfo extendedInfo;
-  auto result = serialization::validateSerializedAST(
-      FileBufOrErr.get()->getBuffer(), &extendedInfo);
-  bool HasSerializedAST = result.status == serialization::Status::Valid;
-
-  if (HasSerializedAST) {
-    const StringRef Stem = ModuleName.size()
-                               ? StringRef(ModuleName)
-                               : llvm::sys::path::stem(InputFilename);
-    Invocation.setModuleName(Stem);
-    Invocation.setInputKind(InputFileKind::IFK_Swift_Library);
-  } else {
-    Invocation.setModuleName("main");
-    Invocation.setInputKind(InputFileKind::IFK_SIL);
-  }
-
-  SILOptions &SILOpts = Invocation.getSILOptions();
-  SILOpts.AssumeUnqualifiedOwnershipWhenParsing =
-      AssumeUnqualifiedOwnershipWhenParsing;
 
   CompilerInstance CI;
   PrintingDiagnosticConsumer PrintDiags;
@@ -295,15 +274,14 @@ int main(int argc, char **argv) {
 
   // Load the SIL if we have a module. We have to do this after SILParse
   // creating the unfortunate double if statement.
-  if (HasSerializedAST) {
+  if (Invocation.hasSerializedAST()) {
     assert(!CI.hasSILModule() &&
            "performSema() should not create a SILModule.");
-    CI.setSILModule(
-        SILModule::createEmptyModule(CI.getMainModule(), CI.getSILOptions()));
+    CI.createSILModule();
     std::unique_ptr<SerializedSILLoader> SL = SerializedSILLoader::create(
         CI.getASTContext(), CI.getSILModule(), nullptr);
 
-    if (extendedInfo.isSIB())
+    if (extendedInfo.isSIB() || DisableSILLinking)
       SL->getAllForModule(CI.getMainModule()->getName(), nullptr);
     else
       SL->getAll();
@@ -340,16 +318,16 @@ int main(int argc, char **argv) {
   ArrayRef<std::string> DemangledNames(&*std::next(Names.begin(), NumMangled),
                                        NumNames - NumMangled);
 
-  DEBUG(llvm::errs() << "MangledNames to keep:\n";
-        std::for_each(MangledNames.begin(), MangledNames.end(),
-                      [](const std::string &str) {
-                        llvm::errs() << "    " << str << '\n';
-                      }));
-  DEBUG(llvm::errs() << "DemangledNames to keep:\n";
-        std::for_each(DemangledNames.begin(), DemangledNames.end(),
-                      [](const std::string &str) {
-                        llvm::errs() << "    " << str << '\n';
-                      }));
+  LLVM_DEBUG(llvm::errs() << "MangledNames to keep:\n";
+             std::for_each(MangledNames.begin(), MangledNames.end(),
+                           [](const std::string &str) {
+                             llvm::errs() << "    " << str << '\n';
+                           }));
+  LLVM_DEBUG(llvm::errs() << "DemangledNames to keep:\n";
+             std::for_each(DemangledNames.begin(), DemangledNames.end(),
+                           [](const std::string &str) {
+                             llvm::errs() << "    " << str << '\n';
+                           }));
 
   removeUnwantedFunctions(CI.getSILModule(), MangledNames, DemangledNames);
 
@@ -359,10 +337,12 @@ int main(int argc, char **argv) {
       OutputFile = OutputFilename;
     } else if (ModuleName.size()) {
       OutputFile = ModuleName;
-      llvm::sys::path::replace_extension(OutputFile, SIB_EXTENSION);
+      llvm::sys::path::replace_extension(
+          OutputFile, file_types::getExtension(file_types::TY_SIB));
     } else {
       OutputFile = CI.getMainModule()->getName().str();
-      llvm::sys::path::replace_extension(OutputFile, SIB_EXTENSION);
+      llvm::sys::path::replace_extension(
+          OutputFile, file_types::getExtension(file_types::TY_SIB));
     }
 
     SerializationOptions serializationOpts;

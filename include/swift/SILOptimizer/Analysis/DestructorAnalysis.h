@@ -23,16 +23,37 @@ class DestructorAnalysis : public SILAnalysis {
   SILModule *Mod;
   llvm::DenseMap<CanType, bool> Cached;
 public:
-
   DestructorAnalysis(SILModule *M)
-      : SILAnalysis(AnalysisKind::Destructor), Mod(M) {}
+      : SILAnalysis(SILAnalysisKind::Destructor), Mod(M) {}
 
   static bool classof(const SILAnalysis *S) {
-    return S->getKind() == AnalysisKind::Destructor;
+    return S->getKind() == SILAnalysisKind::Destructor;
   }
 
   /// Returns true if destruction of T may store to memory.
   bool mayStoreToMemoryOnDestruction(SILType T);
+
+  /// No invalidation is needed.
+  virtual void invalidate() override {
+    // Nothing can invalidate, because types are static and cannot be changed
+    // during the SIL pass pipeline.
+  }
+
+  /// No invalidation is needed.
+  virtual void invalidate(SILFunction *F, InvalidationKind K)  override {
+    // Nothing can invalidate, because types are static and cannot be changed
+    // during the SIL pass pipeline.
+  }
+
+  /// Notify the analysis about a newly created function.
+  virtual void notifyAddedOrModifiedFunction(SILFunction *F) override {}
+
+  /// Notify the analysis about a function which will be deleted from the
+  /// module.
+  virtual void notifyWillDeleteFunction(SILFunction *F) override {}
+
+  /// Notify the analysis about changed witness or vtables.
+  virtual void invalidateFunctionTables() override { }
 
 protected:
   bool cacheResult(CanType Type, bool Result);

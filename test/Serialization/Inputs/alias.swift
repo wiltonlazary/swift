@@ -31,3 +31,11 @@ public protocol ProtoWrapper {}
 extension ProtoWrapper {
   public typealias Boolean = Bool
 }
+
+public struct Outer { public typealias G<T> = T }
+public typealias GG = Outer.G
+
+public typealias GInt = Outer.G<Int>
+
+public struct UnboundStruct<T> {}
+public typealias UnboundAlias<T: Comparable> = UnboundStruct<T>

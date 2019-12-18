@@ -81,7 +81,7 @@ final class TestManagedBuffer<T> : ManagedBuffer<CountAndCapacity, T> {
     withUnsafeMutablePointerToElements {
       (x: UnsafeMutablePointer<T>) -> () in
       for i in stride(from: 0, to: count, by: 2) {
-        (x + i).deinitialize()
+        (x + i).deinitialize(count: 1)
       }
     }
   }
@@ -104,7 +104,7 @@ class MyBuffer<T> {
     Manager(unsafeBufferObject: self).withUnsafeMutablePointers {
       (pointerToHeader, pointerToElements) -> Void in
       pointerToElements.deinitialize(count: self.count)
-      pointerToHeader.deinitialize()
+      pointerToHeader.deinitialize(count: 1)
     }
   }
 
@@ -191,7 +191,6 @@ tests.test("ManagedBufferPointer") {
     let s = buf!
     expectEqual(0, s.count)
     expectLE(10, s.capacity)
-    expectGE(12, s.capacity)  // allow some over-allocation but not too much
     
     expectEqual(s.count, mgr.header.count.value)
     expectEqual(s.capacity, mgr.header.capacity)

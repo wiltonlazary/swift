@@ -19,53 +19,68 @@
 
 #include "swift/AST/ASTContext.h"
 #include "swift/AST/Builtins.h"
-#include "swift/AST/Module.h"
-#include "swift/AST/SILOptions.h"
 #include "swift/AST/SILLayout.h"
+#include "swift/AST/SILOptions.h"
 #include "swift/Basic/LangOptions.h"
+#include "swift/Basic/ProfileCounter.h"
 #include "swift/Basic/Range.h"
+#include "swift/SIL/Notifications.h"
 #include "swift/SIL/SILCoverageMap.h"
 #include "swift/SIL/SILDeclRef.h"
 #include "swift/SIL/SILDefaultWitnessTable.h"
 #include "swift/SIL/SILFunction.h"
 #include "swift/SIL/SILGlobalVariable.h"
-#include "swift/SIL/Notifications.h"
+#include "swift/SIL/SILPrintContext.h"
+#include "swift/SIL/SILProperty.h"
 #include "swift/SIL/SILType.h"
 #include "swift/SIL/SILVTable.h"
 #include "swift/SIL/SILWitnessTable.h"
 #include "swift/SIL/TypeLowering.h"
-#include "swift/SIL/SILPrintContext.h"
 #include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/FoldingSet.h"
+#include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/Optional.h"
 #include "llvm/ADT/PointerIntPair.h"
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/ilist.h"
+#include "llvm/ProfileData/InstrProfReader.h"
 #include "llvm/Support/Allocator.h"
 #include "llvm/Support/raw_ostream.h"
 #include <functional>
 
+namespace llvm {
+namespace yaml {
+class Output;
+} // end namespace yaml
+} // end namespace llvm
+
 namespace swift {
-  class AnyFunctionType;
-  class ASTContext;
-  class FuncDecl;
-  class SILUndef;
-  class SourceFile;
-  class SerializedSILLoader;
 
-  namespace Lowering {
-    class SILGenModule;
-  }
+class AnyFunctionType;
+class ASTContext;
+class FileUnit;
+class FuncDecl;
+class KeyPathPattern;
+class ModuleDecl;
+class SILUndef;
+class SourceFile;
+class SerializedSILLoader;
+class SILFunctionBuilder;
 
-/// \brief A stage of SIL processing.
+namespace Lowering {
+class SILGenModule;
+} // namespace Lowering
+
+/// A stage of SIL processing.
 enum class SILStage {
-  /// \brief "Raw" SIL, emitted by SILGen, but not yet run through guaranteed
+  /// "Raw" SIL, emitted by SILGen, but not yet run through guaranteed
   /// optimization and diagnostic passes.
   ///
   /// Raw SIL does not have fully-constructed SSA and may contain undiagnosed
   /// dataflow errors.
   Raw,
 
-  /// \brief Canonical SIL, which has been run through at least the guaranteed
+  /// Canonical SIL, which has been run through at least the guaranteed
   /// optimization and diagnostic passes.
   ///
   /// Canonical SIL has stricter invariants than raw SIL. It must not contain
@@ -73,7 +88,7 @@ enum class SILStage {
   /// forms.
   Canonical,
 
-  /// \brief Lowered SIL, which has been prepared for IRGen and will no longer
+  /// Lowered SIL, which has been prepared for IRGen and will no longer
   /// be passed to canonical SIL transform passes.
   ///
   /// In lowered SIL, the SILType of all SILValues is its SIL storage
@@ -86,31 +101,46 @@ enum class SILStage {
   Lowered,
 };
 
-/// \brief A SIL module. The SIL module owns all of the SILFunctions generated
+/// A SIL module. The SIL module owns all of the SILFunctions generated
 /// when a Swift compilation context is lowered to SIL.
 class SILModule {
+  friend class SILFunctionBuilder;
+
 public:
   using FunctionListType = llvm::ilist<SILFunction>;
   using GlobalListType = llvm::ilist<SILGlobalVariable>;
   using VTableListType = llvm::ilist<SILVTable>;
+  using PropertyListType = llvm::ilist<SILProperty>;
   using WitnessTableListType = llvm::ilist<SILWitnessTable>;
   using DefaultWitnessTableListType = llvm::ilist<SILDefaultWitnessTable>;
-  using CoverageMapListType = llvm::ilist<SILCoverageMap>;
-  using LinkingMode = SILOptions::LinkingMode;
+  using CoverageMapCollectionType =
+      llvm::MapVector<StringRef, SILCoverageMap *>;
+
+  enum class LinkingMode : uint8_t {
+    /// Link functions with non-public linkage. Used by the mandatory pipeline.
+    LinkNormal,
+
+    /// Link all functions. Used by the performance pipeine.
+    LinkAll
+  };
+
+  using ActionCallback = std::function<void()>;
 
 private:
-  friend class SILBasicBlock;
-  friend class SILCoverageMap;
-  friend class SILDefaultWitnessTable;
-  friend class SILFunction;
-  friend class SILGlobalVariable;
-  friend class SILLayout;
-  friend class SILType;
-  friend class SILVTable;
-  friend class SILUndef;
-  friend class SILWitnessTable;
-  friend class Lowering::SILGenModule;
-  friend class Lowering::TypeConverter;
+  friend KeyPathPattern;
+  friend SILBasicBlock;
+  friend SILCoverageMap;
+  friend SILDefaultWitnessTable;
+  friend SILFunction;
+  friend SILGlobalVariable;
+  friend SILLayout;
+  friend SILType;
+  friend SILVTable;
+  friend SILProperty;
+  friend SILUndef;
+  friend SILWitnessTable;
+  friend Lowering::SILGenModule;
+  friend Lowering::TypeConverter;
   class SerializationCallback;
 
   /// Allocator that manages the memory of all the pieces of the SILModule.
@@ -147,11 +177,11 @@ private:
   VTableListType vtables;
 
   /// This is a cache of vtable entries for quick look-up
-  llvm::DenseMap<std::pair<const SILVTable *, SILDeclRef>, SILFunction *>
+  llvm::DenseMap<std::pair<const SILVTable *, SILDeclRef>, SILVTable::Entry>
       VTableEntryCache;
 
   /// Lookup table for SIL witness tables from conformances.
-  llvm::DenseMap<const NormalProtocolConformance *, SILWitnessTable *>
+  llvm::DenseMap<const RootProtocolConformance *, SILWitnessTable *>
   WitnessTableMap;
 
   /// The list of SILWitnessTables in the module.
@@ -164,14 +194,34 @@ private:
   /// The list of SILDefaultWitnessTables in the module.
   DefaultWitnessTableListType defaultWitnessTables;
 
+  /// Declarations which are externally visible.
+  ///
+  /// These are method declarations which are referenced from inlinable
+  /// functions due to cross-module-optimzation. Those declarations don't have
+  /// any attributes or linkage which mark them as externally visible by
+  /// default.
+  /// Currently this table is not serialized.
+  llvm::SetVector<ValueDecl *> externallyVisible;
+
   /// Lookup table for SIL Global Variables.
   llvm::StringMap<SILGlobalVariable *> GlobalVariableMap;
 
   /// The list of SILGlobalVariables in the module.
   GlobalListType silGlobals;
 
-  // The list of SILCoverageMaps in the module.
-  CoverageMapListType coverageMaps;
+  // The map of SILCoverageMaps in the module.
+  CoverageMapCollectionType coverageMaps;
+  
+  // The list of SILProperties in the module.
+  PropertyListType properties;
+
+  /// This is the underlying raw stream of OptRecordStream.
+  ///
+  /// It is also owned by SILModule in order to keep their lifetime in sync.
+  std::unique_ptr<llvm::raw_ostream> OptRecordRawStream;
+
+  /// If non-null, the YAML file where remarks should be recorded.
+  std::unique_ptr<llvm::yaml::Output> OptRecordStream;
 
   /// This is a cache of intrinsic Function declarations to numeric ID mappings.
   llvm::DenseMap<Identifier, IntrinsicInfo> IntrinsicIDCache;
@@ -180,13 +230,13 @@ private:
   llvm::DenseMap<Identifier, BuiltinInfo> BuiltinIDCache;
 
   /// This is the set of undef values we've created, for uniquing purposes.
-  llvm::DenseMap<SILType, SILUndef *> UndefValues;
+  llvm::DenseMap<std::pair<SILType, unsigned>, SILUndef *> UndefValues;
 
   /// The stage of processing this module is at.
   SILStage Stage;
 
-  /// The callback used by the SILLoader.
-  std::unique_ptr<SerializationCallback> Callback;
+  /// The set of deserialization notification handlers.
+  DeserializationNotificationHandlerSet deserializationNotificationHandlers;
 
   /// The SILLoader used when linking functions into this module.
   ///
@@ -195,7 +245,10 @@ private:
   /// constructed. In certain cases this was before all Modules had been loaded
   /// causing us to not
   std::unique_ptr<SerializedSILLoader> SILLoader;
-  
+
+  /// The indexed profile data to be used for PGO, or nullptr.
+  std::unique_ptr<llvm::IndexedInstrProfReader> PGOReader;
+
   /// True if this SILModule really contains the whole module, i.e.
   /// optimizations can assume that they see the whole module.
   bool wholeModule;
@@ -203,24 +256,50 @@ private:
   /// The options passed into this SILModule.
   SILOptions &Options;
 
+  /// Set if the SILModule was serialized already. It is used
+  /// to ensure that the module is serialized only once.
+  bool serialized;
+
+  /// Action to be executed for serializing the SILModule.
+  ActionCallback SerializeSILAction;
+
   /// A list of clients that need to be notified when an instruction
   /// invalidation message is sent.
   llvm::SetVector<DeleteNotificationHandler*> NotificationHandlers;
 
   // Intentionally marked private so that we need to use 'constructSIL()'
   // to construct a SILModule.
-  SILModule(ModuleDecl *M, SILOptions &Options, const DeclContext *associatedDC,
+  SILModule(ModuleDecl *M, Lowering::TypeConverter &TC,
+            SILOptions &Options, const DeclContext *associatedDC,
             bool wholeModule);
 
   SILModule(const SILModule&) = delete;
   void operator=(const SILModule&) = delete;
 
+  /// Folding set for key path patterns.
+  llvm::FoldingSet<KeyPathPattern> KeyPathPatterns;
+
+public:
+  ~SILModule();
+
   /// Method which returns the SerializedSILLoader, creating the loader if it
   /// has not been created yet.
   SerializedSILLoader *getSILLoader();
 
-public:
-  ~SILModule();
+  /// Add a callback for each newly deserialized SIL function body.
+  void registerDeserializationNotificationHandler(
+      std::unique_ptr<DeserializationNotificationHandler> &&handler);
+
+  /// Return the set of registered deserialization callbacks.
+  DeserializationNotificationHandlerSet::range
+  getDeserializationHandlers() const {
+    return deserializationNotificationHandlers.getRange();
+  }
+
+  void removeDeserializationNotificationHandler(
+      DeserializationNotificationHandler *handler) {
+    deserializationNotificationHandlers.erase(handler);
+  }
 
   /// Add a delete notification handler \p Handler to the module context.
   void registerDeleteNotificationHandler(DeleteNotificationHandler* Handler);
@@ -230,15 +309,21 @@ public:
 
   /// Send the invalidation message that \p V is being deleted to all
   /// registered handlers. The order of handlers is deterministic but arbitrary.
-  void notifyDeleteHandlers(ValueBase *V);
+  void notifyDeleteHandlers(SILNode *node);
 
-  /// \brief This converts Swift types to SILTypes.
-  mutable Lowering::TypeConverter Types;
+  /// Set a serialization action.
+  void setSerializeSILAction(ActionCallback SerializeSILAction);
+  ActionCallback getSerializeSILAction() const;
 
-  /// Look up the TypeLowering for a SILType.
-  const Lowering::TypeLowering &getTypeLowering(SILType t) {
-    return Types.getTypeLowering(t);
-  }
+  /// Set a flag indicating that this module is serialized already.
+  void setSerialized() { serialized = true; }
+  bool isSerialized() const { return serialized; }
+
+  /// Serialize a SIL module using the configured SerializeSILAction.
+  void serialize();
+
+  /// This converts Swift types to SILTypes.
+  Lowering::TypeConverter &Types;
 
   /// Invalidate cached entries in SIL Loader.
   void invalidateSILLoaderCaches();
@@ -263,28 +348,22 @@ public:
   /// should contain source files.
   ///
   /// If a source file is provided, SIL will only be emitted for decls in that
-  /// source file, starting from the specified element number.
-  ///
-  /// If \p makeModuleFragile is true, all functions and global variables of
-  /// the module are marked as fragile. This is used for compiling the stdlib.
+  /// source file.
   static std::unique_ptr<SILModule>
-  constructSIL(ModuleDecl *M, SILOptions &Options, FileUnit *sf = nullptr,
-               Optional<unsigned> startElem = None,
-               bool makeModuleFragile = false,
-               bool isWholeModule = false);
+  constructSIL(ModuleDecl *M, Lowering::TypeConverter &TC,
+               SILOptions &Options, FileUnit *sf = nullptr);
 
-  /// \brief Create and return an empty SIL module that we can
+  /// Create and return an empty SIL module that we can
   /// later parse SIL bodies directly into, without converting from an AST.
-  static std::unique_ptr<SILModule> createEmptyModule(ModuleDecl *M,
-                                                      SILOptions &Options,
-                                                      bool WholeModule = false) {
-    return std::unique_ptr<SILModule>(new SILModule(M, Options, M, WholeModule));
-  }
+  static std::unique_ptr<SILModule>
+  createEmptyModule(ModuleDecl *M, Lowering::TypeConverter &TC,
+                    SILOptions &Options,
+                    bool WholeModule = false);
 
   /// Get the Swift module associated with this SIL module.
   ModuleDecl *getSwiftModule() const { return TheSwiftModule; }
   /// Get the AST context used for type uniquing etc. by this SIL module.
-  ASTContext &getASTContext() const { return TheSwiftModule->getASTContext(); }
+  ASTContext &getASTContext() const;
   SourceManager &getSourceManager() const { return getASTContext().SourceMgr; }
 
   /// Get the Swift DeclContext associated with this SIL module.
@@ -305,6 +384,11 @@ public:
   bool isWholeModule() const {
     return wholeModule;
   }
+
+  bool isStdlibModule() const;
+
+  /// Returns true if it is the optimized OnoneSupport module.
+  bool isOptimizedOnoneSupportModule() const;
 
   SILOptions &getOptions() const { return Options; }
 
@@ -371,6 +455,13 @@ public:
     return {defaultWitnessTables.begin(), defaultWitnessTables.end()};
   }
 
+  void addExternallyVisibleDecl(ValueDecl *decl) {
+    externallyVisible.insert(decl);
+  }
+  bool isExternallyVisibleDecl(ValueDecl *decl) {
+    return externallyVisible.count(decl) != 0;
+  }
+
   using sil_global_iterator = GlobalListType::iterator;
   using sil_global_const_iterator = GlobalListType::const_iterator;
   GlobalListType &getSILGlobalList() { return silGlobals; }
@@ -390,29 +481,32 @@ public:
     return {silGlobals.begin(), silGlobals.end()};
   }
 
-  using coverage_map_iterator = CoverageMapListType::iterator;
-  using coverage_map_const_iterator = CoverageMapListType::const_iterator;
-  CoverageMapListType &getCoverageMapList() { return coverageMaps; }
-  const CoverageMapListType &getCoverageMapList() const { return coverageMaps; }
-  coverage_map_iterator coverage_map_begin() { return coverageMaps.begin(); }
-  coverage_map_iterator coverage_map_end() { return coverageMaps.end(); }
-  coverage_map_const_iterator coverage_map_begin() const {
-    return coverageMaps.begin();
+  using coverage_map_iterator = CoverageMapCollectionType::iterator;
+  using coverage_map_const_iterator = CoverageMapCollectionType::const_iterator;
+  CoverageMapCollectionType &getCoverageMaps() { return coverageMaps; }
+  const CoverageMapCollectionType &getCoverageMaps() const {
+    return coverageMaps;
   }
-  coverage_map_const_iterator coverage_map_end() const {
-    return coverageMaps.end();
-  }
-  iterator_range<coverage_map_iterator> getCoverageMaps() {
-    return {coverageMaps.begin(), coverageMaps.end()};
-  }
-  iterator_range<coverage_map_const_iterator> getCoverageMaps() const {
-    return {coverageMaps.begin(), coverageMaps.end()};
- }
 
+  llvm::yaml::Output *getOptRecordStream() { return OptRecordStream.get(); }
+  void setOptRecordStream(std::unique_ptr<llvm::yaml::Output> &&Stream,
+                          std::unique_ptr<llvm::raw_ostream> &&RawStream);
+
+  // This is currently limited to VarDecl because the visibility of global
+  // variables and class properties is straightforward, while the visibility of
+  // class methods (ValueDecls) depends on the subclass scope. "Visiblity" has
+  // a different meaning when vtable layout is at stake.
+  bool isVisibleExternally(const VarDecl *decl) {
+    return isPossiblyUsedExternally(getDeclSILLinkage(decl), isWholeModule());
+  }
+
+  PropertyListType &getPropertyList() { return properties; }
+  const PropertyListType &getPropertyList() const { return properties; }
+  
   /// Look for a global variable by name.
   ///
   /// \return null if this module has no such global variable
- SILGlobalVariable *lookUpGlobalVariable(StringRef name) const {
+  SILGlobalVariable *lookUpGlobalVariable(StringRef name) const {
     return GlobalVariableMap.lookup(name);
   }
 
@@ -428,19 +522,23 @@ public:
   /// \return null if this module has no such function
   SILFunction *lookUpFunction(SILDeclRef fnRef);
 
+  /// Attempt to deserialize the SILFunction. Returns true if deserialization
+  /// succeeded, false otherwise.
+  bool loadFunction(SILFunction *F);
+
+  /// Update the linkage of the SILFunction with the linkage of the serialized
+  /// function.
+  ///
+  /// The serialized SILLinkage can differ from the linkage derived from the
+  /// AST, e.g. cross-module-optimization can change the SIL linkages.
+  void updateFunctionLinkage(SILFunction *F);
+
   /// Attempt to link the SILFunction. Returns true if linking succeeded, false
   /// otherwise.
   ///
   /// \return false if the linking failed.
-  bool linkFunction(SILFunction *Fun,
-                    LinkingMode LinkAll = LinkingMode::LinkNormal);
-
-  /// Attempt to link a function by mangled name. Returns true if linking
-  /// succeeded, false otherwise.
-  ///
-  /// \return false if the linking failed.
-  bool linkFunction(StringRef Name,
-                    LinkingMode LinkAll = LinkingMode::LinkNormal);
+  bool linkFunction(SILFunction *F,
+                    LinkingMode LinkMode = LinkingMode::LinkNormal);
 
   /// Check if a given function exists in any of the modules with a
   /// required linkage, i.e. it can be linked by linkFunction.
@@ -453,56 +551,9 @@ public:
   /// i.e. it can be linked by linkFunction.
   bool hasFunction(StringRef Name);
 
-  /// Link in all Witness Tables in the module.
-  void linkAllWitnessTables();
-
-  /// Link in all VTables in the module.
-  void linkAllVTables();
-
-  /// \brief Return the declaration of a utility function that can,
-  /// but needn't, be shared between modules.
-  SILFunction *getOrCreateSharedFunction(SILLocation loc,
-                                         StringRef name,
-                                         CanSILFunctionType type,
-                                         IsBare_t isBareSILFunction,
-                                         IsTransparent_t isTransparent,
-                                         IsFragile_t isFragile,
-                                         IsThunk_t isThunk);
-
-  /// \brief Return the declaration of a function, or create it if it doesn't
-  /// exist.
-  SILFunction *getOrCreateFunction(SILLocation loc,
-                                   StringRef name,
-                                   SILLinkage linkage,
-                                   CanSILFunctionType type,
-                                   IsBare_t isBareSILFunction,
-                                   IsTransparent_t isTransparent,
-                                   IsFragile_t isFragile,
-                                   IsThunk_t isThunk = IsNotThunk,
-                                   SILFunction::ClassVisibility_t CV =
-                                           SILFunction::NotRelevant);
-
-  /// \brief Return the declaration of a function, or create it if it doesn't
-  /// exist.
-  SILFunction *getOrCreateFunction(SILLocation loc,
-                                   SILDeclRef constant,
-                                   ForDefinition_t forDefinition);
-
-  /// \brief Create a function declaration.
-  ///
-  /// This signature is a direct copy of the signature of SILFunction::create()
-  /// in order to simplify refactoring all SILFunction creation use-sites to use
-  /// SILModule. Eventually the uses should probably be refactored.
-  SILFunction *createFunction(
-      SILLinkage linkage, StringRef name, CanSILFunctionType loweredType,
-      GenericEnvironment *genericEnv, Optional<SILLocation> loc,
-      IsBare_t isBareSILFunction, IsTransparent_t isTrans,
-      IsFragile_t isFragile, IsThunk_t isThunk = IsNotThunk,
-      SILFunction::ClassVisibility_t classVisibility = SILFunction::NotRelevant,
-      Inline_t inlineStrategy = InlineDefault,
-      EffectsKind EK = EffectsKind::Unspecified,
-      SILFunction *InsertBefore = nullptr,
-      const SILDebugScope *DebugScope = nullptr);
+  /// Link all definitions in all segments that are logically part of
+  /// the same AST module.
+  void linkAllFromCurrentModule();
 
   /// Look up the SILWitnessTable representing the lowering of a protocol
   /// conformance, and collect the substitutions to apply to the referenced
@@ -540,11 +591,6 @@ public:
   /// hierarchy of \p Class.
   SILFunction *lookUpFunctionInVTable(ClassDecl *Class, SILDeclRef Member);
 
-  // Given a protocol conformance, attempt to create a witness table declaration
-  // for it.
-  SILWitnessTable *
-  createWitnessTableDeclaration(ProtocolConformance *C, SILLinkage linkage);
-
   // Given a protocol, attempt to create a default witness table declaration
   // for it.
   SILDefaultWitnessTable *
@@ -554,16 +600,31 @@ public:
   /// Deletes a dead witness table.
   void deleteWitnessTable(SILWitnessTable *Wt);
 
-  /// \brief Return the stage of processing this module is at.
+  /// Return the stage of processing this module is at.
   SILStage getStage() const { return Stage; }
 
-  /// \brief Advance the module to a further stage of processing.
+  /// Advance the module to a further stage of processing.
   void setStage(SILStage s) {
     assert(s >= Stage && "regressing stage?!");
     Stage = s;
   }
 
-  /// \brief Run the SIL verifier to make sure that all Functions follow
+  llvm::IndexedInstrProfReader *getPGOReader() const { return PGOReader.get(); }
+
+  void setPGOReader(std::unique_ptr<llvm::IndexedInstrProfReader> IPR) {
+    PGOReader = std::move(IPR);
+  }
+
+  /// Can value operations (copies and destroys) on the given lowered type
+  /// be performed in this module?
+  bool isTypeABIAccessible(SILType type,
+                           TypeExpansionContext forExpansion);
+
+  /// Can type metadata for the given formal type be fetched in
+  /// the given module?
+  bool isTypeMetadataAccessible(CanType type);
+
+  /// Run the SIL verifier to make sure that all Functions follow
   /// invariants.
   void verify() const;
 
@@ -627,14 +688,14 @@ public:
   /// Deallocate memory of an instruction.
   void deallocateInst(SILInstruction *I);
 
-  /// \brief Looks up the llvm intrinsic ID and type for the builtin function.
+  /// Looks up the llvm intrinsic ID and type for the builtin function.
   ///
   /// \returns Returns llvm::Intrinsic::not_intrinsic if the function is not an
   /// intrinsic. The particular intrinsic functions which correspond to the
   /// returned value are defined in llvm/Intrinsics.h.
   const IntrinsicInfo &getIntrinsicInfo(Identifier ID);
 
-  /// \brief Looks up the lazily cached identification for the builtin function.
+  /// Looks up the lazily cached identification for the builtin function.
   ///
   /// \returns Returns builtin info of BuiltinValueKind::None kind if the
   /// declaration is not a builtin.
@@ -645,8 +706,13 @@ public:
 
   /// Returns true if the default atomicity of the module is Atomic.
   bool isDefaultAtomic() const {
-    return ! getOptions().AssumeSingleThreaded;
+    return !getOptions().AssumeSingleThreaded;
   }
+
+  /// Returns true if SIL entities associated with declarations in the given
+  /// declaration context ought to be serialized as part of this module.
+  bool
+  shouldSerializeEntitiesAssociatedWithDeclContext(const DeclContext *DC) const;
 };
 
 inline llvm::raw_ostream &operator<<(llvm::raw_ostream &OS, const SILModule &M){
@@ -655,11 +721,11 @@ inline llvm::raw_ostream &operator<<(llvm::raw_ostream &OS, const SILModule &M){
 }
 
 namespace Lowering {
-  /// Determine whether the given class will be allocated/deallocated
-  /// using the Objective-C runtime, i.e., +alloc and -dealloc.
-  LLVM_LIBRARY_VISIBILITY bool usesObjCAllocator(ClassDecl *theClass);
-}
+/// Determine whether the given class will be allocated/deallocated using the
+/// Objective-C runtime, i.e., +alloc and -dealloc.
+LLVM_LIBRARY_VISIBILITY bool usesObjCAllocator(ClassDecl *theClass);
+} // namespace Lowering
 
-} // end swift namespace
+} // namespace swift
 
 #endif

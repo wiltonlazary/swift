@@ -14,6 +14,12 @@
 // It is reported to be very slow: <rdar://problem/17255477>
 import TestsUtils
 
+public let StrToInt = BenchmarkInfo(
+  name: "StrToInt",
+  runFunction: run_StrToInt,
+  tags: [.validation, .api, .String],
+  legacyFactor: 10)
+
 @inline(never)
 public func run_StrToInt(_ N: Int) {
   // 64 numbers from -500_000 to 500_000 generated randomly
@@ -40,8 +46,8 @@ public func run_StrToInt(_ N: Int) {
     return r
   }
   var res = Int.max
-  for _ in 1...1000*N {
+  for _ in 1...100*N {
     res = res & DoOneIter(input)
   }
-  CheckResults(res == ref_result, "IncorrectResults in StrToInt: \(res) != \(ref_result)")
+  CheckResults(res == ref_result)
 }

@@ -1,4 +1,4 @@
-// RUN: rm -rf %t && mkdir -p %t
+// RUN: %empty-directory(%t)
 // RUN: %target-swift-frontend -emit-module -module-name Multi -o %t/multi-file.swiftmodule -primary-file %s %S/Inputs/multi-file-nested-types.swift
 // RUN: %target-swift-frontend -emit-module -module-name Multi -o %t/multi-file-2.swiftmodule %s -primary-file %S/Inputs/multi-file-nested-types.swift
 
@@ -15,9 +15,9 @@
 
 // REQUIRES: asserts
 
-// CHECK: 4 Serialization - # of same-module nested types resolved without lookup
+// CHECK: 4 Serialization - # of nested types resolved without full lookup
 // DISABLED: Statistics
-// DISABLED-NOT: same-module nested types resolved without lookup
+// DISABLED-NOT: nested types resolved without full lookup
 
 public func useTypes(
   _: Outer.Inner,

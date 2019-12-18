@@ -1,5 +1,4 @@
-// RUN: rm -rf %t
-// RUN: mkdir -p %t
+// RUN: %empty-directory(%t)
 
 // RUN: %target-swift-frontend -typecheck %s -enable-source-import -I %S/Inputs -sdk "" -verify -show-diagnostics-after-fatal
 // RUN: not %target-swift-frontend -typecheck %s -I %S/Inputs -sdk "" -show-diagnostics-after-fatal 2>&1 | %FileCheck %s -check-prefix=CHECK-NO-SOURCE-IMPORT
@@ -33,8 +32,8 @@ letters.asdf.A // expected-error{{module 'letters' has no member named 'asdf'}}
 var uA : A // expected-error {{'A' is ambiguous for type lookup in this context}}
 var uB : B = abcde.B()
 var uC : C // expected-error {{'C' is ambiguous for type lookup in this context}}
-var uD : D // expected-error {{'D' is ambiguous for type lookup in this context}}
-var uE : E // expected-error {{'E' is ambiguous for type lookup in this context}}
+var uD : D = asdf.D()
+var uE : E = aeiou.E()
 var uF : F = letters.F()
 
 var qA1 : abcde.A // okay

@@ -18,8 +18,12 @@
 #define SWIFT_AST_AST_NODE_H
 
 #include "llvm/ADT/PointerUnion.h"
-#include "swift/AST/SourceEntityWalker.h"
+#include "swift/Basic/Debug.h"
 #include "swift/AST/TypeAlignments.h"
+
+namespace llvm {
+  class raw_ostream;
+}
 
 namespace swift {
   class Expr;
@@ -29,30 +33,42 @@ namespace swift {
   class SourceLoc;
   class SourceRange;
   class ASTWalker;
-  
-  struct ASTNode : public llvm::PointerUnion3<Expr*, Stmt*, Decl*> {
+  enum class ExprKind : uint8_t;
+  enum class DeclKind : uint8_t;
+  enum class StmtKind;
+
+  struct ASTNode : public llvm::PointerUnion<Expr*, Stmt*, Decl*> {
     // Inherit the constructors from PointerUnion.
-    using PointerUnion3::PointerUnion3;
-    
+    using PointerUnion::PointerUnion;
+
     SourceRange getSourceRange() const;
 
-    /// \brief Return the location of the start of the statement.
+    /// Return the location of the start of the statement.
     SourceLoc getStartLoc() const;
   
-    /// \brief Return the location of the end of the statement.
+    /// Return the location of the end of the statement.
     SourceLoc getEndLoc() const;
 
     void walk(ASTWalker &Walker);
     void walk(ASTWalker &&walker) { walk(walker); }
 
-    void walk(SourceEntityWalker &Walker);
-    void walk(SourceEntityWalker &&walker) { walk(walker); }
-
-    /// \brief get the underlying entity as a decl context if it is one,
+    /// get the underlying entity as a decl context if it is one,
     /// otherwise, return nullptr;
     DeclContext *getAsDeclContext() const;
+
+    /// Provides some utilities to decide detailed node kind.
+#define FUNC(T) bool is##T(T##Kind Kind) const;
+    FUNC(Stmt)
+    FUNC(Expr)
+    FUNC(Decl)
+#undef FUNC
+    
+    SWIFT_DEBUG_DUMP;
+    void dump(llvm::raw_ostream &OS, unsigned Indent = 0) const;
+
+    /// Whether the AST node is implicit.
+    bool isImplicit() const;
   };
-  
 } // namespace swift
 
 namespace llvm {

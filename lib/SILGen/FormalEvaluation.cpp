@@ -23,12 +23,32 @@ using namespace Lowering;
 
 void FormalAccess::_anchor() {}
 
+void FormalAccess::verify(SILGenFunction &SGF) const {
+#ifndef NDEBUG
+  // If this access was already finished, continue. This can happen if an
+  // owned formal access was forwarded.
+  if (isFinished()) {
+    assert(getKind() == FormalAccess::Owned &&
+           "Only owned formal accesses should be forwarded.");
+    // We can not check that our cleanup is actually dead since the cleanup
+    // may have been popped at this point and the stack may have new values.
+    return;
+  }
+
+  assert(!isFinished() && "Can not finish a formal access cleanup "
+         "twice");
+
+  // Now try to look up the cleanup handle of the formal access.
+  SGF.Cleanups.checkIterator(getCleanup());
+#endif
+}
+
 //===----------------------------------------------------------------------===//
 //                      Shared Borrow Formal Evaluation
 //===----------------------------------------------------------------------===//
 
-void SharedBorrowFormalAccess::finishImpl(SILGenFunction &gen) {
-  gen.B.createEndBorrow(CleanupLocation::get(loc), borrowedValue,
+void SharedBorrowFormalAccess::finishImpl(SILGenFunction &SGF) {
+  SGF.B.createEndBorrow(CleanupLocation::get(loc), borrowedValue,
                         originalValue);
 }
 
@@ -36,57 +56,78 @@ void SharedBorrowFormalAccess::finishImpl(SILGenFunction &gen) {
 //                             OwnedFormalAccess
 //===----------------------------------------------------------------------===//
 
-void OwnedFormalAccess::finishImpl(SILGenFunction &gen) {
+void OwnedFormalAccess::finishImpl(SILGenFunction &SGF) {
   auto cleanupLoc = CleanupLocation::get(loc);
   if (value->getType().isAddress())
-    gen.B.createDestroyAddr(cleanupLoc, value);
+    SGF.B.createDestroyAddr(cleanupLoc, value);
   else
-    gen.B.emitDestroyValueOperation(cleanupLoc, value);
+    SGF.B.emitDestroyValueOperation(cleanupLoc, value);
 }
 
 //===----------------------------------------------------------------------===//
 //                          Formal Evaluation Scope
 //===----------------------------------------------------------------------===//
 
-FormalEvaluationScope::FormalEvaluationScope(SILGenFunction &gen)
-    : gen(gen), savedDepth(gen.FormalEvalContext.stable_begin()),
-      wasInWritebackScope(gen.InWritebackScope) {
-  if (gen.InInOutConversionScope) {
+FormalEvaluationScope::FormalEvaluationScope(SILGenFunction &SGF)
+    : SGF(SGF), savedDepth(SGF.FormalEvalContext.stable_begin()),
+      previous(SGF.FormalEvalContext.innermostScope),
+      wasInInOutConversionScope(SGF.InInOutConversionScope) {
+  if (wasInInOutConversionScope) {
     savedDepth.reset();
+    assert(isPopped());
     return;
   }
-  gen.InWritebackScope = true;
+  SGF.FormalEvalContext.innermostScope = this;
 }
 
 FormalEvaluationScope::FormalEvaluationScope(FormalEvaluationScope &&o)
-    : gen(o.gen), savedDepth(o.savedDepth),
-      wasInWritebackScope(o.wasInWritebackScope) {
+    : SGF(o.SGF), savedDepth(o.savedDepth), previous(o.previous),
+      wasInInOutConversionScope(o.wasInInOutConversionScope) {
+
+  // Replace the scope in the active-scope chain if it's present.
+  if (!o.isPopped()) {
+    for (auto c = &SGF.FormalEvalContext.innermostScope; ; c = &(*c)->previous){
+      if (*c == &o) {
+        *c = this;
+        break;
+      }
+    }
+  }
+
   o.savedDepth.reset();
+  assert(o.isPopped());
 }
 
 void FormalEvaluationScope::popImpl() {
-  // Pop the InWritebackScope bit.
-  gen.InWritebackScope = wasInWritebackScope;
+  auto &context = SGF.FormalEvalContext;
+
+  // Remove the innermost scope from the chain.
+  assert(context.innermostScope == this &&
+         "popping formal-evaluation scopes out of order");
+  context.innermostScope = previous;
+
+  auto endDepth = *savedDepth;
 
   // Check to see if there is anything going on here.
-
-  auto &context = gen.FormalEvalContext;
-  using iterator = FormalEvaluationContext::iterator;
-  using stable_iterator = FormalEvaluationContext::stable_iterator;
-
-  iterator unwrappedSavedDepth = context.find(savedDepth.getValue());
-  iterator iter = context.begin();
-  if (iter == unwrappedSavedDepth)
+  if (endDepth == context.stable_begin())
     return;
+
+#ifndef NDEBUG
+  // Verify that all the accesses are valid.
+  for (auto i = context.begin(), e = context.find(endDepth); i != e; ++i) {
+    i->verify(SGF);
+  }
+#endif
 
   // Save our start point to make sure that we are not adding any new cleanups
   // to the front of the stack.
-  stable_iterator originalBegin = context.stable_begin();
+  auto originalBegin = context.stable_begin();
 
   // Then working down the stack until we visit unwrappedSavedDepth...
-  for (; iter != unwrappedSavedDepth; ++iter) {
-    // Grab the next evaluation...
-    FormalAccess &access = *iter;
+  auto i = originalBegin;
+  do {
+    // Grab the next evaluation.
+    FormalAccess &access = context.findAndAdvance(i);
 
     // If this access was already finished, continue. This can happen if an
     // owned formal access was forwarded.
@@ -101,24 +142,25 @@ void FormalEvaluationScope::popImpl() {
     assert(!access.isFinished() && "Can not finish a formal access cleanup "
                                    "twice");
 
-    // and deactivate the cleanup. This will set the isFinished bit for owned
-    // FormalAccess.
-    gen.Cleanups.setCleanupState(access.getCleanup(), CleanupState::Dead);
+    // Set the finished bit to appease various invariants.
+    access.setFinished();
+
+    // Deactivate the cleanup.
+    SGF.Cleanups.setCleanupState(access.getCleanup(), CleanupState::Dead);
 
     // Attempt to diagnose problems where obvious aliasing introduces illegal
     // code. We do a simple N^2 comparison here to detect this because it is
     // extremely unlikely more than a few writebacks are active at once.
     if (access.getKind() == FormalAccess::Exclusive) {
-      iterator j = iter;
-      ++j;
-
-      for (; j != unwrappedSavedDepth; ++j) {
+      // Note that we already advanced 'iter' above, so we can just start
+      // iterating from there.  Also, this doesn't invalidate the iterators.
+      for (auto j = context.find(i), je = context.find(endDepth); j != je; ++j){
         FormalAccess &other = *j;
         if (other.getKind() != FormalAccess::Exclusive)
           continue;
         auto &lhs = static_cast<ExclusiveBorrowFormalAccess &>(access);
         auto &rhs = static_cast<ExclusiveBorrowFormalAccess &>(other);
-        lhs.diagnoseConflict(rhs, gen);
+        lhs.diagnoseConflict(rhs, SGF);
       }
     }
 
@@ -127,25 +169,35 @@ void FormalEvaluationScope::popImpl() {
     //
     // This evaluates arbitrary code, so it's best to be paranoid
     // about iterators on the context.
-    access.finish(gen);
-  }
+    DiverseValueBuffer<FormalAccess> copiedAccess(access);
+    copiedAccess.getCopy().finish(SGF);
+
+  } while (i != endDepth);
 
   // Then check that we did not add any additional cleanups to the beginning of
   // the stack...
   assert(originalBegin == context.stable_begin() &&
-         "more writebacks placed onto context during writeback scope pop?!");
+         "pushed more formal evaluations while popping formal evaluations?!");
 
   // And then pop off all stack elements until we reach the savedDepth.
-  context.pop(savedDepth.getValue());
+  context.pop(endDepth);
+}
+
+void FormalEvaluationScope::verify() const {
+  // Walk up the stack to the saved depth.
+  auto &context = SGF.FormalEvalContext;
+  for (auto i = context.begin(), e = context.find(*savedDepth); i != e; ++i) {
+    i->verify(SGF);
+  }
 }
 
 //===----------------------------------------------------------------------===//
 //                         Formal Evaluation Context
 //===----------------------------------------------------------------------===//
 
-void FormalEvaluationContext::dump(SILGenFunction &gen) {
+void FormalEvaluationContext::dump(SILGenFunction &SGF) {
   for (auto II = begin(), IE = end(); II != IE; ++II) {
     FormalAccess &access = *II;
-    gen.Cleanups.dump(access.getCleanup());
+    SGF.Cleanups.dump(access.getCleanup());
   }
 }

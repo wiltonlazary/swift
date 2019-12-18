@@ -2,23 +2,26 @@ set(LLVM_TARGET_DEFINITIONS Options.td)
 swift_tablegen(Options.inc -gen-opt-parser-defs)
 swift_add_public_tablegen_target(sourcekitdTestOptionsTableGen)
 
-if(SWIFT_SOURCEKIT_USE_INPROC_LIBRARY)
-  set(SOURCEKITD_TEST_DEPEND sourcekitdInProc)
-else()
-  set(SOURCEKITD_TEST_DEPEND sourcekitd)
-endif()
-
-if(SOURCEKIT_NEED_EXPLICIT_LIBDISPATCH)
-  set(SOURCEKITD_TEST_DEPEND ${SOURCEKITD_TEST_DEPEND} dispatch swiftCore)
-endif()
-
 add_sourcekit_executable(sourcekitd-test
   sourcekitd-test.cpp
   TestOptions.cpp
-  DEPENDS ${SOURCEKITD_TEST_DEPEND} SourceKitSupport
-    clangRewrite clangLex clangBasic
-  LLVM_COMPONENT_DEPENDS core support option coverage lto
+  LLVM_LINK_COMPONENTS core option coverage lto
 )
+target_link_libraries(sourcekitd-test PRIVATE
+  SourceKitSupport
+  clangRewrite
+  clangLex
+  clangBasic)
+if(SWIFT_SOURCEKIT_USE_INPROC_LIBRARY)
+  target_link_libraries(sourcekitd-test PRIVATE sourcekitdInProc)
+else()
+  target_link_libraries(sourcekitd-test PRIVATE sourcekitd)
+endif()
+if(NOT CMAKE_SYSTEM_NAME STREQUAL Darwin)
+  target_link_libraries(sourcekitd-test PRIVATE
+    dispatch
+    BlocksRuntime)
+endif()
 
 add_dependencies(sourcekitd-test sourcekitdTestOptionsTableGen)
 
@@ -33,6 +36,8 @@ if(SWIFT_ANALYZE_CODE_COVERAGE)
     LINK_FLAGS " -fprofile-instr-generate -fcoverage-mapping")
 endif()
 
-swift_install_in_component(tools
-    TARGETS sourcekitd-test
-    RUNTIME DESTINATION bin)
+add_dependencies(tools sourcekitd-test)
+swift_install_in_component(TARGETS sourcekitd-test
+                           RUNTIME
+                             DESTINATION bin
+                             COMPONENT tools)

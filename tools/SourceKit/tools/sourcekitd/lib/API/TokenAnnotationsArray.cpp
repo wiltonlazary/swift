@@ -85,7 +85,8 @@ public:
                     unsigned Offset,
                     unsigned Length,
                     bool IsSystem,
-                    sourcekitd_variant_dictionary_applier_t applier) {
+                    llvm::function_ref<bool(sourcekitd_uid_t,
+                                            sourcekitd_variant_t)> applier) {
 
 #define APPLY(K, Ty, Field)                              \
   do {                                                   \
@@ -136,7 +137,7 @@ public:
   }
 };
 
-}
+} // end anonymous namespace
 
 namespace sourcekitd {
 
@@ -161,9 +162,11 @@ struct CompactVariantFuncs<TokenAnnotationsArray> {
 
     return Fn(key, Kind, Offset, Length, IsSystem);
   }
-
-  static bool dictionary_apply(sourcekitd_variant_t dict,
-                              sourcekitd_variant_dictionary_applier_t applier) {
+  
+  static bool
+  dictionary_apply(sourcekitd_variant_t dict,
+                   llvm::function_ref<bool(sourcekitd_uid_t,
+                                           sourcekitd_variant_t)> applier) {
     void *Buf = (void*)dict.data[1];
     size_t Index = dict.data[2];
 
@@ -215,10 +218,12 @@ VariantFunctions CompactVariantFuncs<TokenAnnotationsArray>::Funcs = {
   nullptr/*Annot_string_get_length*/,
   nullptr/*Annot_string_get_ptr*/,
   nullptr/*Annot_int64_get_value*/,
-  nullptr/*Annot_uid_get_value*/
+  nullptr/*Annot_uid_get_value*/,
+  nullptr/*Annot_data_get_size*/,
+  nullptr/*Annot_data_get_ptr*/,
 };
 
-}
+} // namespace sourcekitd
 
 VariantFunctions *
 sourcekitd::getVariantFunctionsForTokenAnnotationsArray() {

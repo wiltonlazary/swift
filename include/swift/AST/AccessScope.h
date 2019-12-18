@@ -15,6 +15,7 @@
 
 #include "swift/AST/AttrKind.h"
 #include "swift/AST/DeclContext.h"
+#include "swift/Basic/Debug.h"
 #include "llvm/ADT/PointerIntPair.h"
 
 namespace swift {
@@ -30,6 +31,11 @@ public:
 
   static AccessScope getPublic() { return AccessScope(nullptr); }
 
+  /// Check if private access is allowed. This is a lexical scope check in Swift
+  /// 3 mode. In Swift 4 mode, declarations and extensions of the same type will
+  /// also allow access.
+  static bool allowsPrivateAccess(const DeclContext *useDC, const DeclContext *sourceDC);
+
   /// Returns nullptr if access scope is public.
   const DeclContext *getDeclContext() const { return Value.getPointer(); }
 
@@ -42,27 +48,28 @@ public:
   bool isPublic() const { return !Value.getPointer(); }
   bool isPrivate() const { return Value.getInt(); }
   bool isFileScope() const;
+  bool isInternal() const;
 
   /// Returns true if this is a child scope of the specified other access scope.
   ///
   /// \see DeclContext::isChildContextOf
   bool isChildOf(AccessScope AS) const {
     if (!isPublic() && !AS.isPublic())
-      return getDeclContext()->isChildContextOf(AS.getDeclContext());
+      return allowsPrivateAccess(getDeclContext(), AS.getDeclContext());
     if (isPublic() && AS.isPublic())
       return false;
     return AS.isPublic();
   }
 
   /// Returns the associated access level for diagnostic purposes.
-  Accessibility accessibilityForDiagnostics() const;
+  AccessLevel accessLevelForDiagnostics() const;
 
   /// Returns the minimum access level required to access
   /// associated DeclContext for diagnostic purposes.
-  Accessibility requiredAccessibilityForDiagnostics() const {
+  AccessLevel requiredAccessForDiagnostics() const {
     return isFileScope()
-      ? Accessibility::FilePrivate
-      : accessibilityForDiagnostics();
+      ? AccessLevel::FilePrivate
+      : accessLevelForDiagnostics();
   }
 
   /// Returns the narrowest access scope if this and the specified access scope
@@ -81,6 +88,7 @@ public:
     return None;
   }
 
+  SWIFT_DEBUG_DUMP;
 };
 
 } // end namespace swift

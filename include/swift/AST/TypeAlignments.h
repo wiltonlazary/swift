@@ -25,10 +25,12 @@
 #include <cstddef>
 
 namespace swift {
+  class AbstractClosureExpr;
   class AbstractStorageDecl;
   class ArchetypeType;
   class AssociatedTypeDecl;
   class ASTContext;
+  class AttributeBase;
   class BraceStmt;
   class Decl;
   class DeclContext;
@@ -36,22 +38,30 @@ namespace swift {
   class ExtensionDecl;
   class GenericEnvironment;
   class GenericTypeParamDecl;
+  class NominalTypeDecl;
   class NormalProtocolConformance;
+  class OpaqueValueExpr;
   class OperatorDecl;
+  class Pattern;
   class ProtocolDecl;
   class ProtocolConformance;
+  class SILFunction;
   class Stmt;
-  class Substitution;
   class TypeVariableType;
   class TypeBase;
+  class TypeDecl;
   class ValueDecl;
 
   /// We frequently use three tag bits on all of these types.
+  constexpr size_t AttrAlignInBits = 3;
   constexpr size_t DeclAlignInBits = 3;
-  constexpr size_t DeclContextAlignInBits = 4;
+  constexpr size_t DeclContextAlignInBits = 3;
   constexpr size_t ExprAlignInBits = 3;
   constexpr size_t StmtAlignInBits = 3;
   constexpr size_t TypeAlignInBits = 3;
+  constexpr size_t PatternAlignInBits = 3;
+  constexpr size_t SILFunctionAlignInBits = 2;
+  constexpr size_t TypeVariableAlignInBits = 4;
 }
 
 namespace llvm {
@@ -65,14 +75,14 @@ namespace llvm {
     }
   };
 
-  template <class T> class PointerLikeTypeTraits;
+  template <class T> struct PointerLikeTypeTraits;
 }
 
 /// Declare the expected alignment of pointers to the given type.
 /// This macro should be invoked from a top-level file context.
 #define LLVM_DECLARE_TYPE_ALIGNMENT(CLASS, ALIGNMENT)     \
 namespace llvm {                                          \
-template <> class PointerLikeTypeTraits<CLASS*>           \
+template <> struct PointerLikeTypeTraits<CLASS*>          \
   : public MoreAlignedPointerTraits<CLASS, ALIGNMENT> {}; \
 }
 
@@ -82,12 +92,14 @@ LLVM_DECLARE_TYPE_ALIGNMENT(swift::AssociatedTypeDecl, swift::DeclAlignInBits)
 LLVM_DECLARE_TYPE_ALIGNMENT(swift::GenericTypeParamDecl, swift::DeclAlignInBits)
 LLVM_DECLARE_TYPE_ALIGNMENT(swift::OperatorDecl, swift::DeclAlignInBits)
 LLVM_DECLARE_TYPE_ALIGNMENT(swift::ProtocolDecl, swift::DeclAlignInBits)
+LLVM_DECLARE_TYPE_ALIGNMENT(swift::TypeDecl, swift::DeclAlignInBits)
 LLVM_DECLARE_TYPE_ALIGNMENT(swift::ValueDecl, swift::DeclAlignInBits)
+LLVM_DECLARE_TYPE_ALIGNMENT(swift::NominalTypeDecl, swift::DeclAlignInBits)
 LLVM_DECLARE_TYPE_ALIGNMENT(swift::ExtensionDecl, swift::DeclAlignInBits)
 
 LLVM_DECLARE_TYPE_ALIGNMENT(swift::TypeBase, swift::TypeAlignInBits)
 LLVM_DECLARE_TYPE_ALIGNMENT(swift::ArchetypeType, swift::TypeAlignInBits)
-LLVM_DECLARE_TYPE_ALIGNMENT(swift::TypeVariableType, swift::TypeAlignInBits)
+LLVM_DECLARE_TYPE_ALIGNMENT(swift::TypeVariableType, swift::TypeVariableAlignInBits)
 
 LLVM_DECLARE_TYPE_ALIGNMENT(swift::Stmt, swift::StmtAlignInBits)
 LLVM_DECLARE_TYPE_ALIGNMENT(swift::BraceStmt, swift::StmtAlignInBits)
@@ -95,11 +107,19 @@ LLVM_DECLARE_TYPE_ALIGNMENT(swift::BraceStmt, swift::StmtAlignInBits)
 LLVM_DECLARE_TYPE_ALIGNMENT(swift::ASTContext, 2);
 LLVM_DECLARE_TYPE_ALIGNMENT(swift::DeclContext, swift::DeclContextAlignInBits)
 LLVM_DECLARE_TYPE_ALIGNMENT(swift::Expr, swift::ExprAlignInBits)
+LLVM_DECLARE_TYPE_ALIGNMENT(swift::AbstractClosureExpr, swift::ExprAlignInBits)
+LLVM_DECLARE_TYPE_ALIGNMENT(swift::OpaqueValueExpr, swift::ExprAlignInBits)
 LLVM_DECLARE_TYPE_ALIGNMENT(swift::ProtocolConformance, swift::DeclAlignInBits)
 LLVM_DECLARE_TYPE_ALIGNMENT(swift::NormalProtocolConformance,
                             swift::DeclAlignInBits)
 LLVM_DECLARE_TYPE_ALIGNMENT(swift::GenericEnvironment,
                             swift::DeclAlignInBits)
+LLVM_DECLARE_TYPE_ALIGNMENT(swift::Pattern,
+                            swift::PatternAlignInBits)
+LLVM_DECLARE_TYPE_ALIGNMENT(swift::SILFunction,
+                            swift::SILFunctionAlignInBits)
+
+LLVM_DECLARE_TYPE_ALIGNMENT(swift::AttributeBase, swift::AttrAlignInBits)
 
 static_assert(alignof(void*) >= 2, "pointer alignment is too small");
 

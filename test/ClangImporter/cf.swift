@@ -1,11 +1,11 @@
-// RUN: %target-swift-frontend -disable-objc-attr-requires-foundation-module -typecheck -verify -import-cf-types -I %S/Inputs/custom-modules %s -verify-ignore-unknown
+// RUN: %target-swift-frontend -disable-objc-attr-requires-foundation-module -typecheck -verify -import-cf-types -I %S/Inputs/custom-modules %s
 
 // REQUIRES: objc_interop
 
 import CoreCooling
 import CFAndObjC
 
-func assertUnmanaged<T: AnyObject>(_ t: Unmanaged<T>) {}
+func assertUnmanaged<T>(_ t: Unmanaged<T>) {}
 func assertManaged<T: AnyObject>(_ t: T) {}
 
 func test0(_ fridge: CCRefrigerator) {
@@ -14,7 +14,7 @@ func test0(_ fridge: CCRefrigerator) {
 
 func test1(_ power: Unmanaged<CCPowerSupply>) {
   assertUnmanaged(power)
-  let fridge = CCRefrigeratorCreate(power) // expected-error {{cannot convert value of type 'Unmanaged<CCPowerSupply>' to expected argument type 'CCPowerSupply!'}}
+  let fridge = CCRefrigeratorCreate(power) // expected-error {{cannot convert value of type 'Unmanaged<CCPowerSupply>' to expected argument type 'CCPowerSupply?'}}
   assertUnmanaged(fridge)
 }
 
@@ -61,8 +61,10 @@ func test9() {
   let constFridge: CCRefrigerator = fridge
   CCRefrigeratorOpen(fridge)
   let item = CCRefrigeratorGet(fridge, 0).takeUnretainedValue()
-  CCRefrigeratorInsert(item, fridge) // expected-error {{cannot convert value of type 'CCItem' to expected argument type 'CCMutableRefrigerator!'}}
-  CCRefrigeratorInsert(constFridge, item) // expected-error {{cannot convert value of type 'CCRefrigerator' to expected argument type 'CCMutableRefrigerator!'}}
+  // TODO(diagnostics): In this case we should probably suggest to flip `item` and `fridge`
+  CCRefrigeratorInsert(item, fridge) // expected-error {{cannot convert value of type 'CCItem' to expected argument type 'CCMutableRefrigerator?'}}
+  // expected-error@-1 {{cannot convert value of type 'CCMutableRefrigerator' to expected argument type 'CCItem?'}}
+  CCRefrigeratorInsert(constFridge, item) // expected-error {{cannot convert value of type 'CCRefrigerator' to expected argument type 'CCMutableRefrigerator?'}}
   CCRefrigeratorInsert(fridge, item)
   CCRefrigeratorClose(fridge)
 }
@@ -97,6 +99,7 @@ func testChainedAliases(_ fridge: CCRefrigerator) {
 func testBannedImported(_ object: CCOpaqueTypeRef) {
   CCRetain(object) // expected-error {{'CCRetain' is unavailable: Core Foundation objects are automatically memory managed}} expected-warning {{result of call to 'CCRetain' is unused}}
   CCRelease(object) // expected-error {{'CCRelease' is unavailable: Core Foundation objects are automatically memory managed}}
+  CCMungeAndRetain(object) // okay, has a custom swift_name
 }
 
 func testOutParametersGood() {
@@ -115,10 +118,10 @@ func testOutParametersBad() {
   CCRefrigeratorCreateIndirect(fridge) // expected-error {{cannot convert value of type 'CCRefrigerator?' to expected argument type 'UnsafeMutablePointer<CCRefrigerator?>?'}}
 
   let power: CCPowerSupply?
-  CCRefrigeratorGetPowerSupplyIndirect(0, power) // expected-error {{cannot convert value of type 'Int' to expected argument type 'CCRefrigerator!'}}
+  CCRefrigeratorGetPowerSupplyIndirect(0, power) // expected-error {{cannot convert value of type 'Int' to expected argument type 'CCRefrigerator?'}}
 
   let item: CCItem?
-  CCRefrigeratorGetItemUnaudited(0, 0, item) // expected-error {{cannot convert value of type 'Int' to expected argument type 'CCRefrigerator!'}}
+  CCRefrigeratorGetItemUnaudited(0, 0, item) // expected-error {{cannot convert value of type 'Int' to expected argument type 'CCRefrigerator?'}}
 }
 
 func nameCollisions() {
@@ -132,8 +135,8 @@ func nameCollisions() {
   cf = cfAlias // okay
 
   var otherAlias: MyProblematicAlias?
-  otherAlias = cfAlias // expected-error {{cannot assign value of type 'MyProblematicAliasRef?' to type 'MyProblematicAlias?'}}
-  cfAlias = otherAlias // expected-error {{cannot assign value of type 'MyProblematicAlias?' to type 'MyProblematicAliasRef?'}}
+  otherAlias = cfAlias // expected-error {{cannot assign value of type 'MyProblematicAliasRef?' (aka 'Optional<MyProblematicObjectRef>') to type 'MyProblematicAlias?' (aka 'Optional<Float>')}}
+  cfAlias = otherAlias // expected-error {{cannot assign value of type 'MyProblematicAlias?' (aka 'Optional<Float>') to type 'MyProblematicAliasRef?' (aka 'Optional<MyProblematicObjectRef>')}}
 
   func isOptionalFloat(_: inout Optional<Float>) {}
   isOptionalFloat(&otherAlias) // okay
@@ -160,7 +163,3 @@ protocol SwiftProto {}
 @objc protocol ObjCProto {}
 extension CCRefrigerator: ObjCProto {} // expected-error {{Core Foundation class 'CCRefrigerator' cannot conform to @objc protocol 'ObjCProto' because Core Foundation types are not classes in Objective-C}}
 extension CCRefrigerator: SwiftProto {}
-
-// FIXME: Remove -verify-ignore-unknown.
-// <unknown>:0: error: unexpected note produced: 'CCFridgeRef' was obsoleted in Swift 3
-// <unknown>:0: error: unexpected note produced: 'NotAProblemRef' was obsoleted in Swift 3

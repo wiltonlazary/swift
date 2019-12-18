@@ -29,10 +29,11 @@ namespace swift {
   struct SILDeclRef;
   class SILFunction;
   class SILType;
-  class Substitution;
 
 namespace irgen {
-  class CallEmission;
+  class Callee;
+  class CalleeInfo;
+  class ConstantArrayBuilder;
   class IRGenFunction;
   class IRGenModule;
 
@@ -82,18 +83,9 @@ namespace irgen {
     }
   };
 
-  CallEmission prepareObjCMethodRootCall(IRGenFunction &IGF,
-                                         SILDeclRef method,
-                                         CanSILFunctionType origFnType,
-                                         CanSILFunctionType substFnType,
-                                         SubstitutionList subs,
-                                         ObjCMessageKind kind);
-
-  void addObjCMethodCallImplicitArguments(IRGenFunction &IGF,
-                                          Explosion &emission,
-                                          SILDeclRef method,
-                                          llvm::Value *self,
-                                          SILType superSearchType);
+  /// Prepare a callee for an Objective-C method.
+  Callee getObjCMethodCallee(IRGenFunction &IGF, const ObjCMethod &method,
+                             llvm::Value *selfValue, CalleeInfo &&info);
 
   /// Emit a partial application of an Objective-C method to its 'self'
   /// argument.
@@ -113,73 +105,65 @@ namespace irgen {
   llvm::Value *emitObjCAutoreleaseReturnValue(IRGenFunction &IGF,
                                               llvm::Value *value);
 
+  struct ObjCMethodDescriptor {
+    llvm::Constant *selectorRef = nullptr;
+    llvm::Constant *typeEncoding = nullptr;
+    llvm::Constant *impl = nullptr;
+    SILFunction *silFunction = nullptr;
+  };
+
   /// Build the components of an Objective-C method descriptor for the given
   /// method or constructor implementation.
-  void emitObjCMethodDescriptorParts(IRGenModule &IGM,
-                                     AbstractFunctionDecl *method,
-                                     bool extendedEncoding,
-                                     bool concrete,
-                                     llvm::Constant *&selectorRef,
-                                     llvm::Constant *&atEncoding,
-                                     llvm::Constant *&impl);
+  ObjCMethodDescriptor
+  emitObjCMethodDescriptorParts(IRGenModule &IGM,
+                                AbstractFunctionDecl *method,
+                                bool concrete);
 
   /// Build the components of an Objective-C method descriptor for the given
   /// property's method implementations.
-  void emitObjCGetterDescriptorParts(IRGenModule &IGM,
-                                     VarDecl *property,
-                                     llvm::Constant *&selectorRef,
-                                     llvm::Constant *&atEncoding,
-                                     llvm::Constant *&impl);
+  ObjCMethodDescriptor emitObjCGetterDescriptorParts(IRGenModule &IGM,
+                                                     VarDecl *property);
 
   /// Build the components of an Objective-C method descriptor for the given
   /// subscript's method implementations.
-  void emitObjCGetterDescriptorParts(IRGenModule &IGM,
-                                     SubscriptDecl *subscript,
-                                     llvm::Constant *&selectorRef,
-                                     llvm::Constant *&atEncoding,
-                                     llvm::Constant *&impl);
+  ObjCMethodDescriptor emitObjCGetterDescriptorParts(IRGenModule &IGM,
+                                                     SubscriptDecl *property);
 
-  void emitObjCGetterDescriptorParts(IRGenModule &IGM,
-                                     AbstractStorageDecl *subscript,
-                                     llvm::Constant *&selectorRef,
-                                     llvm::Constant *&atEncoding,
-                                     llvm::Constant *&impl);
+  /// Build the components of an Objective-C method descriptor if the abstract
+  /// storage refers to a property or a subscript.
+  ObjCMethodDescriptor
+  emitObjCGetterDescriptorParts(IRGenModule &IGM,
+                                AbstractStorageDecl *subscript);
 
   /// Build the components of an Objective-C method descriptor for the given
   /// property's method implementations.
-  void emitObjCSetterDescriptorParts(IRGenModule &IGM,
-                                     VarDecl *property,
-                                     llvm::Constant *&selectorRef,
-                                     llvm::Constant *&atEncoding,
-                                     llvm::Constant *&impl);
+  ObjCMethodDescriptor emitObjCSetterDescriptorParts(IRGenModule &IGM,
+                                                     VarDecl *property);
 
   /// Build the components of an Objective-C method descriptor for the given
   /// subscript's method implementations.
-  void emitObjCSetterDescriptorParts(IRGenModule &IGM,
-                                     SubscriptDecl *subscript,
-                                     llvm::Constant *&selectorRef,
-                                     llvm::Constant *&atEncoding,
-                                     llvm::Constant *&impl);
+  ObjCMethodDescriptor emitObjCSetterDescriptorParts(IRGenModule &IGM,
+                                                     SubscriptDecl *property);
 
-  void emitObjCSetterDescriptorParts(IRGenModule &IGM,
-                                     AbstractStorageDecl *subscript,
-                                     llvm::Constant *&selectorRef,
-                                     llvm::Constant *&atEncoding,
-                                     llvm::Constant *&impl);
+  /// Build the components of an Objective-C method descriptor if the abstract
+  /// storage refers to a property or a subscript.
+  ObjCMethodDescriptor
+  emitObjCSetterDescriptorParts(IRGenModule &IGM,
+                                AbstractStorageDecl *subscript);
 
   /// Build an Objective-C method descriptor for the given method,
   /// constructor, or destructor implementation.
-  llvm::Constant *emitObjCMethodDescriptor(IRGenModule &IGM,
-                                           AbstractFunctionDecl *method);
+  void emitObjCMethodDescriptor(IRGenModule &IGM,
+                                ConstantArrayBuilder &descriptors,
+                                AbstractFunctionDecl *method);
 
   /// Build an Objective-C method descriptor for the ivar initializer
   /// or destroyer of a class (-.cxx_construct or -.cxx_destruct).
-  ///
-  /// \returns the method destructor, or an empty optional if there is
-  /// no corresponding SIL function.
-  Optional<llvm::Constant*> emitObjCIVarInitDestroyDescriptor(IRGenModule &IGM,
-                                                              ClassDecl *cd,
-                                                              bool isDestroyer);
+  void emitObjCIVarInitDestroyDescriptor(IRGenModule &IGM,
+                                         ConstantArrayBuilder &descriptors,
+                                         ClassDecl *cd,
+                                         llvm::Function *impl,
+                                         bool isDestroyer);
 
   /// Get the type encoding for an ObjC property.
   void getObjCEncodingForPropertyType(IRGenModule &IGM, VarDecl *property,
@@ -195,16 +179,15 @@ namespace irgen {
   llvm::Constant *getMethodTypeExtendedEncoding(IRGenModule &IGM,
                                                 AbstractFunctionDecl *method);
   
-  /// Build an Objective-C method descriptor for the given property's
-  /// getter and setter methods.
-  std::pair<llvm::Constant *, llvm::Constant *>
-  emitObjCPropertyMethodDescriptors(IRGenModule &IGM, VarDecl *property);
+  /// Build an Objective-C method descriptor for the given getter method.
+  void emitObjCGetterDescriptor(IRGenModule &IGM,
+                                ConstantArrayBuilder &descriptors,
+                                AbstractStorageDecl *storage);
 
-  /// Build an Objective-C method descriptor for the given subscript's
-  /// getter and setter methods.
-  std::pair<llvm::Constant *, llvm::Constant *>
-  emitObjCSubscriptMethodDescriptors(IRGenModule &IGM, 
-                                     SubscriptDecl *subscript);
+  /// Build an Objective-C method descriptor for the given setter method.
+  void emitObjCSetterDescriptor(IRGenModule &IGM,
+                                ConstantArrayBuilder &descriptors,
+                                AbstractStorageDecl *storage);
 
   /// True if the FuncDecl requires an ObjC method descriptor.
   bool requiresObjCMethodDescriptor(FuncDecl *method);
@@ -224,7 +207,7 @@ namespace irgen {
   /// Allocate an Objective-C object.
   llvm::Value *emitObjCAllocObjectCall(IRGenFunction &IGF,
                                        llvm::Value *classPtr,
-                                       CanType resultType);
+                                       SILType resultType);
 
 } // end namespace irgen
 } // end namespace swift

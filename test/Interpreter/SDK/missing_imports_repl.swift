@@ -1,4 +1,4 @@
-// RUN: rm -rf %t && mkdir -p %t
+// RUN: %empty-directory(%t)
 // RUN: touch %t/Corrupted_Module.swiftmodule
 // RUN: not %target-repl-run-simple-swift -I %t 2> %t/stderr.txt | %FileCheck %s
 // RUN: %FileCheck -check-prefix CHECK-ERROR %s < %t/stderr.txt
@@ -33,7 +33,7 @@ MKMapRectIsNull(x)
 
 
 import Corrupted_Module
-// CHECK-ERROR: error: malformed module file
+// CHECK-ERROR: error: malformed compiled module
 
 "unreached"
 // CHECK-NOT: unreached

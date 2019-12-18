@@ -54,17 +54,17 @@ func test_varname_binding() {
   var (d, e) = (c.1, c.0)
   var ((), (g1, g2), h) = ((), (e, d), e)
   var (j, k, l) = callee1()
-  var (m, n) = callee1() // expected-error{{'(Int, Int, Int)' is not convertible to '(_, _)', tuples have a different number of elements}}
-  var (o, p, q, r) = callee1() // expected-error{{'(Int, Int, Int)' is not convertible to '(_, _, _, _)', tuples have a different number of elements}}
+  var (m, n) = callee1() // expected-error{{'(Int, Int, Int)' is not convertible to '(Int, Int)', tuples have a different number of elements}}
+  var (o, p, q, r) = callee1() // expected-error{{'(Int, Int, Int)' is not convertible to '(Int, Int, Int, _)', tuples have a different number of elements}}
 }
 
 //===----------------------------------------------------------------------===//
 // ForwardIndex referencing of types.
 //===----------------------------------------------------------------------===//
 
-// We don't allow namebinding to look forward past a var declaration in the
+// We allow namebinding to look forward past a var declaration in the
 // main module
-var x : x_ty  // expected-error {{use of undeclared type 'x_ty'}}
+var x : x_ty
 typealias x_ty = Int
 
 // We allow namebinding to look forward past a function declaration (and other
@@ -141,6 +141,7 @@ func overloadtest(x: Int) {
 func localtest() {
   func shadowbug() { 
     var Foo = 10
+    // expected-warning@-1 {{initialization of variable 'Foo' was never used; consider replacing with assignment to '_' or removing it}}
     func g() {
       struct S {
         // FIXME: Swap these two lines to crash our broken lookup.
@@ -195,16 +196,16 @@ test+++
 //===----------------------------------------------------------------------===//
 
 func forwardReference() {
-  x = 0 // expected-error{{use of local variable 'x' before its declaration}}
-  var x: Float = 0.0 // expected-note{{'x' declared here}}
+  v = 0 // expected-error{{use of local variable 'v' before its declaration}}
+  var v: Float = 0.0 // expected-note{{'v' declared here}}
 }
 
 class ForwardReference {
   var x: Int = 0
 
   func test() {
-    x = 0 // expected-error{{use of local variable 'x' before its declaration}}
-    var x: Float = 0.0 // expected-note{{'x' declared here}}
+    x = 0
+    var x: Float = 0.0 // expected-warning{{variable 'x' was never used; consider replacing with '_' or removing it}}
   }
 }
 

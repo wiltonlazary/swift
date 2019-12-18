@@ -1,12 +1,16 @@
-// RUN: %target-run-simple-swift | %FileCheck %s
+// RUN: %empty-directory(%t)
+// RUN: %target-build-swift -Onone %s -o %t/a.out
+// RUN: %target-run %t/a.out | %FileCheck --check-prefix CHECK --check-prefix CHECK-ONONE %s
 // RUN: %target-build-swift -O %s -o %t/a.out.optimized
+// RUN: %target-codesign %t/a.out.optimized
 // RUN: %target-run %t/a.out.optimized | %FileCheck %s
 // REQUIRES: executable_test
 
 // FIXME: rdar://problem/19648117 Needs splitting objc parts out
-// XFAIL: linux
 
+#if canImport(Foundation)
 import Foundation
+#endif
 
 func allToInt<T>(_ x: T) -> Int {
   return x as! Int
@@ -129,6 +133,64 @@ anyClassToCOrE(C()).print() // CHECK: C!
 anyClassToCOrE(D()).print() // CHECK: D!
 anyClassToCOrE(X()).print() // CHECK: E!
 
+protocol P {}
+struct PS: P {}
+enum PE: P {}
+class PC: P {}
+class PCSub: PC {}
+
+func nongenericAnyIsP(type: Any.Type) -> Bool {
+  return type is P.Type
+}
+func nongenericAnyIsPAndAnyObject(type: Any.Type) -> Bool {
+  return type is (P & AnyObject).Type
+}
+func nongenericAnyIsPAndPCSub(type: Any.Type) -> Bool {
+  return type is (P & PCSub).Type
+}
+func genericAnyIs<T>(type: Any.Type, to: T.Type, expected: Bool) -> Bool {
+  // If we're testing against a runtime that doesn't have the fix this tests,
+  // just pretend we got it right.
+  if #available(macOS 9999, iOS 9999, watchOS 9999, tvOS 9999, *) {
+    return type is T.Type
+  } else {
+    return expected
+  }
+}
+// CHECK-LABEL: casting types to protocols with generics:
+print("casting types to protocols with generics:")
+print(nongenericAnyIsP(type: PS.self)) // CHECK: true
+print(genericAnyIs(type: PS.self, to: P.self, expected: true)) // CHECK-ONONE: true
+print(nongenericAnyIsP(type: PE.self)) // CHECK: true
+print(genericAnyIs(type: PE.self, to: P.self, expected: true)) // CHECK-ONONE: true
+print(nongenericAnyIsP(type: PC.self)) // CHECK: true
+print(genericAnyIs(type: PC.self, to: P.self, expected: true)) // CHECK-ONONE: true
+print(nongenericAnyIsP(type: PCSub.self)) // CHECK: true
+print(genericAnyIs(type: PCSub.self, to: P.self, expected: true)) // CHECK-ONONE: true
+
+// CHECK-LABEL: casting types to protocol & AnyObject existentials:
+print("casting types to protocol & AnyObject existentials:")
+print(nongenericAnyIsPAndAnyObject(type: PS.self)) // CHECK: false
+print(genericAnyIs(type: PS.self, to: (P & AnyObject).self, expected: false)) // CHECK: false
+print(nongenericAnyIsPAndAnyObject(type: PE.self)) // CHECK: false
+print(genericAnyIs(type: PE.self, to: (P & AnyObject).self, expected: false)) // CHECK: false
+print(nongenericAnyIsPAndAnyObject(type: PC.self)) // CHECK: true
+print(genericAnyIs(type: PC.self, to: (P & AnyObject).self, expected: true)) // CHECK-ONONE: true
+print(nongenericAnyIsPAndAnyObject(type: PCSub.self)) // CHECK: true
+print(genericAnyIs(type: PCSub.self, to: (P & AnyObject).self, expected: true)) // CHECK-ONONE: true
+
+// CHECK-LABEL: casting types to protocol & class existentials:
+print("casting types to protocol & class existentials:")
+print(nongenericAnyIsPAndPCSub(type: PS.self)) // CHECK: false
+print(genericAnyIs(type: PS.self, to: (P & PCSub).self, expected: false)) // CHECK: false
+print(nongenericAnyIsPAndPCSub(type: PE.self)) // CHECK: false
+print(genericAnyIs(type: PE.self, to: (P & PCSub).self, expected: false)) // CHECK: false
+//print(nongenericAnyIsPAndPCSub(type: PC.self)) // CHECK-SR-11565: false -- FIXME: reenable this when SR-11565 is fixed
+print(genericAnyIs(type: PC.self, to: (P & PCSub).self, expected: false)) // CHECK: false
+print(nongenericAnyIsPAndPCSub(type: PCSub.self)) // CHECK: true
+print(genericAnyIs(type: PCSub.self, to: (P & PCSub).self, expected: true)) // CHECK-ONONE: true
+
+
 // CHECK-LABEL: type comparisons:
 print("type comparisons:\n")
 print(allMetasToAllMetas(Int.self, Int.self)) // CHECK: true
@@ -153,21 +215,35 @@ print(u is Int.Type) // CHECK: false
 // FIXME: Can't spell AnyObject.Protocol
 // CHECK-LABEL: AnyObject casts:
 print("AnyObject casts:")
-print(allToAll(C(), AnyObject.self)) // CHECK-NEXT: true
-print(allToAll(type(of: C()), AnyObject.self)) // CHECK-NEXT: true
+print(allToAll(C(), AnyObject.self)) // CHECK: true
+
+// On Darwin, the object will be the ObjC-runtime-class object;
+// out of Darwin, this should not succeed.
+print(allToAll(type(of: C()), AnyObject.self)) 
+// CHECK-objc: true
+// CHECK-native: false
+
 // Bridging
-print(allToAll(0, AnyObject.self)) // CHECK-NEXT: true
+// NSNumber on Darwin, __SwiftValue on Linux.
+print(allToAll(0, AnyObject.self)) // CHECK: true
 
-// This will get bridged using _SwiftValue.
+// This will get bridged using __SwiftValue.
 struct NotBridged { var x: Int }
-print(allToAll(NotBridged(x: 0), AnyObject.self)) // CHECK-NEXT: true
-print(allToAll(NotBridged(x: 0), NSCopying.self)) // CHECK-NEXT: true
+print(allToAll(NotBridged(x: 0), AnyObject.self)) // CHECK: true
 
-// These casts fail (intentionally) even though _SwiftValue does
+#if canImport(Foundation)
+// This requires Foundation (for NSCopying):
+print(allToAll(NotBridged(x: 0), NSCopying.self)) // CHECK-objc: true
+#endif
+
+// On Darwin, these casts fail (intentionally) even though __SwiftValue does
 // technically conform to these protocols through NSObject.
-print(allToAll(NotBridged(x: 0), CustomStringConvertible.self)) // CHECK-NEXT: false
-print(allToAll(NotBridged(x: 0), (AnyObject & CustomStringConvertible).self)) // CHECK-NEXT: false
+// Off Darwin, it should not conform at all.
+print(allToAll(NotBridged(x: 0), CustomStringConvertible.self)) // CHECK: false
+print(allToAll(NotBridged(x: 0), (AnyObject & CustomStringConvertible).self)) // CHECK: false
 
+#if canImport(Foundation)
+// This requires Foundation (for NSArray):
 //
 // rdar://problem/19482567
 //
@@ -183,4 +259,5 @@ func swiftOptimizesThisFunctionIncorrectly() -> Bool {
 }
 
 let result = swiftOptimizesThisFunctionIncorrectly()
-print("Bridge cast result: \(result)") // CHECK-NEXT: Bridge cast result: true
+print("Bridge cast result: \(result)") // CHECK-NEXT-objc: Bridge cast result: true
+#endif

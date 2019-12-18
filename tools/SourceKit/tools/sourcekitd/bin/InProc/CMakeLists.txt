@@ -5,37 +5,52 @@ option(SOURCEKITD_BUILD_STATIC_INPROC
 
 set(sourcekitdInProc_args
   sourcekitdInProc.cpp
-  DEPENDS SourceKitSwiftLang sourcekitdAPI
-  LLVM_COMPONENT_DEPENDS support coverage
+  LLVM_LINK_COMPONENTS support coverage
 )
 
 if (SOURCEKIT_INSTALLING_INPROC)
-  add_sourcekit_framework(sourcekitdInProc
-    ${SOURCEKITD_SOURCE_DIR}/include/sourcekitd/sourcekitd.h
-    ${sourcekitdInProc_args}
-    MODULEMAP module.modulemap
-    INSTALL_IN_COMPONENT sourcekit-inproc
-  )
-  set_property(TARGET sourcekitdInProc APPEND_STRING PROPERTY LINK_FLAGS " -fapplication-extension")
+  if("${CMAKE_SYSTEM_NAME}" STREQUAL "Darwin")
+    add_sourcekit_framework(sourcekitdInProc
+      ${SOURCEKITD_SOURCE_DIR}/include/sourcekitd/sourcekitd.h
+      ${sourcekitdInProc_args}
+      MODULEMAP module.modulemap
+      INSTALL_IN_COMPONENT sourcekit-inproc
+    )
+    set_property(TARGET sourcekitdInProc APPEND_STRING PROPERTY LINK_FLAGS " -fapplication-extension")
+  else()
+    add_sourcekit_library(sourcekitdInProc
+      ${sourcekitdInProc_args}
+      HEADERS
+        ${SOURCEKITD_SOURCE_DIR}/include/sourcekitd/sourcekitd.h
+      INSTALL_IN_COMPONENT sourcekit-inproc
+      SHARED
+    )
+  endif()
 else()
   add_sourcekit_library(sourcekitdInProc
     ${sourcekitdInProc_args}
+    HEADERS
+      ${SOURCEKITD_SOURCE_DIR}/include/sourcekitd/sourcekitd.h
     INSTALL_IN_COMPONENT sourcekit-inproc
     SHARED
   )
 endif()
+target_link_libraries(sourcekitdInProc PRIVATE
+  SourceKitSwiftLang
+  sourcekitdAPI)
 
 # While it is possible to build this as a static library,
 # to get the runtime paths correct, it must be linked into a binary
 # that is in the same directory as the swift library directory.
 if (SOURCEKITD_BUILD_STATIC_INPROC)
   add_sourcekit_library(sourcekitdInProc_Static
+    HEADERS
+      ${SOURCEKITD_SOURCE_DIR}/include/sourcekitd/sourcekitd.h
     ${sourcekitdInProc_args}
   )
-endif()
-
-if("${CMAKE_SYSTEM_NAME}" STREQUAL "Linux")
-  target_link_libraries(sourcekitdInProc PUBLIC BlocksRuntime)
+  target_link_libraries(sourcekitdInProc_Static PRIVATE
+    SourceKitSwiftLang
+    sourcekitdAPI)
 endif()
 
 if (SOURCEKIT_BUILT_STANDALONE)

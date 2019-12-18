@@ -31,9 +31,12 @@
 #
 
 import argparse
+import csv
+import datetime
 import resource
 import subprocess
 import sys
+import time
 
 
 class MemAction(argparse.Action):
@@ -77,6 +80,9 @@ parser.add_argument("--time",
                     metavar="T",
                     help="time (in secs, or ..'ms', 'us')",
                     action=TimeAction)
+parser.add_argument("--wall-time",
+                    help="wall time (in secs, or ..'ms', 'us')",
+                    action='store_true')
 parser.add_argument("--enforce",
                     action='store_true',
                     default=False,
@@ -85,6 +91,20 @@ parser.add_argument("--verbose",
                     action='store_true',
                     default=False,
                     help="always report status and usage")
+parser.add_argument("--csv",
+                    action='store_true',
+                    default=False,
+                    help="write results as CSV")
+parser.add_argument("--csv-header",
+                    action='store_true',
+                    default=False,
+                    help="Emit CSV header")
+parser.add_argument("--csv-output", default="-",
+                    type=argparse.FileType('wb', 0),
+                    help="Write CSV output to file")
+parser.add_argument("--csv-name", type=str,
+                    default=str(datetime.datetime.now()),
+                    help="Label row in CSV with name")
 parser.add_argument('remainder', nargs=argparse.REMAINDER,
                     help="subcommand to run under supervision")
 
@@ -109,7 +129,13 @@ if args.enforce:
             sys.stderr.write("rusage: setrlimit(RLIMIT_RSS, %d)\n"
                              % mem)
         resource.setrlimit(resource.RLIMIT_RSS, (mem, mem))
+
+start = time.time()
 ret = subprocess.call(args.remainder)
+end = time.time()
+
+wall_time = end - start
+
 used = resource.getrusage(resource.RUSAGE_CHILDREN)
 
 if args.verbose:
@@ -128,9 +154,27 @@ if over_mem:
 if args.verbose or over_time:
     sys.stderr.write("rusage: subprocess time: %.6f secs\n"
                      % used.ru_utime)
+    if args.wall_time:
+        sys.stderr.write("rusage: subprocess wall time: %.6f secs\n"
+                         % wall_time)
 if over_time:
     sys.stderr.write("rusage:  exceeded limit: %.6f secs\n"
                      % args.time)
+
+if args.csv:
+    fieldnames = ["time", "mem", "run"]
+    row = {
+        'time': used.ru_utime,
+        'mem': used.ru_maxrss,
+        'run': args.csv_name
+    }
+    if args.wall_time:
+        row['wall'] = wall_time
+        fieldnames.insert(1, 'wall')
+    out = csv.DictWriter(args.csv_output, fieldnames, dialect='excel-tab')
+    if args.csv_header:
+        out.writeheader()
+    out.writerow(row)
 
 if over_mem or over_time:
     sys.exit(-1)

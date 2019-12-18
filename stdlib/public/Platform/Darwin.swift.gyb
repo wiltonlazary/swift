@@ -12,8 +12,7 @@
 
 @_exported import Darwin // Clang module
 
-public let MAP_FAILED =
-  UnsafeMutableRawPointer(bitPattern: -1)! as UnsafeMutableRawPointer!
+public let MAP_FAILED: UnsafeMutableRawPointer! = UnsafeMutableRawPointer(bitPattern: -1)
 
 //  Constants defined by <math.h>
 @available(swift, deprecated: 3.0, message: "Please use 'Double.pi' or '.pi' to get the value of correct type and avoid casting.")
@@ -70,3 +69,13 @@ public let ${prefix}_TRUE_MIN = ${type}.leastNonzeroMagnitude
 #endif
 % end
 %end
+
+// Macros defined in bsd/sys/proc.h that do not import into Swift.
+extension extern_proc {
+    // #define p_starttime p_un.__p_starttime
+    @_transparent
+    public var p_starttime: timeval {
+        get { return self.p_un.__p_starttime }
+        set { self.p_un.__p_starttime = newValue }
+    }
+}

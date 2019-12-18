@@ -26,7 +26,7 @@ class SideEffectsDumper : public SILModuleTransform {
 
   void run() override {
 
-    DEBUG(llvm::dbgs() << "** SideEffectsDumper **\n");
+    LLVM_DEBUG(llvm::dbgs() << "** SideEffectsDumper **\n");
 
 #ifndef NDEBUG
     auto *SEA = PM->getAnalysis<SideEffectAnalysis>();
@@ -40,7 +40,6 @@ class SideEffectsDumper : public SILModuleTransform {
 #endif
   }
 
-  StringRef getName() override { return "SideEffectsDumper"; }
 };
 
 } // end anonymous namespace
